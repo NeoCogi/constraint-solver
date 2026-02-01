@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use crate::exp::{Exp, MissingVarError};
+use crate::exp::{Exp, MissingVarError, VarId};
 use crate::matrix::Matrix;
 use std::collections::HashMap;
 
@@ -38,7 +38,7 @@ pub struct Jacobian {
     /// Vector of expressions f_i(x), each representing one equation in the system
     expressions: Vec<Exp>,
     /// Variable IDs that correspond to the unknowns x_j in the system
-    variables: Vec<usize>,
+    variables: Vec<VarId>,
     /// Cached symbolic partial derivatives df_i/dx_j (simplified)
     symbolic_jacobian: Vec<Vec<Exp>>,
 }
@@ -55,7 +55,7 @@ impl Jacobian {
     /// The Jacobian would be:
     /// J = [df1/dx  df1/dy] = [2x   2y]
     ///     [df2/dx  df2/dy]   [y    x ]
-    pub fn new(expressions: Vec<Exp>, variables: Vec<usize>) -> Self {
+    pub fn new(expressions: Vec<Exp>, variables: Vec<VarId>) -> Self {
         // Pre-compute symbolic derivatives once since Newton iterations repeatedly
         // evaluate J at different points.
         let mut symbolic_jacobian = Vec::new();
@@ -107,7 +107,7 @@ impl Jacobian {
     /// For f1 = x^2 + y^2, f2 = xy at point (x=1, y=2):
     /// J = [2x   2y] = [2   4]
     ///     [y    x ]   [2   1]
-    pub fn evaluate(&self, vars: &HashMap<usize, f64>) -> Matrix {
+    pub fn evaluate(&self, vars: &HashMap<VarId, f64>) -> Matrix {
         let rows = self.expressions.len(); // Number of equations
         let cols = self.variables.len(); // Number of variables
         let mut result = Matrix::new(rows, cols);
@@ -116,7 +116,10 @@ impl Jacobian {
         result
     }
 
-    pub fn evaluate_checked(&self, vars: &HashMap<usize, f64>) -> Result<Matrix, MissingVarError> {
+    pub fn evaluate_checked(
+        &self,
+        vars: &HashMap<VarId, f64>,
+    ) -> Result<Matrix, MissingVarError> {
         let rows = self.expressions.len();
         let cols = self.variables.len();
         let mut result = Matrix::new(rows, cols);
@@ -125,7 +128,7 @@ impl Jacobian {
         Ok(result)
     }
 
-    pub fn evaluate_into(&self, vars: &HashMap<usize, f64>, out: &mut Matrix) {
+    pub fn evaluate_into(&self, vars: &HashMap<VarId, f64>, out: &mut Matrix) {
         let rows = self.expressions.len();
         let cols = self.variables.len();
         if out.rows() != rows || out.cols() != cols {
@@ -141,7 +144,7 @@ impl Jacobian {
 
     pub fn evaluate_checked_into(
         &self,
-        vars: &HashMap<usize, f64>,
+        vars: &HashMap<VarId, f64>,
         out: &mut Matrix,
     ) -> Result<(), MissingVarError> {
         let rows = self.expressions.len();
@@ -173,7 +176,7 @@ impl Jacobian {
     /// # Usage in Newton-Raphson
     /// This is the "f(x)" in the Newton-Raphson formula: x_{k+1} = x_k - J^{-1} * f(x_k)
     /// We seek the root where f(x) = 0, so this tells us how close we are to the solution.
-    pub fn evaluate_functions(&self, vars: &HashMap<usize, f64>) -> Matrix {
+    pub fn evaluate_functions(&self, vars: &HashMap<VarId, f64>) -> Matrix {
         let rows = self.expressions.len();
         let mut result = Matrix::new(rows, 1); // Column vector
 
@@ -184,7 +187,7 @@ impl Jacobian {
 
     pub fn evaluate_functions_checked(
         &self,
-        vars: &HashMap<usize, f64>,
+        vars: &HashMap<VarId, f64>,
     ) -> Result<Matrix, MissingVarError> {
         let rows = self.expressions.len();
         let mut result = Matrix::new(rows, 1);
@@ -194,7 +197,7 @@ impl Jacobian {
         Ok(result)
     }
 
-    pub fn evaluate_functions_into(&self, vars: &HashMap<usize, f64>, out: &mut Matrix) {
+    pub fn evaluate_functions_into(&self, vars: &HashMap<VarId, f64>, out: &mut Matrix) {
         let rows = self.expressions.len();
         if out.rows() != rows || out.cols() != 1 {
             *out = Matrix::new(rows, 1);
@@ -207,7 +210,7 @@ impl Jacobian {
 
     pub fn evaluate_functions_checked_into(
         &self,
-        vars: &HashMap<usize, f64>,
+        vars: &HashMap<VarId, f64>,
         out: &mut Matrix,
     ) -> Result<(), MissingVarError> {
         let rows = self.expressions.len();
@@ -236,8 +239,8 @@ mod tests {
         // Expected Jacobian:
         // J = [2x   2y]
         //     [y    x ]
-        let x = Exp::var("x".to_string(), 0);
-        let y = Exp::var("y".to_string(), 1);
+        let x = Exp::var("x".to_string(), VarId::new(0));
+        let y = Exp::var("y".to_string(), VarId::new(1));
 
         let f1 = Exp::sub(
             Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
@@ -246,12 +249,12 @@ mod tests {
 
         let f2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
-        let jacobian = Jacobian::new(vec![f1, f2], vec![0, 1]);
+        let jacobian = Jacobian::new(vec![f1, f2], vec![VarId::new(0), VarId::new(1)]);
 
         // Evaluate at point (0.5, 0.5)
         let mut vars = HashMap::new();
-        vars.insert(0, 0.5); // x = 0.5
-        vars.insert(1, 0.5); // y = 0.5
+        vars.insert(VarId::new(0), 0.5); // x = 0.5
+        vars.insert(VarId::new(1), 0.5); // y = 0.5
 
         let j_matrix = jacobian.evaluate(&vars);
         assert_eq!(j_matrix.rows(), 2);
@@ -277,18 +280,18 @@ mod tests {
         // Expected Jacobian:
         // J = [cos(x)   -1   ]
         //     [-1       -sin(y)]
-        let x = Exp::var("x".to_string(), 0);
-        let y = Exp::var("y".to_string(), 1);
+        let x = Exp::var("x".to_string(), VarId::new(0));
+        let y = Exp::var("y".to_string(), VarId::new(1));
 
         let f1 = Exp::sub(Exp::sin(x.clone()), y.clone());
         let f2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
-        let jacobian = Jacobian::new(vec![f1, f2], vec![0, 1]);
+        let jacobian = Jacobian::new(vec![f1, f2], vec![VarId::new(0), VarId::new(1)]);
 
         // Evaluate at origin (0, 0)
         let mut vars = HashMap::new();
-        vars.insert(0, 0.0); // x = 0
-        vars.insert(1, 0.0); // y = 0
+        vars.insert(VarId::new(0), 0.0); // x = 0
+        vars.insert(VarId::new(1), 0.0); // y = 0
 
         let j_matrix = jacobian.evaluate(&vars);
 

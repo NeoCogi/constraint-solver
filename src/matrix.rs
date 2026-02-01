@@ -34,6 +34,12 @@ pub enum MatrixError {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LeastSquaresQrInfo {
+    pub rank: usize,
+    pub cond_est: f64,
+}
+
 impl fmt::Display for MatrixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -215,6 +221,16 @@ impl Matrix {
     /// - If `rows >= cols`, returns the standard least-squares solution.
     /// - If `rows < cols`, returns the minimum-norm solution among all minimizers.
     pub fn solve_least_squares_qr(&self, b: &Matrix) -> Result<Matrix, String> {
+        self.solve_least_squares_qr_with_info(b)
+            .map(|(solution, _)| solution)
+    }
+
+    /// Solve a (possibly non-square) least squares problem using Householder QR,
+    /// returning diagnostic information about rank and conditioning.
+    pub fn solve_least_squares_qr_with_info(
+        &self,
+        b: &Matrix,
+    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         if b.cols != 1 {
             return Err("Invalid dimensions for b (expected column vector)".to_string());
         }
@@ -227,17 +243,26 @@ impl Matrix {
 
         // Trivial cases.
         if n == 0 {
-            return Ok(Matrix::new(0, 1));
+            return Ok((
+                Matrix::new(0, 1),
+                LeastSquaresQrInfo {
+                    rank: 0,
+                    cond_est: f64::INFINITY,
+                },
+            ));
         }
 
         if m >= n {
-            Self::solve_least_squares_qr_tall(self, b)
+            Self::solve_least_squares_qr_tall_with_info(self, b)
         } else {
-            Self::solve_least_squares_qr_wide(self, b)
+            Self::solve_least_squares_qr_wide_with_info(self, b)
         }
     }
 
-    fn solve_least_squares_qr_tall(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
+    fn solve_least_squares_qr_tall_with_info(
+        a: &Matrix,
+        b: &Matrix,
+    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         let m = a.rows;
         let n = a.cols;
 
@@ -303,6 +328,28 @@ impl Matrix {
             r[(k, k)] = alpha;
         }
 
+        let mut max_diag: f64 = 0.0;
+        for i in 0..n {
+            max_diag = max_diag.max(r[(i, i)].abs());
+        }
+        let tol = 1e-12 * max_diag.max(1.0);
+        let mut rank = 0;
+        let mut min_diag = f64::INFINITY;
+        for i in 0..n {
+            let diag = r[(i, i)].abs();
+            if diag > tol {
+                rank += 1;
+                if diag < min_diag {
+                    min_diag = diag;
+                }
+            }
+        }
+        let cond_est = if rank == 0 || !min_diag.is_finite() {
+            f64::INFINITY
+        } else {
+            max_diag / min_diag
+        };
+
         // Back-substitute R x = Q^T b, using the top n entries.
         let mut x = Matrix::new(n, 1);
         for i in (0..n).rev() {
@@ -328,10 +375,19 @@ impl Matrix {
             x[(i, 0)] = sum / diag;
         }
 
-        Ok(x)
+        Ok((
+            x,
+            LeastSquaresQrInfo {
+                rank,
+                cond_est,
+            },
+        ))
     }
 
-    fn solve_least_squares_qr_wide(a: &Matrix, b: &Matrix) -> Result<Matrix, String> {
+    fn solve_least_squares_qr_wide_with_info(
+        a: &Matrix,
+        b: &Matrix,
+    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         // Use QR on A^T to compute the minimum-norm least squares solution.
         //
         // Let A be m x n with m < n. Compute QR of A^T (n x m):
@@ -387,6 +443,28 @@ impl Matrix {
             r[(k, k)] = alpha;
         }
 
+        let mut max_diag: f64 = 0.0;
+        for i in 0..m {
+            max_diag = max_diag.max(r[(i, i)].abs());
+        }
+        let tol = 1e-12 * max_diag.max(1.0);
+        let mut rank = 0;
+        let mut min_diag = f64::INFINITY;
+        for i in 0..m {
+            let diag = r[(i, i)].abs();
+            if diag > tol {
+                rank += 1;
+                if diag < min_diag {
+                    min_diag = diag;
+                }
+            }
+        }
+        let cond_est = if rank == 0 || !min_diag.is_finite() {
+            f64::INFINITY
+        } else {
+            max_diag / min_diag
+        };
+
         // Solve R^T y = b (R is m x m upper triangular, so R^T is lower triangular).
         let mut y = vec![0.0; m];
         for i in 0..m {
@@ -436,7 +514,15 @@ impl Matrix {
             }
         }
 
-        Matrix::from_vec(w, n, 1)
+        Matrix::from_vec(w, n, 1).map(|solution| {
+            (
+                solution,
+                LeastSquaresQrInfo {
+                    rank,
+                    cond_est,
+                },
+            )
+        })
     }
 
     pub fn norm(&self) -> f64 {
@@ -565,6 +651,39 @@ impl fmt::Display for Matrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestRng {
+        state: u64,
+    }
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.state = self
+                .state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            (self.state >> 32) as u32
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            let v = self.next_u32() as f64 / u32::MAX as f64;
+            2.0 * v - 1.0
+        }
+    }
+
+    fn random_matrix(rows: usize, cols: usize, rng: &mut TestRng) -> Matrix {
+        let mut m = Matrix::new(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                m[(i, j)] = rng.next_f64();
+            }
+        }
+        m
+    }
 
     #[test]
     fn test_matrix_creation() {
@@ -726,5 +845,97 @@ mod tests {
         let x = a.solve_least_squares_qr(&b).unwrap();
         assert!((x[(0, 0)] - 0.5).abs() < 1e-12);
         assert!((x[(1, 0)] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_random_tall_full_rank() {
+        let mut rng = TestRng::new(0x5eed_1234_5678_9abc);
+        for _ in 0..5 {
+            let mut a = random_matrix(6, 3, &mut rng);
+            for i in 0..3 {
+                a[(i, i)] += 2.0;
+            }
+            let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let x_mat = Matrix::from_vec(x_true.clone(), 3, 1).unwrap();
+            let b = &a * &x_mat;
+
+            let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+            assert_eq!(info.rank, 3);
+            assert!(info.cond_est.is_finite());
+            for i in 0..3 {
+                assert!((x[(i, 0)] - x_true[i]).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_random_wide_min_norm() {
+        let mut rng = TestRng::new(0x1234_5678_9abc_def0);
+        let mut a = Matrix::new(2, 4);
+        a[(0, 0)] = 1.0;
+        a[(1, 1)] = 1.0;
+
+        for _ in 0..5 {
+            let b0 = rng.next_f64();
+            let b1 = rng.next_f64();
+            let b = Matrix::from_vec(vec![b0, b1], 2, 1).unwrap();
+
+            let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+            assert_eq!(info.rank, 2);
+            assert!(info.cond_est.is_finite());
+            assert!((x[(0, 0)] - b0).abs() < 1e-12);
+            assert!((x[(1, 0)] - b1).abs() < 1e-12);
+            assert!((x[(2, 0)]).abs() < 1e-12);
+            assert!((x[(3, 0)]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_detects_ill_conditioning() {
+        let mut a = Matrix::identity(3);
+        for i in 0..3 {
+            a[(i, 2)] *= 1e-8;
+        }
+        let b = Matrix::from_vec(vec![0.0, 0.0, 0.0], 3, 1).unwrap();
+
+        let (_x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+        assert_eq!(info.rank, 3);
+        assert!(info.cond_est > 1e6, "cond_est was {}", info.cond_est);
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_tall_full_rank() {
+        let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
+        let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
+
+        let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+        assert_eq!(info.rank, 2);
+        assert!(info.cond_est.is_finite());
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((x[(1, 0)] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_wide_full_rank() {
+        let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 2, 3).unwrap();
+        let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
+
+        let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+        assert_eq!(info.rank, 2);
+        assert!(info.cond_est.is_finite());
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((x[(1, 0)] - 2.0).abs() < 1e-12);
+        assert!((x[(2, 0)] - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_solve_least_squares_qr_with_info_rank_deficient() {
+        let a = Matrix::from_vec(vec![1.0, 1.0, 2.0, 2.0], 2, 2).unwrap();
+        let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
+
+        let err = a
+            .solve_least_squares_qr_with_info(&b)
+            .expect_err("expected rank-deficient QR solve to fail");
+        assert!(err.contains("rank deficient"), "{err}");
     }
 }

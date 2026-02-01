@@ -30,9 +30,9 @@ pub mod solver;
 #[cfg(test)]
 mod matrix_test;
 
-pub use exp::{Exp, MissingVarError};
+pub use exp::{Exp, MissingVarError, VarId};
 pub use jacobian::Jacobian;
-pub use matrix::{Matrix, MatrixError};
+pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 pub use solver::{
     EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverRunDiagnostic,
 };
