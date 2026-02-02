@@ -2,5 +2,17 @@
 name = "constraint-solver"
 version = "0.1.0"
 edition = "2024"
+description = "A small, generic nonlinear constraint solver with symbolic expressions, compilation, and a modified Newton-Raphson method."
+license = "MIT"
+readme = "README.md"
+authors = ["Raja Lehtihet", "Wael El Oraiby"]
+keywords = [
+    "constraints",
+    "solver",
+    "nonlinear",
+    "least-squares",
+    "optimization",
+]
+categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]

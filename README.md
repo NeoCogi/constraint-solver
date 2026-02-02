@@ -7,7 +7,7 @@ A small, generic constraint-solving core for nonlinear systems. This crate provi
 - A dense matrix type with LU and QR-based least squares (`Matrix`).
 - A Newton-Raphson solver with damping, regularization, and optional line search (`NewtonRaphsonSolver`).
 
-This crate is intentionally CAD-agnostic and focuses on the math/solver core.
+This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
 
 ## Usage
 
@@ -152,6 +152,20 @@ let solution = solver
     .expect("solve failed");
 assert!(solution.converged);
 ```
+
+## Examples
+
+The `examples/` folder contains small end-to-end programs that show how to build
+constraints and run the solver:
+
+- `cad_circle_intersection`: two circle constraints; finds one of the intersection points.
+  Run with `cargo run --example cad_circle_intersection`.
+- `cad_segment_horizontal`: fixed-length segment with a horizontal constraint; solves for B
+  while A is fixed. Run with `cargo run --example cad_segment_horizontal`.
+- `circuit_voltage_divider`: resistive divider with explicit currents and KCL.
+  Run with `cargo run --example circuit_voltage_divider`.
+- `circuit_diode`: diode + resistor using the Shockley equation (nonlinear).
+  Run with `cargo run --example circuit_diode`.
 
 ## Testing
 
