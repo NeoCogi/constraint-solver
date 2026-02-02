@@ -2,7 +2,7 @@
 
 A small, generic constraint-solving core for nonlinear systems. This crate provides:
 
-- A symbolic expression tree (`Exp`) with evaluation and differentiation.
+- A symbolic expression tree (`Exp`) for building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
 - A dense matrix type with LU and QR-based least squares (`Matrix`).
 - A Newton-Raphson solver with damping, regularization, and optional line search (`NewtonRaphsonSolver`).
