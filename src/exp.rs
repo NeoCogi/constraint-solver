@@ -25,38 +25,14 @@ SOFTWARE.
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct VarId(usize);
-
-impl VarId {
-    pub const fn new(id: usize) -> Self {
-        Self(id)
-    }
-
-    pub const fn index(self) -> usize {
-        self.0
-    }
-}
-
-impl fmt::Display for VarId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingVarError {
     pub var_name: String,
-    pub var_id: VarId,
 }
 
 impl fmt::Display for MissingVarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Missing variable '{}' (id {})",
-            self.var_name, self.var_id
-        )
+        write!(f, "Missing variable '{}'", self.var_name)
     }
 }
 
@@ -65,7 +41,7 @@ impl std::error::Error for MissingVarError {}
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exp {
     Val(f64),
-    Var(String, VarId),
+    Var(String),
     Add(Box<Exp>, Box<Exp>),
     Sub(Box<Exp>, Box<Exp>),
     Mul(Box<Exp>, Box<Exp>),
@@ -80,8 +56,8 @@ pub enum Exp {
 
 #[allow(clippy::self_named_constructors, clippy::should_implement_trait)]
 impl Exp {
-    pub fn var(name: String, id: VarId) -> Self {
-        Exp::Var(name, id)
+    pub fn var(name: impl Into<String>) -> Self {
+        Exp::Var(name.into())
     }
 
     pub fn val(v: f64) -> Self {
@@ -130,13 +106,12 @@ impl Exp {
 
     pub fn evaluate_checked(
         &self,
-        vars: &HashMap<VarId, f64>,
+        vars: &HashMap<String, f64>,
     ) -> Result<f64, MissingVarError> {
         match self {
             Exp::Val(v) => Ok(*v),
-            Exp::Var(name, id) => vars.get(id).copied().ok_or_else(|| MissingVarError {
+            Exp::Var(name) => vars.get(name).copied().ok_or_else(|| MissingVarError {
                 var_name: name.clone(),
-                var_id: *id,
             }),
             Exp::Add(l, r) => Ok(l.evaluate_checked(vars)? + r.evaluate_checked(vars)?),
             Exp::Sub(l, r) => Ok(l.evaluate_checked(vars)? - r.evaluate_checked(vars)?),
@@ -151,10 +126,10 @@ impl Exp {
         }
     }
 
-    pub fn evaluate(&self, vars: &HashMap<VarId, f64>) -> f64 {
+    pub fn evaluate(&self, vars: &HashMap<String, f64>) -> f64 {
         match self {
             Exp::Val(v) => *v,
-            Exp::Var(_, id) => *vars.get(id).unwrap_or(&0.0),
+            Exp::Var(name) => *vars.get(name).unwrap_or(&0.0),
             Exp::Add(l, r) => l.evaluate(vars) + r.evaluate(vars),
             Exp::Sub(l, r) => l.evaluate(vars) - r.evaluate(vars),
             Exp::Mul(l, r) => l.evaluate(vars) * r.evaluate(vars),
@@ -168,53 +143,53 @@ impl Exp {
         }
     }
 
-    pub fn differentiate(&self, var_id: VarId) -> Exp {
+    pub fn differentiate(&self, var_name: &str) -> Exp {
         match self {
             Exp::Val(_) => Exp::Val(0.0),
-            Exp::Var(_, id) => {
-                if *id == var_id {
+            Exp::Var(name) => {
+                if name == var_name {
                     Exp::Val(1.0)
                 } else {
                     Exp::Val(0.0)
                 }
             }
-            Exp::Add(l, r) => Exp::add(l.differentiate(var_id), r.differentiate(var_id)),
-            Exp::Sub(l, r) => Exp::sub(l.differentiate(var_id), r.differentiate(var_id)),
+            Exp::Add(l, r) => Exp::add(l.differentiate(var_name), r.differentiate(var_name)),
+            Exp::Sub(l, r) => Exp::sub(l.differentiate(var_name), r.differentiate(var_name)),
             Exp::Mul(l, r) => {
-                let dl = l.differentiate(var_id);
-                let dr = r.differentiate(var_id);
+                let dl = l.differentiate(var_name);
+                let dr = r.differentiate(var_name);
                 Exp::add(Exp::mul(dl, (**r).clone()), Exp::mul((**l).clone(), dr))
             }
             Exp::Div(l, r) => {
-                let dl = l.differentiate(var_id);
-                let dr = r.differentiate(var_id);
+                let dl = l.differentiate(var_name);
+                let dr = r.differentiate(var_name);
                 Exp::div(
                     Exp::sub(Exp::mul(dl, (**r).clone()), Exp::mul((**l).clone(), dr)),
                     Exp::power((**r).clone(), 2.0),
                 )
             }
             Exp::Power(base, exp) => {
-                let db = base.differentiate(var_id);
+                let db = base.differentiate(var_name);
                 Exp::mul(
                     Exp::mul(Exp::val(*exp), Exp::power((**base).clone(), exp - 1.0)),
                     db,
                 )
             }
-            Exp::Neg(e) => Exp::neg(e.differentiate(var_id)),
+            Exp::Neg(e) => Exp::neg(e.differentiate(var_name)),
             Exp::Sin(e) => {
-                let de = e.differentiate(var_id);
+                let de = e.differentiate(var_name);
                 Exp::mul(Exp::cos((**e).clone()), de)
             }
             Exp::Cos(e) => {
-                let de = e.differentiate(var_id);
+                let de = e.differentiate(var_name);
                 Exp::neg(Exp::mul(Exp::sin((**e).clone()), de))
             }
             Exp::Ln(e) => {
-                let de = e.differentiate(var_id);
+                let de = e.differentiate(var_name);
                 Exp::div(de, (**e).clone())
             }
             Exp::Exp(e) => {
-                let de = e.differentiate(var_id);
+                let de = e.differentiate(var_name);
                 Exp::mul(Exp::exp((**e).clone()), de)
             }
         }
@@ -287,7 +262,7 @@ impl fmt::Display for Exp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Exp::Val(v) => write!(f, "{v}"),
-            Exp::Var(name, _) => write!(f, "{name}"),
+            Exp::Var(name) => write!(f, "{name}"),
             Exp::Add(l, r) => write!(f, "({l} + {r})"),
             Exp::Sub(l, r) => write!(f, "({l} - {r})"),
             Exp::Mul(l, r) => write!(f, "({l} * {r})"),
@@ -309,11 +284,11 @@ mod tests {
     #[test]
     fn test_evaluate() {
         let mut vars = HashMap::new();
-        vars.insert(VarId::new(0), 2.0);
-        vars.insert(VarId::new(1), 3.0);
+        vars.insert("x".to_string(), 2.0);
+        vars.insert("y".to_string(), 3.0);
 
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         let expr = Exp::add(Exp::mul(x.clone(), y.clone()), Exp::val(5.0));
         assert_eq!(expr.evaluate(&vars), 11.0);
@@ -325,30 +300,29 @@ mod tests {
     #[test]
     fn test_evaluate_checked_missing_var() {
         let vars = HashMap::new();
-        let x = Exp::var("x".to_string(), VarId::new(0));
+        let x = Exp::var("x");
         let err = x.evaluate_checked(&vars).expect_err("expected missing variable error");
-        assert_eq!(err.var_id, VarId::new(0));
         assert_eq!(err.var_name, "x");
     }
 
     #[test]
     fn test_differentiate() {
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         let expr = Exp::mul(x.clone(), y.clone());
-        let dx = expr.differentiate(VarId::new(0));
-        let dy = expr.differentiate(VarId::new(1));
+        let dx = expr.differentiate("x");
+        let dy = expr.differentiate("y");
 
         let mut vars = HashMap::new();
-        vars.insert(VarId::new(0), 2.0);
-        vars.insert(VarId::new(1), 3.0);
+        vars.insert("x".to_string(), 2.0);
+        vars.insert("y".to_string(), 3.0);
 
         assert_eq!(dx.evaluate(&vars), 3.0);
         assert_eq!(dy.evaluate(&vars), 2.0);
 
         let expr2 = Exp::power(x.clone(), 3.0);
-        let dx2 = expr2.differentiate(VarId::new(0));
+        let dx2 = expr2.differentiate("x");
         assert_eq!(dx2.evaluate(&vars), 12.0);
     }
 
@@ -357,7 +331,7 @@ mod tests {
         let expr = Exp::add(Exp::val(2.0), Exp::val(3.0));
         assert_eq!(expr.simplify(), Exp::val(5.0));
 
-        let x = Exp::var("x".to_string(), VarId::new(0));
+        let x = Exp::var("x");
         let expr2 = Exp::mul(x.clone(), Exp::val(0.0));
         assert_eq!(expr2.simplify(), Exp::val(0.0));
 

@@ -22,7 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use crate::exp::{Exp, MissingVarError, VarId};
+use crate::compiler::{CompiledExp, CompiledSystem, VarId, VarTable};
+use crate::exp::MissingVarError;
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 use std::collections::HashMap;
@@ -65,9 +66,11 @@ enum LeastSquaresSolveError {
 /// The solver uses adaptive damping and regularization for numerical stability.
 pub struct NewtonRaphsonSolver {
     /// The system of equations to solve (each equation should equal zero)
-    equations: Vec<Exp>,
+    equations: Vec<CompiledExp>,
     /// Variable IDs that correspond to unknowns in the system
     variables: Vec<VarId>,
+    /// Registry of all variables referenced by the compiled system
+    var_table: VarTable,
     /// Maximum number of iterations before giving up
     max_iterations: usize,
     /// Convergence tolerance (solution found when |f(x)| < tolerance)
@@ -86,8 +89,8 @@ pub struct NewtonRaphsonSolver {
 /// Solution result containing the solved variable values and convergence info
 #[derive(Debug, Clone)]
 pub struct Solution {
-    /// Final values of all variables (variable_id -> value)
-    pub values: HashMap<VarId, f64>,
+    /// Final values of all variables (variable name -> value)
+    pub values: HashMap<String, f64>,
     /// Number of iterations taken to converge
     pub iterations: usize,
     /// Final residual error |f(x)|
@@ -111,7 +114,8 @@ pub struct SolverRunDiagnostic {
     pub message: String,
     pub iterations: usize,
     pub error: f64,
-    pub values: HashMap<VarId, f64>,
+    /// Variable values at the end of the run (variable name -> value)
+    pub values: HashMap<String, f64>,
     pub residuals: Vec<f64>,
 }
 
@@ -148,17 +152,43 @@ impl NewtonRaphsonSolver {
     /// - Normal systems use standard parameters for fast convergence
     ///
     /// # Arguments
-    /// * `equations` - System of equations (each should evaluate to 0 at solution)
-    /// * `variables` - Variable IDs that appear in the equations
-    pub fn new(equations: Vec<Exp>, variables: Vec<VarId>) -> Self {
+    /// * `compiled` - Compiled system of equations (each should evaluate to 0 at solution)
+    pub fn new(compiled: CompiledSystem) -> Self {
+        let variables = compiled.var_table.all_var_ids();
+        Self::build(compiled, variables)
+    }
+
+    /// Create a solver while specifying which variables to solve for.
+    ///
+    /// Variables not listed here are treated as fixed parameters and must be
+    /// provided in the initial guess.
+    pub fn new_with_variables(
+        compiled: CompiledSystem,
+        variables: &[&str],
+    ) -> Result<Self, SolverError> {
+        let mut ids = Vec::with_capacity(variables.len());
+        let mut seen = std::collections::HashSet::new();
+        for name in variables {
+            let id = compiled
+                .var_table
+                .get_id(name)
+                .ok_or_else(|| SolverError::InvalidInput(format!("Unknown variable '{name}'")))?;
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        Ok(Self::build(compiled, ids))
+    }
+
+    fn build(compiled: CompiledSystem, variables: Vec<VarId>) -> Self {
         // Allow both under-constrained and over-constrained systems
         // We'll use least squares to solve them
-
-        let is_over_constrained = equations.len() > variables.len();
+        let is_over_constrained = compiled.equations.len() > variables.len();
 
         NewtonRaphsonSolver {
-            equations,
+            equations: compiled.equations,
             variables,
+            var_table: compiled.var_table,
             // Over-constrained systems are harder to converge, so give them more iterations
             max_iterations: if is_over_constrained { 200 } else { 100 },
             // Over-constrained systems use relaxed tolerance since exact solutions may not exist
@@ -229,14 +259,15 @@ impl NewtonRaphsonSolver {
     }
 
     /// Solve the system using standard Newton-Raphson method
-    pub fn solve(&self, initial_guess: HashMap<VarId, f64>) -> Result<Solution, SolverError> {
-        self.solve_modified(initial_guess, false)
+    pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
+        let vars = self.map_initial_guess(initial_guess)?;
+        self.solve_modified_internal(vars, false)
     }
 
     /// Core Newton-Raphson solver implementation with optional line search
     ///
     /// # Arguments
-    /// * `initial_guess` - Starting values for all variables
+    /// * `initial_guess` - Starting values for all variables (by name)
     /// * `use_line_search` - Whether to use backtracking line search for step size
     ///
     /// # Algorithm
@@ -247,7 +278,7 @@ impl NewtonRaphsonSolver {
     ///    - Under/over-constrained: QR least squares (with adaptive regularization if needed)
     /// 4. Update: x_new = x_old + damping * delta
     /// 5. Adapt damping based on error change
-    pub fn solve_modified(
+    fn solve_modified_internal(
         &self,
         initial_guess: HashMap<VarId, f64>,
         use_line_search: bool,
@@ -256,6 +287,8 @@ impl NewtonRaphsonSolver {
 
         let mut vars = initial_guess.clone();
         let jacobian = Jacobian::new(self.equations.clone(), self.variables.clone());
+        // Cache Jacobian storage to avoid per-iteration allocations.
+        let mut jacobian_workspace = jacobian.workspace();
         let mut convergence_history = Vec::with_capacity(self.max_iterations);
         // Start with configured damping factor, will be adapted during iterations
         let mut damping = self.damping_factor;
@@ -266,7 +299,7 @@ impl NewtonRaphsonSolver {
 
         let mut f_vals = Matrix::new(num_equations, 1);
         let mut f_neg = Matrix::new(num_equations, 1);
-        let mut j_matrix = Matrix::new(num_equations, num_variables);
+        jacobian_workspace.replace_jacobian(jacobian.evaluate_checked(&vars)?);
 
         let mut line_search_f_vals = Matrix::new(num_equations, 1);
 
@@ -290,7 +323,7 @@ impl NewtonRaphsonSolver {
             // Check for convergence: |f(x)| < tolerance
             if error < self.tolerance {
                 return Ok(Solution {
-                    values: vars,
+                    values: self.values_by_name(&vars),
                     iterations: iter + 1,
                     error,
                     converged: true,
@@ -327,63 +360,65 @@ impl NewtonRaphsonSolver {
 
             last_error = error;
 
-            // Step 2: Compute Jacobian matrix J = df/dx
-            jacobian.evaluate_checked_into(&vars, &mut j_matrix)?;
-
-            // Step 3: Solve linear system J * delta = -f(x)
             for i in 0..num_equations {
                 f_neg[(i, 0)] = -f_vals[(i, 0)];
             }
 
-            // Handle different system types with appropriate solving methods
-            let delta = if j_matrix.rows() == j_matrix.cols() {
-                // Square system (equations == variables)
-                // Use standard LU decomposition: J * delta = -f
-                match j_matrix.solve_lu(&f_neg) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // Matrix is singular - try with increased regularization
-                        let diag_size = j_matrix.rows().min(j_matrix.cols());
-                        for i in 0..diag_size {
-                            j_matrix[(i, i)] += self.regularization * 100.0;
-                        }
-                        match j_matrix.solve_lu(&f_neg) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                let diag = self.build_diagnostic(
-                                    format!("Matrix is singular even with regularization: {e}"),
-                                    iter + 1,
-                                    &vars,
-                                    &f_vals,
-                                );
-                                return Err(SolverError::SingularMatrix(diag));
+            // Step 2: Solve linear system J * delta = -f(x)
+            let delta = {
+                let j_matrix = jacobian_workspace.jacobian();
+                // Handle different system types with appropriate solving methods
+                if j_matrix.rows() == j_matrix.cols() {
+                    // Square system (equations == variables)
+                    // Use standard LU decomposition: J * delta = -f
+                    match j_matrix.solve_lu(&f_neg) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            // Matrix is singular - try with increased regularization
+                            let diag_size = j_matrix.rows().min(j_matrix.cols());
+                            for i in 0..diag_size {
+                                j_matrix[(i, i)] += self.regularization * 100.0;
+                            }
+                            match j_matrix.solve_lu(&f_neg) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    let diag = self.build_diagnostic(
+                                        format!(
+                                            "Matrix is singular even with regularization: {e}"
+                                        ),
+                                        iter + 1,
+                                        &vars,
+                                        &f_vals,
+                                    );
+                                    return Err(SolverError::SingularMatrix(diag));
+                                }
                             }
                         }
                     }
-                }
-            } else {
-                match self.solve_least_squares_delta(
-                    &j_matrix,
-                    &f_neg,
-                    least_squares_workspace.as_mut(),
-                ) {
-                    Ok(delta) => delta,
-                    Err(LeastSquaresSolveError::InvalidInput(err)) => {
-                        return Err(SolverError::InvalidInput(err.to_string()));
-                    }
-                    Err(LeastSquaresSolveError::Singular {
-                        qr_err,
-                        normal_eq_err,
-                    }) => {
-                        let diag = self.build_diagnostic(
-                            format!(
-                                "Least squares system is singular (qr_err: {qr_err}; normal_eq_err: {normal_eq_err})"
-                            ),
-                            iter + 1,
-                            &vars,
-                            &f_vals,
-                        );
-                        return Err(SolverError::SingularMatrix(diag));
+                } else {
+                    match self.solve_least_squares_delta(
+                        j_matrix,
+                        &f_neg,
+                        least_squares_workspace.as_mut(),
+                    ) {
+                        Ok(delta) => delta,
+                        Err(LeastSquaresSolveError::InvalidInput(err)) => {
+                            return Err(SolverError::InvalidInput(err.to_string()));
+                        }
+                        Err(LeastSquaresSolveError::Singular {
+                            qr_err,
+                            normal_eq_err,
+                        }) => {
+                            let diag = self.build_diagnostic(
+                                format!(
+                                    "Least squares system is singular (qr_err: {qr_err}; normal_eq_err: {normal_eq_err})"
+                                ),
+                                iter + 1,
+                                &vars,
+                                &f_vals,
+                            );
+                            return Err(SolverError::SingularMatrix(diag));
+                        }
                     }
                 }
             };
@@ -405,13 +440,16 @@ impl NewtonRaphsonSolver {
             // Additional convergence check: small step size indicates convergence
             if delta.norm() * step_size < self.tolerance {
                 return Ok(Solution {
-                    values: vars,
+                    values: self.values_by_name(&vars),
                     iterations: iter + 1,
                     error,
                     converged: true,
                     convergence_history,
                 });
             }
+
+            // Refresh Jacobian for next iteration
+            jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
         }
 
         // Failed to converge within max iterations
@@ -565,22 +603,57 @@ impl NewtonRaphsonSolver {
         })
     }
 
+    fn map_initial_guess(
+        &self,
+        initial_guess: HashMap<String, f64>,
+    ) -> Result<HashMap<VarId, f64>, SolverError> {
+        let mut unknown = Vec::new();
+        let mut vars = HashMap::new();
+
+        for (name, value) in initial_guess {
+            if let Some(id) = self.var_table.get_id(&name) {
+                vars.insert(id, value);
+            } else {
+                unknown.push(name);
+            }
+        }
+
+        if !unknown.is_empty() {
+            unknown.sort();
+            return Err(SolverError::InvalidInput(format!(
+                "Initial guess includes unknown variables: {unknown:?}"
+            )));
+        }
+
+        self.validate_initial_guess(&vars)?;
+        Ok(vars)
+    }
+
     fn validate_initial_guess(&self, vars: &HashMap<VarId, f64>) -> Result<(), SolverError> {
-        let mut missing: Vec<VarId> = self
-            .variables
-            .iter()
-            .copied()
-            .filter(|var_id| !vars.contains_key(var_id))
-            .collect();
+        let mut missing = Vec::new();
+        for (idx, name) in self.var_table.names().iter().enumerate() {
+            if !vars.contains_key(&VarId::new(idx)) {
+                missing.push(name.clone());
+            }
+        }
         if missing.is_empty() {
             return Ok(());
         }
 
-        missing.sort_unstable();
-        let missing_ids: Vec<usize> = missing.iter().map(|var_id| var_id.index()).collect();
+        missing.sort();
         Err(SolverError::InvalidInput(format!(
-            "Initial guess missing values for variable IDs: {missing_ids:?}"
+            "Initial guess missing values for variables: {missing:?}"
         )))
+    }
+
+    fn values_by_name(&self, vars: &HashMap<VarId, f64>) -> HashMap<String, f64> {
+        let mut values = HashMap::with_capacity(self.var_table.len());
+        for (idx, name) in self.var_table.names().iter().enumerate() {
+            if let Some(value) = vars.get(&VarId::new(idx)) {
+                values.insert(name.clone(), *value);
+            }
+        }
+        values
     }
 
     fn build_diagnostic(
@@ -599,7 +672,7 @@ impl NewtonRaphsonSolver {
             message,
             iterations,
             error: residuals_matrix.norm(),
-            values: vars.clone(),
+            values: self.values_by_name(vars),
             residuals,
         }
     }
@@ -662,15 +735,17 @@ impl NewtonRaphsonSolver {
     /// finding good step sizes, especially useful for difficult systems.
     pub fn solve_with_line_search(
         &self,
-        initial_guess: HashMap<VarId, f64>,
+        initial_guess: HashMap<String, f64>,
     ) -> Result<Solution, SolverError> {
-        self.solve_modified(initial_guess, true)
+        let vars = self.map_initial_guess(initial_guess)?;
+        self.solve_modified_internal(vars, true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::Compiler;
     use crate::exp::Exp;
 
     struct TestRng {
@@ -705,12 +780,23 @@ mod tests {
         Exp::sub(sum, Exp::val(rhs))
     }
 
+    fn solver_for(equations: Vec<Exp>) -> NewtonRaphsonSolver {
+        let compiled = Compiler::compile(&equations).expect("compile failed");
+        NewtonRaphsonSolver::new(compiled)
+    }
+
+    fn solver_for_with_vars(equations: Vec<Exp>, variables: &[&str]) -> NewtonRaphsonSolver {
+        let compiled = Compiler::compile(&equations).expect("compile failed");
+        NewtonRaphsonSolver::new_with_variables(compiled, variables)
+            .expect("failed to select solve variables")
+    }
+
     #[test]
     fn test_simple_system() {
         // Test system: x^2 + y^2 = 1, xy = 0.25
         // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         let eq1 = Exp::sub(
             Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
@@ -718,11 +804,11 @@ mod tests {
         );
         let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2], vec![VarId::new(0), VarId::new(1)]);
+        let solver = solver_for(vec![eq1, eq2]);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.5);
-        initial.insert(VarId::new(1), 0.866);
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.866);
 
         let solution = match solver.solve(initial.clone()) {
             Ok(sol) => sol,
@@ -734,8 +820,8 @@ mod tests {
         assert!(solution.converged);
         assert!(solution.error < 1e-10);
 
-        let x_sol = solution.values[&VarId::new(0)];
-        let y_sol = solution.values[&VarId::new(1)];
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
         assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
         assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
     }
@@ -743,28 +829,28 @@ mod tests {
     #[test]
     fn test_transcendental_system() {
         // Test transcendental system: sin(x) = 2y, cos(y) = x
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
         let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2], vec![VarId::new(0), VarId::new(1)])
+        let solver = solver_for(vec![eq1, eq2])
             .with_tolerance(1e-8)
             .with_max_iterations(50)
             .with_regularization(1e-8);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.5);
-        initial.insert(VarId::new(1), 0.25);
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.25);
 
         let solution = solver
             .solve_with_line_search(initial)
             .expect("Failed to solve transcendental system");
 
         assert!(solution.converged);
-        let x_sol = solution.values[&VarId::new(0)];
-        let y_sol = solution.values[&VarId::new(1)];
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
         assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
         assert!((y_sol.cos() - x_sol).abs() < 1e-8);
     }
@@ -773,42 +859,41 @@ mod tests {
     fn test_solver_errors_on_missing_variable() {
         // System: x - a = 0, solving for x with a treated as a fixed parameter.
         // Missing `a` should be an error (not implicitly treated as 0).
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let a = Exp::var("a".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let a = Exp::var("a");
         let eq = Exp::sub(x.clone(), a.clone());
 
-        let solver = NewtonRaphsonSolver::new(vec![eq], vec![VarId::new(0)]);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 1.0);
+        initial.insert("x".to_string(), 1.0);
 
         let err = solver.solve(initial).expect_err("expected missing variable error");
         match err {
-            SolverError::MissingVariable(missing) => {
-                assert_eq!(missing.var_id, VarId::new(1));
-                assert_eq!(missing.var_name, "a");
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("a"), "unexpected message: {msg}");
             }
-            other => panic!("expected MissingVariable, got {:?}", other),
+            other => panic!("expected InvalidInput, got {:?}", other),
         }
     }
 
     #[test]
     fn test_solver_invalid_input_on_missing_initial_guess_variable() {
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
         let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq], vec![VarId::new(0), VarId::new(1)]);
+        let solver = solver_for(vec![eq]);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
+        initial.insert("x".to_string(), 0.0);
 
         let err = solver
             .solve(initial)
             .expect_err("expected invalid input due to missing y");
         match err {
             SolverError::InvalidInput(msg) => {
-                assert!(msg.contains("[1]"), "unexpected message: {}", msg);
+                assert!(msg.contains("y"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidInput, got {:?}", other),
         }
@@ -816,10 +901,10 @@ mod tests {
 
     #[test]
     fn test_try_with_equation_traces_invalid_length() {
-        let x = Exp::var("x".to_string(), VarId::new(0));
+        let x = Exp::var("x");
         let eq = Exp::sub(x.clone(), Exp::val(1.0));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq], vec![VarId::new(0)]);
+        let solver = solver_for(vec![eq]);
 
         let traces = vec![
             Some(EquationTrace {
@@ -847,21 +932,21 @@ mod tests {
         // not part of `self.variables` but are referenced by equations.
         //
         // If line search drops them, evaluation errors and the solver fails.
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let a = Exp::var("a".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let a = Exp::var("a");
         let eq = Exp::sub(x.clone(), a.clone());
 
-        let solver = NewtonRaphsonSolver::new(vec![eq], vec![VarId::new(0)]);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
-        initial.insert(VarId::new(1), 2.0);
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("a".to_string(), 2.0);
 
         let solution = solver
             .solve_with_line_search(initial)
             .expect("solver should converge when fixed variables are provided");
         assert!(solution.converged);
-        assert!((solution.values[&VarId::new(0)] - 2.0).abs() < 1e-10);
+        assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
     }
 
     #[test]
@@ -873,8 +958,8 @@ mod tests {
         // least squares should still solve it.
         let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
 
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
         // b corresponds to solution (x,y) = (1,1)
@@ -888,88 +973,90 @@ mod tests {
             Exp::val(2.0 - eps),
         );
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2, eq3], vec![VarId::new(0), VarId::new(1)])
+        let solver = solver_for(vec![eq1, eq2, eq3])
             .with_regularization(0.0)
             .with_damping(1.0)
             .with_max_iterations(10)
             .with_tolerance(1e-10);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
-        initial.insert(VarId::new(1), 0.0);
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
         let solution = solver
             .solve(initial)
             .expect("expected solver to converge with QR least squares");
 
         assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values[&VarId::new(0)] - 1.0).abs() < 1e-8);
-        assert!((solution.values[&VarId::new(1)] - 1.0).abs() < 1e-8);
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
+        assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
     }
 
     #[test]
     fn test_underconstrained_system_returns_min_norm_solution() {
         // Underdetermined system: x + y = 1 has infinitely many solutions.
         // The solver should return the minimum-norm solution: x = 0.5, y = 0.5.
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
         let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
-        let solver = NewtonRaphsonSolver::new(vec![eq], vec![VarId::new(0), VarId::new(1)])
+        let solver = solver_for(vec![eq])
             .with_tolerance(1e-12)
             .with_max_iterations(10);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
-        initial.insert(VarId::new(1), 0.0);
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
         let solution = solver.solve(initial).expect("expected solver to converge");
         assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values[&VarId::new(0)] - 0.5).abs() < 1e-10);
-        assert!((solution.values[&VarId::new(1)] - 0.5).abs() < 1e-10);
+        assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
+        assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
     }
 
     #[test]
     fn test_rank_deficient_overconstrained_recovers_with_regularization() {
         // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let _y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-        let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
-        let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
-        let eq3 = Exp::sub(Exp::mul(x.clone(), Exp::val(3.0)), Exp::val(3.0));
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()), Exp::val(2.0));
+        let eq3 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()), Exp::val(3.0));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2, eq3], vec![VarId::new(0), VarId::new(1)])
+        let solver = solver_for(vec![eq1, eq2, eq3])
             .with_tolerance(1e-12)
             .with_max_iterations(10);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
-        initial.insert(VarId::new(1), 0.0);
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
         let solution = solver.solve(initial).expect("expected solver to converge");
         assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values[&VarId::new(0)] - 1.0).abs() < 1e-10);
-        assert!((solution.values[&VarId::new(1)] - 0.0).abs() < 1e-10);
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+        assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_rank_deficient_overconstrained_fails_without_regularization() {
-        let x = Exp::var("x".to_string(), VarId::new(0));
-        let _y = Exp::var("y".to_string(), VarId::new(1));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-        let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
-        let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
-        let eq3 = Exp::sub(Exp::mul(x.clone(), Exp::val(3.0)), Exp::val(3.0));
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()), Exp::val(2.0));
+        let eq3 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()), Exp::val(3.0));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2, eq3], vec![VarId::new(0), VarId::new(1)])
+        let solver = solver_for(vec![eq1, eq2, eq3])
             .with_regularization(0.0)
             .with_tolerance(1e-12)
             .with_max_iterations(10);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
-        initial.insert(VarId::new(1), 0.0);
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
         let err = solver.solve(initial).expect_err("expected singular matrix error");
         assert!(matches!(err, SolverError::SingularMatrix(_)), "{:?}", err);
@@ -978,20 +1065,20 @@ mod tests {
     #[test]
     fn test_overconstrained_consistent_system_solves() {
         // Overdetermined but consistent system: x = 1 and 2x = 2.
-        let x = Exp::var("x".to_string(), VarId::new(0));
+        let x = Exp::var("x");
         let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
         let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
 
-        let solver = NewtonRaphsonSolver::new(vec![eq1, eq2], vec![VarId::new(0)])
+        let solver = solver_for(vec![eq1, eq2])
             .with_tolerance(1e-12)
             .with_max_iterations(10);
 
         let mut initial = HashMap::new();
-        initial.insert(VarId::new(0), 0.0);
+        initial.insert("x".to_string(), 0.0);
 
         let solution = solver.solve(initial).expect("expected solver to converge");
         assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values[&VarId::new(0)] - 1.0).abs() < 1e-10);
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
     }
 
     #[test]
@@ -1015,28 +1102,24 @@ mod tests {
                 }
             }
 
-            let vars: Vec<Exp> = (0..n)
-                .map(|i| Exp::var(format!("x{i}"), VarId::new(i)))
-                .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
             let equations: Vec<Exp> = (0..n)
                 .map(|i| linear_equation(&a[i], &vars, b[i]))
                 .collect();
 
-            let solver = NewtonRaphsonSolver::new(
-                equations,
-                (0..n).map(VarId::new).collect(),
-            )
-            .with_tolerance(1e-12)
-            .with_max_iterations(20);
+            let solver = solver_for(equations)
+                .with_tolerance(1e-12)
+                .with_max_iterations(20);
 
             let mut initial = HashMap::new();
             for i in 0..n {
-                initial.insert(VarId::new(i), 0.0);
+                initial.insert(format!("x{i}"), 0.0);
             }
 
             let solution = solver.solve(initial).expect("expected to solve");
             for i in 0..n {
-                assert!((solution.values[&VarId::new(i)] - x_true[i]).abs() < 1e-8);
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - x_true[i]).abs() < 1e-8);
             }
         }
     }
@@ -1066,28 +1149,24 @@ mod tests {
                 }
             }
 
-            let vars: Vec<Exp> = (0..n)
-                .map(|i| Exp::var(format!("x{i}"), VarId::new(i)))
-                .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
             let equations: Vec<Exp> = (0..m)
                 .map(|i| linear_equation(&a[i], &vars, b[i]))
                 .collect();
 
-            let solver = NewtonRaphsonSolver::new(
-                equations,
-                (0..n).map(VarId::new).collect(),
-            )
-            .with_tolerance(1e-12)
-            .with_max_iterations(20);
+            let solver = solver_for(equations)
+                .with_tolerance(1e-12)
+                .with_max_iterations(20);
 
             let mut initial = HashMap::new();
             for i in 0..n {
-                initial.insert(VarId::new(i), 0.0);
+                initial.insert(format!("x{i}"), 0.0);
             }
 
             let solution = solver.solve(initial).expect("expected to solve");
             for i in 0..n {
-                assert!((solution.values[&VarId::new(i)] - x_true[i]).abs() < 1e-8);
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - x_true[i]).abs() < 1e-8);
             }
         }
     }
@@ -1097,33 +1176,30 @@ mod tests {
         let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
         let _m = 2;
         let n = 4;
-        let vars: Vec<Exp> = (0..n)
-            .map(|i| Exp::var(format!("x{i}"), VarId::new(i)))
-            .collect();
+        let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
 
         for _ in 0..5 {
             let b0 = rng.next_f64();
             let b1 = rng.next_f64();
-            let eq1 = Exp::sub(vars[0].clone(), Exp::val(b0));
-            let eq2 = Exp::sub(vars[1].clone(), Exp::val(b1));
+            let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
+            let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
+            let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
+            let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
 
-            let solver = NewtonRaphsonSolver::new(
-                vec![eq1, eq2],
-                (0..n).map(VarId::new).collect(),
-            )
-            .with_tolerance(1e-12)
-            .with_max_iterations(20);
+            let solver = solver_for(vec![eq1, eq2])
+                .with_tolerance(1e-12)
+                .with_max_iterations(20);
 
             let mut initial = HashMap::new();
             for i in 0..n {
-                initial.insert(VarId::new(i), 0.0);
+                initial.insert(format!("x{i}"), 0.0);
             }
 
             let solution = solver.solve(initial).expect("expected to solve");
-            assert!((solution.values[&VarId::new(0)] - b0).abs() < 1e-10);
-            assert!((solution.values[&VarId::new(1)] - b1).abs() < 1e-10);
-            assert!((solution.values[&VarId::new(2)]).abs() < 1e-10);
-            assert!((solution.values[&VarId::new(3)]).abs() < 1e-10);
+            assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
+            assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
+            assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
+            assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
         }
     }
 }

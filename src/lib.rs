@@ -22,16 +22,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+pub mod compiler;
 pub mod exp;
-pub mod jacobian;
+mod jacobian;
 pub mod matrix;
 pub mod solver;
 
 #[cfg(test)]
 mod matrix_test;
 
-pub use exp::{Exp, MissingVarError, VarId};
-pub use jacobian::Jacobian;
+pub use compiler::{CompileError, CompiledSystem, Compiler};
+pub use exp::{Exp, MissingVarError};
 pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 pub use solver::{
     EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverRunDiagnostic,
