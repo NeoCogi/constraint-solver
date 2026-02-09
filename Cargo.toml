@@ -16,3 +16,8 @@ keywords = [
 categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]
+
+[dev-dependencies]
+glow = "0.13"
+glfw = "0.55"
+rs-math3d = "0.9.24"
