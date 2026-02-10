@@ -22,20 +22,42 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-pub mod compiler;
-pub mod exp;
-mod jacobian;
-pub mod matrix;
-pub mod mode;
-pub mod solver;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
-#[cfg(test)]
-mod matrix_test;
+#[derive(Debug, Clone)]
+pub enum Mode {
+    Serial,
+    Parallel { thread_count: usize },
+}
 
-pub use compiler::{CompileError, CompiledSystem, Compiler};
-pub use exp::{Exp, MissingVarError};
-pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
-pub use mode::Mode;
-pub use solver::{
-    EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverRunDiagnostic,
-};
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Serial
+    }
+}
+
+impl Mode {
+    pub fn serial() -> Self {
+        Mode::Serial
+    }
+
+    pub fn parallel(thread_count: usize) -> Self {
+        Mode::Parallel { thread_count }
+    }
+}
+
+pub(crate) fn build_thread_pool(mode: &Mode) -> Result<Option<ThreadPool>, String> {
+    match mode {
+        Mode::Serial => Ok(None),
+        Mode::Parallel { thread_count } => {
+            if *thread_count == 0 {
+                return Err("thread_count must be greater than 0".to_string());
+            }
+            ThreadPoolBuilder::new()
+                .num_threads(*thread_count)
+                .build()
+                .map(Some)
+                .map_err(|err| format!("failed to build thread pool: {err}"))
+        }
+    }
+}

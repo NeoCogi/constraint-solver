@@ -40,9 +40,13 @@ mod additional_matrix_tests {
         assert!((x[(1, 0)] - 2.0).abs() < 1e-10);
 
         // Verify
-        let ax = &a * &x;
-        assert!((ax[(0, 0)] - b[(0, 0)]).abs() < 1e-10);
-        assert!((ax[(1, 0)] - b[(1, 0)]).abs() < 1e-10);
+        let ax_serial = a.try_mul_with_parallel(&x, false).unwrap();
+        let ax_parallel = a.try_mul_with_parallel(&x, true).unwrap();
+        for i in 0..2 {
+            assert!((ax_serial[(i, 0)] - ax_parallel[(i, 0)]).abs() < 1e-12);
+        }
+        assert!((ax_serial[(0, 0)] - b[(0, 0)]).abs() < 1e-10);
+        assert!((ax_serial[(1, 0)] - b[(1, 0)]).abs() < 1e-10);
     }
 
     #[test]
@@ -68,9 +72,11 @@ mod additional_matrix_tests {
         assert!((x[(3, 0)] - (-0.5)).abs() < 1e-10);
 
         // Verify J*x = b
-        let jx = &j * &x;
+        let jx_serial = j.try_mul_with_parallel(&x, false).unwrap();
+        let jx_parallel = j.try_mul_with_parallel(&x, true).unwrap();
         for i in 0..4 {
-            assert!((jx[(i, 0)] - b[(i, 0)]).abs() < 1e-10);
+            assert!((jx_serial[(i, 0)] - jx_parallel[(i, 0)]).abs() < 1e-12);
+            assert!((jx_serial[(i, 0)] - b[(i, 0)]).abs() < 1e-10);
         }
     }
 

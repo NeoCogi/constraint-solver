@@ -16,8 +16,14 @@ keywords = [
 categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]
+rayon = "1.8"
 
 [dev-dependencies]
+criterion = "0.5"
 glow = "0.13"
 glfw = "0.55"
 rs-math3d = "0.9.24"
+
+[[bench]]
+name = "linear_algebra"
+harness = false

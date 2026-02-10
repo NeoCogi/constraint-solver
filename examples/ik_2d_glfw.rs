@@ -382,10 +382,10 @@ fn main() {
 
     let compiled = Compiler::compile(&equations).expect("compile");
     // Only the joints are solved for; the target is provided as a parameter.
-    let joints = [&joint1, &joint2, &joint3, &joint4];
+    let joints: [&dyn IKConstraint; 4] = [&joint1, &joint2, &joint3, &joint4];
     let mut solve_var_names = Vec::with_capacity(joints.len() * 2);
     for joint in joints {
-        solve_var_names.extend(joint.vars.variables().iter().cloned());
+        solve_var_names.extend(joint.variables().iter().cloned());
     }
     let solve_var_refs: Vec<&str> = solve_var_names.iter().map(|s| s.as_str()).collect();
     let solver =

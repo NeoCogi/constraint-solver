@@ -25,6 +25,14 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
 
+use rayon::prelude::*;
+
+const PARALLEL_THRESHOLD: usize = 16_384;
+
+fn should_parallelize(rows: usize, cols: usize) -> bool {
+    rows.saturating_mul(cols) >= PARALLEL_THRESHOLD
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixError {
     DimensionMismatch {
@@ -98,7 +106,24 @@ impl Matrix {
     }
 
     pub fn transpose(&self) -> Matrix {
+        self.transpose_with_parallel(false)
+    }
+
+    pub fn transpose_with_parallel(&self, parallel: bool) -> Matrix {
         let mut result = Matrix::new(self.cols, self.rows);
+        if parallel && should_parallelize(self.rows, self.cols) {
+            result
+                .data
+                .par_chunks_mut(self.rows)
+                .enumerate()
+                .for_each(|(j, row)| {
+                    for i in 0..self.rows {
+                        row[i] = self[(i, j)];
+                    }
+                });
+            return result;
+        }
+
         for i in 0..self.rows {
             for j in 0..self.cols {
                 result[(j, i)] = self[(i, j)];
@@ -225,11 +250,28 @@ impl Matrix {
             .map(|(solution, _)| solution)
     }
 
+    pub fn solve_least_squares_qr_with_parallel(
+        &self,
+        b: &Matrix,
+        parallel: bool,
+    ) -> Result<Matrix, String> {
+        self.solve_least_squares_qr_with_info_with_parallel(b, parallel)
+            .map(|(solution, _)| solution)
+    }
+
     /// Solve a (possibly non-square) least squares problem using Householder QR,
     /// returning diagnostic information about rank and conditioning.
     pub fn solve_least_squares_qr_with_info(
         &self,
         b: &Matrix,
+    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
+        self.solve_least_squares_qr_with_info_with_parallel(b, false)
+    }
+
+    pub fn solve_least_squares_qr_with_info_with_parallel(
+        &self,
+        b: &Matrix,
+        parallel: bool,
     ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         if b.cols != 1 {
             return Err("Invalid dimensions for b (expected column vector)".to_string());
@@ -253,15 +295,16 @@ impl Matrix {
         }
 
         if m >= n {
-            Self::solve_least_squares_qr_tall_with_info(self, b)
+            Self::solve_least_squares_qr_tall_with_info(self, b, parallel)
         } else {
-            Self::solve_least_squares_qr_wide_with_info(self, b)
+            Self::solve_least_squares_qr_wide_with_info(self, b, parallel)
         }
     }
 
     fn solve_least_squares_qr_tall_with_info(
         a: &Matrix,
         b: &Matrix,
+        parallel: bool,
     ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         let m = a.rows;
         let n = a.cols;
@@ -301,16 +344,62 @@ impl Matrix {
             taus.push(tau);
 
             // Apply reflector to remaining columns.
-            for j in (k + 1)..n {
-                let mut dot = r[(k, j)];
-                for i in (k + 1)..m {
-                    dot += r[(i, k)] * r[(i, j)];
-                }
-                dot *= tau;
+            let cols_left = n.saturating_sub(k + 1);
+            if cols_left > 0 {
+                let use_parallel = parallel && should_parallelize(m - (k + 1), cols_left);
+                let dots: Vec<f64> = if use_parallel {
+                    (0..cols_left)
+                        .into_par_iter()
+                        .map(|offset| {
+                            let j = k + 1 + offset;
+                            let mut dot = r[(k, j)];
+                            for i in (k + 1)..m {
+                                dot += r[(i, k)] * r[(i, j)];
+                            }
+                            dot * tau
+                        })
+                        .collect()
+                } else {
+                    let mut dots = Vec::with_capacity(cols_left);
+                    for j in (k + 1)..n {
+                        let mut dot = r[(k, j)];
+                        for i in (k + 1)..m {
+                            dot += r[(i, k)] * r[(i, j)];
+                        }
+                        dots.push(dot * tau);
+                    }
+                    dots
+                };
 
-                r[(k, j)] -= dot;
-                for i in (k + 1)..m {
-                    r[(i, j)] -= r[(i, k)] * dot;
+                for (offset, dot) in dots.iter().enumerate() {
+                    let j = k + 1 + offset;
+                    r[(k, j)] -= dot;
+                }
+
+                if use_parallel {
+                    let cols = r.cols;
+                    let j_start = k + 1;
+                    let k_col = k;
+                    r.data[(k + 1) * cols..]
+                        .par_chunks_mut(cols)
+                        .for_each(|row| {
+                            let vik = row[k_col];
+                            if vik != 0.0 {
+                                for (offset, dot) in dots.iter().enumerate() {
+                                    row[j_start + offset] -= vik * dot;
+                                }
+                            }
+                        });
+                } else {
+                    for i in (k + 1)..m {
+                        let vik = r[(i, k)];
+                        if vik != 0.0 {
+                            for (offset, dot) in dots.iter().enumerate() {
+                                let j = k + 1 + offset;
+                                r[(i, j)] -= vik * dot;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -321,8 +410,24 @@ impl Matrix {
             }
             dot *= tau;
             qt_b[(k, 0)] -= dot;
-            for i in (k + 1)..m {
-                qt_b[(i, 0)] -= r[(i, k)] * dot;
+
+            let use_parallel = parallel && should_parallelize(m - (k + 1), 1);
+            if use_parallel {
+                let cols = r.cols;
+                let k_col = k;
+                let r_data = &r.data;
+                qt_b.data[(k + 1)..]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(idx, val)| {
+                        let i = k + 1 + idx;
+                        let vik = r_data[i * cols + k_col];
+                        *val -= vik * dot;
+                    });
+            } else {
+                for i in (k + 1)..m {
+                    qt_b[(i, 0)] -= r[(i, k)] * dot;
+                }
             }
 
             r[(k, k)] = alpha;
@@ -387,6 +492,7 @@ impl Matrix {
     fn solve_least_squares_qr_wide_with_info(
         a: &Matrix,
         b: &Matrix,
+        parallel: bool,
     ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
         // Use QR on A^T to compute the minimum-norm least squares solution.
         //
@@ -428,15 +534,62 @@ impl Matrix {
             let tau = 2.0 / v_sq;
             taus.push(tau);
 
-            for j in (k + 1)..m {
-                let mut dot = r[(k, j)];
-                for i in (k + 1)..n {
-                    dot += r[(i, k)] * r[(i, j)];
+            let cols_left = m.saturating_sub(k + 1);
+            if cols_left > 0 {
+                let use_parallel = parallel && should_parallelize(n - (k + 1), cols_left);
+                let dots: Vec<f64> = if use_parallel {
+                    (0..cols_left)
+                        .into_par_iter()
+                        .map(|offset| {
+                            let j = k + 1 + offset;
+                            let mut dot = r[(k, j)];
+                            for i in (k + 1)..n {
+                                dot += r[(i, k)] * r[(i, j)];
+                            }
+                            dot * tau
+                        })
+                        .collect()
+                } else {
+                    let mut dots = Vec::with_capacity(cols_left);
+                    for j in (k + 1)..m {
+                        let mut dot = r[(k, j)];
+                        for i in (k + 1)..n {
+                            dot += r[(i, k)] * r[(i, j)];
+                        }
+                        dots.push(dot * tau);
+                    }
+                    dots
+                };
+
+                for (offset, dot) in dots.iter().enumerate() {
+                    let j = k + 1 + offset;
+                    r[(k, j)] -= dot;
                 }
-                dot *= tau;
-                r[(k, j)] -= dot;
-                for i in (k + 1)..n {
-                    r[(i, j)] -= r[(i, k)] * dot;
+
+                if use_parallel {
+                    let cols = r.cols;
+                    let j_start = k + 1;
+                    let k_col = k;
+                    r.data[(k + 1) * cols..]
+                        .par_chunks_mut(cols)
+                        .for_each(|row| {
+                            let vik = row[k_col];
+                            if vik != 0.0 {
+                                for (offset, dot) in dots.iter().enumerate() {
+                                    row[j_start + offset] -= vik * dot;
+                                }
+                            }
+                        });
+                } else {
+                    for i in (k + 1)..n {
+                        let vik = r[(i, k)];
+                        if vik != 0.0 {
+                            for (offset, dot) in dots.iter().enumerate() {
+                                let j = k + 1 + offset;
+                                r[(i, j)] -= vik * dot;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -509,8 +662,24 @@ impl Matrix {
             dot *= tau;
 
             w[k] -= dot;
-            for i in (k + 1)..n {
-                w[i] -= r[(i, k)] * dot;
+
+            let use_parallel = parallel && should_parallelize(n - (k + 1), 1);
+            if use_parallel {
+                let cols = r.cols;
+                let k_col = k;
+                let r_data = &r.data;
+                w[(k + 1)..]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(idx, val)| {
+                        let i = k + 1 + idx;
+                        let vik = r_data[i * cols + k_col];
+                        *val -= vik * dot;
+                    });
+            } else {
+                for i in (k + 1)..n {
+                    w[i] -= r[(i, k)] * dot;
+                }
             }
         }
 
@@ -562,6 +731,10 @@ impl Matrix {
     }
 
     pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
+        self.try_mul_with_parallel(rhs, false)
+    }
+
+    pub fn try_mul_with_parallel(&self, rhs: &Matrix, parallel: bool) -> Result<Matrix, MatrixError> {
         if self.cols != rhs.rows {
             return Err(MatrixError::DimensionMismatch {
                 operation: "mul",
@@ -571,10 +744,29 @@ impl Matrix {
         }
 
         let mut result = Matrix::new(self.rows, rhs.cols);
+        if parallel && should_parallelize(self.rows, rhs.cols) {
+            let rhs_cols = rhs.cols;
+            result
+                .data
+                .par_chunks_mut(rhs_cols)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    for k in 0..self.cols {
+                        let a = self[(i, k)];
+                        let rhs_row = &rhs.data[k * rhs_cols..(k + 1) * rhs_cols];
+                        for j in 0..rhs_cols {
+                            row[j] += a * rhs_row[j];
+                        }
+                    }
+                });
+            return Ok(result);
+        }
+
         for i in 0..self.rows {
-            for j in 0..rhs.cols {
-                for k in 0..self.cols {
-                    result[(i, j)] += self[(i, k)] * rhs[(k, j)];
+            for k in 0..self.cols {
+                let a = self[(i, k)];
+                for j in 0..rhs.cols {
+                    result[(i, j)] += a * rhs[(k, j)];
                 }
             }
         }
@@ -685,6 +877,17 @@ mod tests {
         m
     }
 
+    fn assert_matrix_close(a: &Matrix, b: &Matrix, tol: f64) {
+        assert_eq!(a.rows(), b.rows());
+        assert_eq!(a.cols(), b.cols());
+        for i in 0..a.rows() {
+            for j in 0..a.cols() {
+                let diff = (a[(i, j)] - b[(i, j)]).abs();
+                assert!(diff <= tol, "mismatch at ({i},{j}): {diff}");
+            }
+        }
+    }
+
     #[test]
     fn test_matrix_creation() {
         let m = Matrix::new(2, 3);
@@ -712,13 +915,15 @@ mod tests {
         m[(1, 1)] = 5.0;
         m[(1, 2)] = 6.0;
 
-        let mt = m.transpose();
-        assert_eq!(mt.rows(), 3);
-        assert_eq!(mt.cols(), 2);
-        assert_eq!(mt[(0, 0)], 1.0);
-        assert_eq!(mt[(1, 0)], 2.0);
-        assert_eq!(mt[(2, 0)], 3.0);
-        assert_eq!(mt[(0, 1)], 4.0);
+        let mt_serial = m.transpose_with_parallel(false);
+        let mt_parallel = m.transpose_with_parallel(true);
+        assert_matrix_close(&mt_serial, &mt_parallel, 0.0);
+        assert_eq!(mt_serial.rows(), 3);
+        assert_eq!(mt_serial.cols(), 2);
+        assert_eq!(mt_serial[(0, 0)], 1.0);
+        assert_eq!(mt_serial[(1, 0)], 2.0);
+        assert_eq!(mt_serial[(2, 0)], 3.0);
+        assert_eq!(mt_serial[(0, 1)], 4.0);
     }
 
     #[test]
@@ -739,13 +944,60 @@ mod tests {
         b[(2, 0)] = 11.0;
         b[(2, 1)] = 12.0;
 
-        let c = &a * &b;
-        assert_eq!(c.rows(), 2);
-        assert_eq!(c.cols(), 2);
-        assert_eq!(c[(0, 0)], 58.0);
-        assert_eq!(c[(0, 1)], 64.0);
-        assert_eq!(c[(1, 0)], 139.0);
-        assert_eq!(c[(1, 1)], 154.0);
+        let c_serial = a.try_mul_with_parallel(&b, false).unwrap();
+        let c_parallel = a.try_mul_with_parallel(&b, true).unwrap();
+        assert_matrix_close(&c_serial, &c_parallel, 0.0);
+        assert_eq!(c_serial.rows(), 2);
+        assert_eq!(c_serial.cols(), 2);
+        assert_eq!(c_serial[(0, 0)], 58.0);
+        assert_eq!(c_serial[(0, 1)], 64.0);
+        assert_eq!(c_serial[(1, 0)], 139.0);
+        assert_eq!(c_serial[(1, 1)], 154.0);
+    }
+
+    #[test]
+    fn test_parallel_equivalence_threshold_size() {
+        let size = 128;
+        let mut rng = TestRng::new(0x3e5a_9f21_d00d_cafe);
+
+        let a = random_matrix(size, size, &mut rng);
+        let b = random_matrix(size, size, &mut rng);
+
+        let c_serial = a.try_mul_with_parallel(&b, false).unwrap();
+        let c_parallel = a.try_mul_with_parallel(&b, true).unwrap();
+        assert_matrix_close(&c_serial, &c_parallel, 1e-10);
+
+        let t_serial = a.transpose_with_parallel(false);
+        let t_parallel = a.transpose_with_parallel(true);
+        assert_matrix_close(&t_serial, &t_parallel, 0.0);
+
+        let m = size * 4;
+        let n = size;
+        let tall = random_matrix(m, n, &mut rng);
+        let tall_b = random_matrix(m, 1, &mut rng);
+        let (x_serial, info_serial) =
+            tall.solve_least_squares_qr_with_info_with_parallel(&tall_b, false)
+                .unwrap();
+        let (x_parallel, info_parallel) =
+            tall.solve_least_squares_qr_with_info_with_parallel(&tall_b, true)
+                .unwrap();
+        assert_eq!(info_serial.rank, info_parallel.rank);
+        assert!(info_serial.cond_est.is_finite());
+        assert!(info_parallel.cond_est.is_finite());
+        assert_matrix_close(&x_serial, &x_parallel, 1e-7);
+
+        let wide = random_matrix(n, m, &mut rng);
+        let wide_b = random_matrix(n, 1, &mut rng);
+        let (x_serial, info_serial) =
+            wide.solve_least_squares_qr_with_info_with_parallel(&wide_b, false)
+                .unwrap();
+        let (x_parallel, info_parallel) =
+            wide.solve_least_squares_qr_with_info_with_parallel(&wide_b, true)
+                .unwrap();
+        assert_eq!(info_serial.rank, info_parallel.rank);
+        assert!(info_serial.cond_est.is_finite());
+        assert!(info_parallel.cond_est.is_finite());
+        assert_matrix_close(&x_serial, &x_parallel, 1e-7);
     }
 
     #[test]
@@ -755,10 +1007,12 @@ mod tests {
 
         let x = a.solve_lu(&b).unwrap();
 
-        let verify = &a * &x;
+        let verify_serial = a.try_mul_with_parallel(&x, false).unwrap();
+        let verify_parallel = a.try_mul_with_parallel(&x, true).unwrap();
+        assert_matrix_close(&verify_serial, &verify_parallel, 0.0);
 
-        assert!((verify[(0, 0)] - b[(0, 0)]).abs() < 1e-10);
-        assert!((verify[(1, 0)] - b[(1, 0)]).abs() < 1e-10);
+        assert!((verify_serial[(0, 0)] - b[(0, 0)]).abs() < 1e-10);
+        assert!((verify_serial[(1, 0)] - b[(1, 0)]).abs() < 1e-10);
     }
 
     #[test]
@@ -814,15 +1068,21 @@ mod tests {
         let a = Matrix::new(2, 3);
         let b = Matrix::new(2, 2);
 
-        let err = a.try_mul(&b).expect_err("expected dimension mismatch");
+        let err_serial = a
+            .try_mul_with_parallel(&b, false)
+            .expect_err("expected dimension mismatch");
+        let err_parallel = a
+            .try_mul_with_parallel(&b, true)
+            .expect_err("expected dimension mismatch");
         assert_eq!(
-            err,
+            err_serial,
             MatrixError::DimensionMismatch {
                 operation: "mul",
                 left: (2, 3),
                 right: (2, 2),
             }
         );
+        assert_eq!(err_serial, err_parallel);
     }
 
     #[test]
@@ -831,9 +1091,11 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let x = a.solve_least_squares_qr(&b).unwrap();
-        assert!((x[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x[(1, 0)] - 2.0).abs() < 1e-12);
+        let x_serial = a.solve_least_squares_qr_with_parallel(&b, false).unwrap();
+        let x_parallel = a.solve_least_squares_qr_with_parallel(&b, true).unwrap();
+        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
+        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -842,9 +1104,11 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 1.0], 1, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
 
-        let x = a.solve_least_squares_qr(&b).unwrap();
-        assert!((x[(0, 0)] - 0.5).abs() < 1e-12);
-        assert!((x[(1, 0)] - 0.5).abs() < 1e-12);
+        let x_serial = a.solve_least_squares_qr_with_parallel(&b, false).unwrap();
+        let x_parallel = a.solve_least_squares_qr_with_parallel(&b, true).unwrap();
+        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
+        assert!((x_serial[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!((x_serial[(1, 0)] - 0.5).abs() < 1e-12);
     }
 
     #[test]
@@ -859,11 +1123,20 @@ mod tests {
             let x_mat = Matrix::from_vec(x_true.clone(), 3, 1).unwrap();
             let b = &a * &x_mat;
 
-            let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
-            assert_eq!(info.rank, 3);
-            assert!(info.cond_est.is_finite());
+            let (x_serial, info_serial) =
+                a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                    .unwrap();
+            let (x_parallel, info_parallel) =
+                a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                    .unwrap();
+            assert_eq!(info_serial.rank, 3);
+            assert_eq!(info_parallel.rank, 3);
+            assert!(info_serial.cond_est.is_finite());
+            assert!(info_parallel.cond_est.is_finite());
+            assert_matrix_close(&x_serial, &x_parallel, 1e-8);
             for i in 0..3 {
-                assert!((x[(i, 0)] - x_true[i]).abs() < 1e-8);
+                assert!((x_serial[(i, 0)] - x_true[i]).abs() < 1e-8);
+                assert!((x_parallel[(i, 0)] - x_true[i]).abs() < 1e-8);
             }
         }
     }
@@ -880,13 +1153,25 @@ mod tests {
             let b1 = rng.next_f64();
             let b = Matrix::from_vec(vec![b0, b1], 2, 1).unwrap();
 
-            let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
-            assert_eq!(info.rank, 2);
-            assert!(info.cond_est.is_finite());
-            assert!((x[(0, 0)] - b0).abs() < 1e-12);
-            assert!((x[(1, 0)] - b1).abs() < 1e-12);
-            assert!((x[(2, 0)]).abs() < 1e-12);
-            assert!((x[(3, 0)]).abs() < 1e-12);
+            let (x_serial, info_serial) =
+                a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                    .unwrap();
+            let (x_parallel, info_parallel) =
+                a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                    .unwrap();
+            assert_eq!(info_serial.rank, 2);
+            assert_eq!(info_parallel.rank, 2);
+            assert!(info_serial.cond_est.is_finite());
+            assert!(info_parallel.cond_est.is_finite());
+            assert_matrix_close(&x_serial, &x_parallel, 1e-12);
+            assert!((x_serial[(0, 0)] - b0).abs() < 1e-12);
+            assert!((x_serial[(1, 0)] - b1).abs() < 1e-12);
+            assert!((x_serial[(2, 0)]).abs() < 1e-12);
+            assert!((x_serial[(3, 0)]).abs() < 1e-12);
+            assert!((x_parallel[(0, 0)] - b0).abs() < 1e-12);
+            assert!((x_parallel[(1, 0)] - b1).abs() < 1e-12);
+            assert!((x_parallel[(2, 0)]).abs() < 1e-12);
+            assert!((x_parallel[(3, 0)]).abs() < 1e-12);
         }
     }
 
@@ -898,9 +1183,16 @@ mod tests {
         }
         let b = Matrix::from_vec(vec![0.0, 0.0, 0.0], 3, 1).unwrap();
 
-        let (_x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
-        assert_eq!(info.rank, 3);
-        assert!(info.cond_est > 1e6, "cond_est was {}", info.cond_est);
+        let (_x_serial, info_serial) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                .unwrap();
+        let (_x_parallel, info_parallel) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                .unwrap();
+        assert_eq!(info_serial.rank, 3);
+        assert_eq!(info_parallel.rank, 3);
+        assert!(info_serial.cond_est > 1e6, "cond_est was {}", info_serial.cond_est);
+        assert!(info_parallel.cond_est > 1e6, "cond_est was {}", info_parallel.cond_est);
     }
 
     #[test]
@@ -908,11 +1200,19 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
-        assert_eq!(info.rank, 2);
-        assert!(info.cond_est.is_finite());
-        assert!((x[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x[(1, 0)] - 2.0).abs() < 1e-12);
+        let (x_serial, info_serial) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                .unwrap();
+        let (x_parallel, info_parallel) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                .unwrap();
+        assert_eq!(info_serial.rank, 2);
+        assert_eq!(info_parallel.rank, 2);
+        assert!(info_serial.cond_est.is_finite());
+        assert!(info_parallel.cond_est.is_finite());
+        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
+        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -920,12 +1220,20 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 2, 3).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
-        let (x, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
-        assert_eq!(info.rank, 2);
-        assert!(info.cond_est.is_finite());
-        assert!((x[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x[(1, 0)] - 2.0).abs() < 1e-12);
-        assert!((x[(2, 0)] - 0.0).abs() < 1e-12);
+        let (x_serial, info_serial) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                .unwrap();
+        let (x_parallel, info_parallel) =
+            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                .unwrap();
+        assert_eq!(info_serial.rank, 2);
+        assert_eq!(info_parallel.rank, 2);
+        assert!(info_serial.cond_est.is_finite());
+        assert!(info_parallel.cond_est.is_finite());
+        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
+        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
+        assert!((x_serial[(2, 0)] - 0.0).abs() < 1e-12);
     }
 
     #[test]
@@ -933,9 +1241,13 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 1.0, 2.0, 2.0], 2, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
-        let err = a
-            .solve_least_squares_qr_with_info(&b)
+        let err_serial = a
+            .solve_least_squares_qr_with_info_with_parallel(&b, false)
             .expect_err("expected rank-deficient QR solve to fail");
-        assert!(err.contains("rank deficient"), "{err}");
+        let err_parallel = a
+            .solve_least_squares_qr_with_info_with_parallel(&b, true)
+            .expect_err("expected rank-deficient QR solve to fail");
+        assert!(err_serial.contains("rank deficient"), "{err_serial}");
+        assert!(err_parallel.contains("rank deficient"), "{err_parallel}");
     }
 }

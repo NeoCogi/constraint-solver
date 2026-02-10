@@ -26,6 +26,8 @@ use crate::compiler::{CompiledExp, CompiledSystem, VarId, VarTable};
 use crate::exp::MissingVarError;
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
+use crate::mode::{build_thread_pool, Mode};
+use rayon::ThreadPool;
 use std::collections::HashMap;
 
 struct LeastSquaresWorkspace {
@@ -84,6 +86,10 @@ pub struct NewtonRaphsonSolver {
     regularization: f64,
     /// Optional metadata describing the source of each equation in the system
     equation_traces: Vec<Option<EquationTrace>>,
+    /// Execution mode for linear algebra (serial vs parallel)
+    mode: Mode,
+    /// Optional thread pool for parallel execution
+    pool: Option<ThreadPool>,
 }
 
 /// Solution result containing the solved variable values and convergence info
@@ -158,6 +164,12 @@ impl NewtonRaphsonSolver {
         Self::build(compiled, variables)
     }
 
+    /// Create a new solver with an explicit execution mode.
+    pub fn new_with_mode(compiled: CompiledSystem, mode: Mode) -> Result<Self, SolverError> {
+        let variables = compiled.var_table.all_var_ids();
+        Self::build_with_mode(compiled, variables, mode)
+    }
+
     /// Create a solver while specifying which variables to solve for.
     ///
     /// Variables not listed here are treated as fixed parameters and must be
@@ -180,6 +192,27 @@ impl NewtonRaphsonSolver {
         Ok(Self::build(compiled, ids))
     }
 
+    /// Create a solver with explicit variables and execution mode.
+    pub fn new_with_variables_and_mode(
+        compiled: CompiledSystem,
+        variables: &[&str],
+        mode: Mode,
+    ) -> Result<Self, SolverError> {
+        let mut ids = Vec::with_capacity(variables.len());
+        let mut seen = std::collections::HashSet::new();
+        for name in variables {
+            let id = compiled
+                .var_table
+                .get_id(name)
+                .ok_or_else(|| SolverError::InvalidInput(format!("Unknown variable '{name}'")))?;
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+
+        Self::build_with_mode(compiled, ids, mode)
+    }
+
     fn build(compiled: CompiledSystem, variables: Vec<VarId>) -> Self {
         // Allow both under-constrained and over-constrained systems
         // We'll use least squares to solve them
@@ -199,6 +232,52 @@ impl NewtonRaphsonSolver {
             // Over-constrained systems need more regularization for numerical stability
             regularization: if is_over_constrained { 1e-4 } else { 1e-8 },
             equation_traces: Vec::new(),
+            mode: Mode::Serial,
+            pool: None,
+        }
+    }
+
+    fn build_with_mode(
+        compiled: CompiledSystem,
+        variables: Vec<VarId>,
+        mode: Mode,
+    ) -> Result<Self, SolverError> {
+        let mut solver = Self::build(compiled, variables);
+        solver.set_mode(mode)?;
+        Ok(solver)
+    }
+
+    /// Update the execution mode for this solver.
+    pub fn with_mode(mut self, mode: Mode) -> Result<Self, SolverError> {
+        self.set_mode(mode)?;
+        Ok(self)
+    }
+
+    /// Returns the current execution mode.
+    pub fn mode(&self) -> &Mode {
+        &self.mode
+    }
+
+    fn set_mode(&mut self, mode: Mode) -> Result<(), SolverError> {
+        let pool = build_thread_pool(&mode).map_err(SolverError::InvalidInput)?;
+        self.mode = mode;
+        self.pool = pool;
+        Ok(())
+    }
+
+    fn parallel_enabled(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    fn run_in_mode<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        if let Some(pool) = &self.pool {
+            pool.install(f)
+        } else {
+            f()
         }
     }
 
@@ -261,7 +340,7 @@ impl NewtonRaphsonSolver {
     /// Solve the system using standard Newton-Raphson method
     pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
         let vars = self.map_initial_guess(initial_guess)?;
-        self.solve_modified_internal(vars, false)
+        self.run_in_mode(|| self.solve_modified_internal(vars, false))
     }
 
     /// Core Newton-Raphson solver implementation with optional line search
@@ -313,6 +392,7 @@ impl NewtonRaphsonSolver {
             } else {
                 None
             };
+        let parallel = self.parallel_enabled();
 
         for iter in 0..self.max_iterations {
             // Step 1: Evaluate function values f(x)
@@ -400,6 +480,7 @@ impl NewtonRaphsonSolver {
                         j_matrix,
                         &f_neg,
                         least_squares_workspace.as_mut(),
+                        parallel,
                     ) {
                         Ok(delta) => delta,
                         Err(LeastSquaresSolveError::InvalidInput(err)) => {
@@ -472,6 +553,7 @@ impl NewtonRaphsonSolver {
         j_matrix: &Matrix,
         f_neg: &Matrix,
         workspace: Option<&mut LeastSquaresWorkspace>,
+        parallel: bool,
     ) -> Result<Matrix, LeastSquaresSolveError> {
         let mut workspace = workspace;
         // Prefer QR-based least squares to avoid forming normal equations (J^T J), which can
@@ -491,7 +573,7 @@ impl NewtonRaphsonSolver {
         let mut unreg_delta: Option<Matrix> = None;
         let mut unreg_info: Option<LeastSquaresQrInfo> = None;
 
-        match j_matrix.solve_least_squares_qr_with_info(f_neg) {
+        match j_matrix.solve_least_squares_qr_with_info_with_parallel(f_neg, parallel) {
             Ok((delta, info)) => {
                 if !is_ill_conditioned(&info) {
                     return Ok(delta);
@@ -555,7 +637,10 @@ impl NewtonRaphsonSolver {
 
                     workspace
                         .augmented_j
-                        .solve_least_squares_qr_with_info(&workspace.augmented_b)
+                        .solve_least_squares_qr_with_info_with_parallel(
+                            &workspace.augmented_b,
+                            parallel,
+                        )
                 }
                 None => {
                     let mut augmented_j =
@@ -571,7 +656,10 @@ impl NewtonRaphsonSolver {
                         augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
                         augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
                     }
-                    augmented_j.solve_least_squares_qr_with_info(&augmented_b)
+                    augmented_j.solve_least_squares_qr_with_info_with_parallel(
+                        &augmented_b,
+                        parallel,
+                    )
                 }
             };
 
@@ -738,7 +826,7 @@ impl NewtonRaphsonSolver {
         initial_guess: HashMap<String, f64>,
     ) -> Result<Solution, SolverError> {
         let vars = self.map_initial_guess(initial_guess)?;
-        self.solve_modified_internal(vars, true)
+        self.run_in_mode(|| self.solve_modified_internal(vars, true))
     }
 }
 
@@ -747,6 +835,7 @@ mod tests {
     use super::*;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
+    use crate::Mode;
 
     struct TestRng {
         state: u64,
@@ -780,426 +869,611 @@ mod tests {
         Exp::sub(sum, Exp::val(rhs))
     }
 
-    fn solver_for(equations: Vec<Exp>) -> NewtonRaphsonSolver {
-        let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new(compiled)
+    fn test_modes() -> Vec<Mode> {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4)
+            .max(1);
+        vec![Mode::Serial, Mode::Parallel { thread_count: threads }]
     }
 
-    fn solver_for_with_vars(equations: Vec<Exp>, variables: &[&str]) -> NewtonRaphsonSolver {
+    fn assert_solution_close(serial: &Solution, parallel: &Solution, tol: f64) {
+        assert_eq!(serial.values.len(), parallel.values.len());
+        for (name, value) in &serial.values {
+            let other = parallel.values.get(name).expect("missing variable");
+            let diff = (value - other).abs();
+            assert!(diff <= tol, "var {name} mismatch: {value} vs {other}");
+        }
+    }
+
+    fn assert_error_matches(serial: &SolverError, parallel: &SolverError) {
+        assert_eq!(
+            std::mem::discriminant(serial),
+            std::mem::discriminant(parallel)
+        );
+        match (serial, parallel) {
+            (SolverError::InvalidInput(a), SolverError::InvalidInput(b)) => assert_eq!(a, b),
+            (SolverError::MissingVariable(a), SolverError::MissingVariable(b)) => {
+                assert_eq!(a, b)
+            }
+            _ => {}
+        }
+    }
+
+    fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new_with_variables(compiled, variables)
-            .expect("failed to select solve variables")
+        NewtonRaphsonSolver::new_with_mode(compiled, mode).expect("failed to set solver mode")
+    }
+
+    fn solver_for_with_vars_mode(
+        equations: Vec<Exp>,
+        variables: &[&str],
+        mode: Mode,
+    ) -> NewtonRaphsonSolver {
+        let compiled = Compiler::compile(&equations).expect("compile failed");
+        NewtonRaphsonSolver::new_with_variables_and_mode(compiled, variables, mode)
+            .expect("failed to select solve variables or set mode")
     }
 
     #[test]
     fn test_simple_system() {
-        // Test system: x^2 + y^2 = 1, xy = 0.25
-        // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
-        let x = Exp::var("x");
-        let y = Exp::var("y");
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Test system: x^2 + y^2 = 1, xy = 0.25
+            // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
+            let x = Exp::var("x");
+            let y = Exp::var("y");
 
-        let eq1 = Exp::sub(
-            Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
-            Exp::val(1.0),
-        );
-        let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
+            let eq1 = Exp::sub(
+                Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
+                Exp::val(1.0),
+            );
+            let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
-        let solver = solver_for(vec![eq1, eq2]);
+            let solver = solver_for_mode(vec![eq1, eq2], mode);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.5);
-        initial.insert("y".to_string(), 0.866);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.5);
+            initial.insert("y".to_string(), 0.866);
 
-        let solution = match solver.solve(initial.clone()) {
-            Ok(sol) => sol,
-            Err(_) => match solver.solve_with_line_search(initial) {
+            let solution = match solver.solve(initial.clone()) {
                 Ok(sol) => sol,
-                Err(e) => panic!("Failed to solve: {:?}", e),
-            },
-        };
-        assert!(solution.converged);
-        assert!(solution.error < 1e-10);
+                Err(_) => match solver.solve_with_line_search(initial) {
+                    Ok(sol) => sol,
+                    Err(e) => panic!("Failed to solve: {:?}", e),
+                },
+            };
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-8);
+            }
+            assert!(solution.converged);
+            assert!(solution.error < 1e-10);
 
-        let x_sol = solution.values.get("x").copied().unwrap();
-        let y_sol = solution.values.get("y").copied().unwrap();
-        assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
-        assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
+            let x_sol = solution.values.get("x").copied().unwrap();
+            let y_sol = solution.values.get("y").copied().unwrap();
+            assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
+            assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
+        }
     }
 
     #[test]
     fn test_transcendental_system() {
-        // Test transcendental system: sin(x) = 2y, cos(y) = x
-        let x = Exp::var("x");
-        let y = Exp::var("y");
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Test transcendental system: sin(x) = 2y, cos(y) = x
+            let x = Exp::var("x");
+            let y = Exp::var("y");
 
-        let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
-        let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
+            let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
+            let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
-        let solver = solver_for(vec![eq1, eq2])
-            .with_tolerance(1e-8)
-            .with_max_iterations(50)
-            .with_regularization(1e-8);
+            let solver = solver_for_mode(vec![eq1, eq2], mode)
+                .with_tolerance(1e-8)
+                .with_max_iterations(50)
+                .with_regularization(1e-8);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.5);
-        initial.insert("y".to_string(), 0.25);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.5);
+            initial.insert("y".to_string(), 0.25);
 
-        let solution = solver
-            .solve_with_line_search(initial)
-            .expect("Failed to solve transcendental system");
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("Failed to solve transcendental system");
 
-        assert!(solution.converged);
-        let x_sol = solution.values.get("x").copied().unwrap();
-        let y_sol = solution.values.get("y").copied().unwrap();
-        assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
-        assert!((y_sol.cos() - x_sol).abs() < 1e-8);
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-8);
+            }
+            assert!(solution.converged);
+            let x_sol = solution.values.get("x").copied().unwrap();
+            let y_sol = solution.values.get("y").copied().unwrap();
+            assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
+            assert!((y_sol.cos() - x_sol).abs() < 1e-8);
+        }
     }
 
     #[test]
     fn test_solver_errors_on_missing_variable() {
-        // System: x - a = 0, solving for x with a treated as a fixed parameter.
-        // Missing `a` should be an error (not implicitly treated as 0).
-        let x = Exp::var("x");
-        let a = Exp::var("a");
-        let eq = Exp::sub(x.clone(), a.clone());
+        let mut serial_error: Option<SolverError> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // System: x - a = 0, solving for x with a treated as a fixed parameter.
+            // Missing `a` should be an error (not implicitly treated as 0).
+            let x = Exp::var("x");
+            let a = Exp::var("a");
+            let eq = Exp::sub(x.clone(), a.clone());
 
-        let solver = solver_for_with_vars(vec![eq], &["x"]);
+            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 1.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 1.0);
 
-        let err = solver.solve(initial).expect_err("expected missing variable error");
-        match err {
-            SolverError::InvalidInput(msg) => {
-                assert!(msg.contains("a"), "unexpected message: {msg}");
+            let err = solver.solve(initial).expect_err("expected missing variable error");
+            if is_serial {
+                serial_error = Some(err.clone());
+            } else {
+                let serial = serial_error.as_ref().expect("serial error missing");
+                assert_error_matches(serial, &err);
             }
-            other => panic!("expected InvalidInput, got {:?}", other),
+            match err {
+                SolverError::InvalidInput(msg) => {
+                    assert!(msg.contains("a"), "unexpected message: {msg}");
+                }
+                other => panic!("expected InvalidInput, got {:?}", other),
+            }
         }
     }
 
     #[test]
     fn test_solver_invalid_input_on_missing_initial_guess_variable() {
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
+        let mut serial_error: Option<SolverError> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 
-        let solver = solver_for(vec![eq]);
+            let solver = solver_for_mode(vec![eq], mode);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
 
-        let err = solver
-            .solve(initial)
-            .expect_err("expected invalid input due to missing y");
-        match err {
-            SolverError::InvalidInput(msg) => {
-                assert!(msg.contains("y"), "unexpected message: {msg}");
+            let err = solver
+                .solve(initial)
+                .expect_err("expected invalid input due to missing y");
+            if is_serial {
+                serial_error = Some(err.clone());
+            } else {
+                let serial = serial_error.as_ref().expect("serial error missing");
+                assert_error_matches(serial, &err);
             }
-            other => panic!("expected InvalidInput, got {:?}", other),
+            match err {
+                SolverError::InvalidInput(msg) => {
+                    assert!(msg.contains("y"), "unexpected message: {msg}");
+                }
+                other => panic!("expected InvalidInput, got {:?}", other),
+            }
         }
     }
 
     #[test]
     fn test_try_with_equation_traces_invalid_length() {
-        let x = Exp::var("x");
-        let eq = Exp::sub(x.clone(), Exp::val(1.0));
+        let mut serial_error: Option<SolverError> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let x = Exp::var("x");
+            let eq = Exp::sub(x.clone(), Exp::val(1.0));
 
-        let solver = solver_for(vec![eq]);
+            let solver = solver_for_mode(vec![eq], mode);
 
-        let traces = vec![
-            Some(EquationTrace {
-                constraint_id: 0,
-                description: "eq0".to_string(),
-            }),
-            None,
-        ];
-        let err = match solver.try_with_equation_traces(traces) {
-            Ok(_) => panic!("expected invalid input for trace length mismatch"),
-            Err(err) => err,
-        };
-        match err {
-            SolverError::InvalidInput(msg) => {
-                assert!(msg.contains("Equation trace length (2)"), "{}", msg);
-                assert!(msg.contains("number of equations (1)"), "{}", msg);
+            let traces = vec![
+                Some(EquationTrace {
+                    constraint_id: 0,
+                    description: "eq0".to_string(),
+                }),
+                None,
+            ];
+            let err = match solver.try_with_equation_traces(traces) {
+                Ok(_) => panic!("expected invalid input for trace length mismatch"),
+                Err(err) => err,
+            };
+            if is_serial {
+                serial_error = Some(err.clone());
+            } else {
+                let serial = serial_error.as_ref().expect("serial error missing");
+                assert_error_matches(serial, &err);
             }
-            other => panic!("expected InvalidInput, got {:?}", other),
+            match err {
+                SolverError::InvalidInput(msg) => {
+                    assert!(msg.contains("Equation trace length (2)"), "{}", msg);
+                    assert!(msg.contains("number of equations (1)"), "{}", msg);
+                }
+                other => panic!("expected InvalidInput, got {:?}", other),
+            }
         }
     }
 
     #[test]
     fn test_line_search_preserves_fixed_variables() {
-        // Regression test: line search must preserve "fixed parameter" variables that are
-        // not part of `self.variables` but are referenced by equations.
-        //
-        // If line search drops them, evaluation errors and the solver fails.
-        let x = Exp::var("x");
-        let a = Exp::var("a");
-        let eq = Exp::sub(x.clone(), a.clone());
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Regression test: line search must preserve "fixed parameter" variables that are
+            // not part of `self.variables` but are referenced by equations.
+            //
+            // If line search drops them, evaluation errors and the solver fails.
+            let x = Exp::var("x");
+            let a = Exp::var("a");
+            let eq = Exp::sub(x.clone(), a.clone());
 
-        let solver = solver_for_with_vars(vec![eq], &["x"]);
+            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
-        initial.insert("a".to_string(), 2.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
+            initial.insert("a".to_string(), 2.0);
 
-        let solution = solver
-            .solve_with_line_search(initial)
-            .expect("solver should converge when fixed variables are provided");
-        assert!(solution.converged);
-        assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("solver should converge when fixed variables are provided");
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert!(solution.converged);
+            assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
+        }
     }
 
     #[test]
     fn test_least_squares_qr_handles_ill_conditioned_overdetermined_system_without_regularization()
     {
-        // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
-        // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
-        // lose the tiny distinguishing term and become singular in floating point. QR-based
-        // least squares should still solve it.
-        let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
+            // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
+            // lose the tiny distinguishing term and become singular in floating point. QR-based
+            // least squares should still solve it.
+            let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
 
-        let x = Exp::var("x");
-        let y = Exp::var("y");
+            let x = Exp::var("x");
+            let y = Exp::var("y");
 
-        // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
-        // b corresponds to solution (x,y) = (1,1)
-        let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
-        let eq2 = Exp::sub(
-            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
-            Exp::val(2.0 + eps),
-        );
-        let eq3 = Exp::sub(
-            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
-            Exp::val(2.0 - eps),
-        );
+            // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
+            // b corresponds to solution (x,y) = (1,1)
+            let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
+            let eq2 = Exp::sub(
+                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
+                Exp::val(2.0 + eps),
+            );
+            let eq3 = Exp::sub(
+                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
+                Exp::val(2.0 - eps),
+            );
 
-        let solver = solver_for(vec![eq1, eq2, eq3])
-            .with_regularization(0.0)
-            .with_damping(1.0)
-            .with_max_iterations(10)
-            .with_tolerance(1e-10);
+            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
+                .with_regularization(0.0)
+                .with_damping(1.0)
+                .with_max_iterations(10)
+                .with_tolerance(1e-10);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
-        initial.insert("y".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
+            initial.insert("y".to_string(), 0.0);
 
-        let solution = solver
-            .solve(initial)
-            .expect("expected solver to converge with QR least squares");
+            let solution = solver
+                .solve(initial)
+                .expect("expected solver to converge with QR least squares");
 
-        assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
-        assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-8);
+            }
+            assert!(solution.converged, "{:?}", solution);
+            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
+            assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
+        }
     }
 
     #[test]
     fn test_underconstrained_system_returns_min_norm_solution() {
-        // Underdetermined system: x + y = 1 has infinitely many solutions.
-        // The solver should return the minimum-norm solution: x = 0.5, y = 0.5.
-        let x = Exp::var("x");
-        let y = Exp::var("y");
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Underdetermined system: x + y = 1 has infinitely many solutions.
+            // The solver should return the minimum-norm solution: x = 0.5, y = 0.5.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
 
-        let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
-        let solver = solver_for(vec![eq])
-            .with_tolerance(1e-12)
-            .with_max_iterations(10);
+            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
+            let solver = solver_for_mode(vec![eq], mode)
+                .with_tolerance(1e-12)
+                .with_max_iterations(10);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
-        initial.insert("y".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
+            initial.insert("y".to_string(), 0.0);
 
-        let solution = solver.solve(initial).expect("expected solver to converge");
-        assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
-        assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
+            let solution = solver.solve(initial).expect("expected solver to converge");
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert!(solution.converged, "{:?}", solution);
+            assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
+            assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
+        }
     }
 
     #[test]
     fn test_rank_deficient_overconstrained_recovers_with_regularization() {
-        // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-        let eq2 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()), Exp::val(2.0));
-        let eq3 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()), Exp::val(3.0));
+            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+            let eq2 = Exp::sub(
+                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+                Exp::val(2.0),
+            );
+            let eq3 = Exp::sub(
+                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+                Exp::val(3.0),
+            );
 
-        let solver = solver_for(vec![eq1, eq2, eq3])
-            .with_tolerance(1e-12)
-            .with_max_iterations(10);
+            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
+                .with_tolerance(1e-12)
+                .with_max_iterations(10);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
-        initial.insert("y".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
+            initial.insert("y".to_string(), 0.0);
 
-        let solution = solver.solve(initial).expect("expected solver to converge");
-        assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
-        assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
+            let solution = solver.solve(initial).expect("expected solver to converge");
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert!(solution.converged, "{:?}", solution);
+            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+            assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
+        }
     }
 
     #[test]
     fn test_rank_deficient_overconstrained_fails_without_regularization() {
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+        let mut serial_error: Option<SolverError> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-        let eq2 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()), Exp::val(2.0));
-        let eq3 = Exp::sub(Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()), Exp::val(3.0));
+            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+            let eq2 = Exp::sub(
+                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+                Exp::val(2.0),
+            );
+            let eq3 = Exp::sub(
+                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+                Exp::val(3.0),
+            );
 
-        let solver = solver_for(vec![eq1, eq2, eq3])
-            .with_regularization(0.0)
-            .with_tolerance(1e-12)
-            .with_max_iterations(10);
+            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
+                .with_regularization(0.0)
+                .with_tolerance(1e-12)
+                .with_max_iterations(10);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
-        initial.insert("y".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
+            initial.insert("y".to_string(), 0.0);
 
-        let err = solver.solve(initial).expect_err("expected singular matrix error");
-        assert!(matches!(err, SolverError::SingularMatrix(_)), "{:?}", err);
+            let err = solver.solve(initial).expect_err("expected singular matrix error");
+            if is_serial {
+                serial_error = Some(err.clone());
+            } else {
+                let serial = serial_error.as_ref().expect("serial error missing");
+                assert_error_matches(serial, &err);
+            }
+            assert!(matches!(err, SolverError::SingularMatrix(_)), "{:?}", err);
+        }
     }
 
     #[test]
     fn test_overconstrained_consistent_system_solves() {
-        // Overdetermined but consistent system: x = 1 and 2x = 2.
-        let x = Exp::var("x");
-        let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
-        let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            // Overdetermined but consistent system: x = 1 and 2x = 2.
+            let x = Exp::var("x");
+            let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
+            let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
 
-        let solver = solver_for(vec![eq1, eq2])
-            .with_tolerance(1e-12)
-            .with_max_iterations(10);
+            let solver = solver_for_mode(vec![eq1, eq2], mode)
+                .with_tolerance(1e-12)
+                .with_max_iterations(10);
 
-        let mut initial = HashMap::new();
-        initial.insert("x".to_string(), 0.0);
+            let mut initial = HashMap::new();
+            initial.insert("x".to_string(), 0.0);
 
-        let solution = solver.solve(initial).expect("expected solver to converge");
-        assert!(solution.converged, "{:?}", solution);
-        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+            let solution = solver.solve(initial).expect("expected solver to converge");
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert!(solution.converged, "{:?}", solution);
+            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+        }
     }
 
     #[test]
     fn test_random_square_linear_systems() {
-        let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
-        for _ in 0..5 {
-            let n = 3;
-            let mut a = vec![vec![0.0; n]; n];
-            for i in 0..n {
-                for j in 0..n {
-                    a[i][j] = rng.next_f64();
+        let mut serial_solutions: Vec<Solution> = Vec::new();
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
+            for case_index in 0..5 {
+                let n = 3;
+                let mut a = vec![vec![0.0; n]; n];
+                for i in 0..n {
+                    for j in 0..n {
+                        a[i][j] = rng.next_f64();
+                    }
+                    a[i][i] += 2.0;
                 }
-                a[i][i] += 2.0;
-            }
 
-            let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
-            let mut b = vec![0.0; n];
-            for i in 0..n {
-                for j in 0..n {
-                    b[i] += a[i][j] * x_true[j];
+                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                let mut b = vec![0.0; n];
+                for i in 0..n {
+                    for j in 0..n {
+                        b[i] += a[i][j] * x_true[j];
+                    }
                 }
-            }
 
-            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-            let equations: Vec<Exp> = (0..n)
-                .map(|i| linear_equation(&a[i], &vars, b[i]))
-                .collect();
+                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+                let equations: Vec<Exp> = (0..n)
+                    .map(|i| linear_equation(&a[i], &vars, b[i]))
+                    .collect();
 
-            let solver = solver_for(equations)
-                .with_tolerance(1e-12)
-                .with_max_iterations(20);
+                let solver = solver_for_mode(equations, mode.clone())
+                    .with_tolerance(1e-12)
+                    .with_max_iterations(20);
 
-            let mut initial = HashMap::new();
-            for i in 0..n {
-                initial.insert(format!("x{i}"), 0.0);
-            }
+                let mut initial = HashMap::new();
+                for i in 0..n {
+                    initial.insert(format!("x{i}"), 0.0);
+                }
 
-            let solution = solver.solve(initial).expect("expected to solve");
-            for i in 0..n {
-                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                assert!((value - x_true[i]).abs() < 1e-8);
+                let solution = solver.solve(initial).expect("expected to solve");
+                if is_serial {
+                    serial_solutions.push(solution.clone());
+                } else {
+                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
+                }
+                for i in 0..n {
+                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                    assert!((value - x_true[i]).abs() < 1e-8);
+                }
             }
         }
     }
 
     #[test]
     fn test_random_overconstrained_linear_systems() {
-        let mut rng = TestRng::new(0xa11c_e551_dead_beef);
-        let m = 5;
-        let n = 3;
+        let mut serial_solutions: Vec<Solution> = Vec::new();
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let mut rng = TestRng::new(0xa11c_e551_dead_beef);
+            let m = 5;
+            let n = 3;
 
-        for _ in 0..5 {
-            let mut a = vec![vec![0.0; n]; m];
-            for i in 0..m {
-                for j in 0..n {
-                    a[i][j] = rng.next_f64();
+            for case_index in 0..5 {
+                let mut a = vec![vec![0.0; n]; m];
+                for i in 0..m {
+                    for j in 0..n {
+                        a[i][j] = rng.next_f64();
+                    }
                 }
-            }
-            for i in 0..n {
-                a[i][i] += 2.0;
-            }
-
-            let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
-            let mut b = vec![0.0; m];
-            for i in 0..m {
-                for j in 0..n {
-                    b[i] += a[i][j] * x_true[j];
+                for i in 0..n {
+                    a[i][i] += 2.0;
                 }
-            }
 
-            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-            let equations: Vec<Exp> = (0..m)
-                .map(|i| linear_equation(&a[i], &vars, b[i]))
-                .collect();
+                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                let mut b = vec![0.0; m];
+                for i in 0..m {
+                    for j in 0..n {
+                        b[i] += a[i][j] * x_true[j];
+                    }
+                }
 
-            let solver = solver_for(equations)
-                .with_tolerance(1e-12)
-                .with_max_iterations(20);
+                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+                let equations: Vec<Exp> = (0..m)
+                    .map(|i| linear_equation(&a[i], &vars, b[i]))
+                    .collect();
 
-            let mut initial = HashMap::new();
-            for i in 0..n {
-                initial.insert(format!("x{i}"), 0.0);
-            }
+                let solver = solver_for_mode(equations, mode.clone())
+                    .with_tolerance(1e-12)
+                    .with_max_iterations(20);
 
-            let solution = solver.solve(initial).expect("expected to solve");
-            for i in 0..n {
-                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                assert!((value - x_true[i]).abs() < 1e-8);
+                let mut initial = HashMap::new();
+                for i in 0..n {
+                    initial.insert(format!("x{i}"), 0.0);
+                }
+
+                let solution = solver.solve(initial).expect("expected to solve");
+                if is_serial {
+                    serial_solutions.push(solution.clone());
+                } else {
+                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
+                }
+                for i in 0..n {
+                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                    assert!((value - x_true[i]).abs() < 1e-8);
+                }
             }
         }
     }
 
     #[test]
     fn test_random_underdetermined_min_norm_structure() {
-        let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
-        let _m = 2;
-        let n = 4;
-        let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+        let mut serial_solutions: Vec<Solution> = Vec::new();
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+            let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
+            let _m = 2;
+            let n = 4;
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
 
-        for _ in 0..5 {
-            let b0 = rng.next_f64();
-            let b1 = rng.next_f64();
-            let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
-            let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
-            let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
-            let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
+            for case_index in 0..5 {
+                let b0 = rng.next_f64();
+                let b1 = rng.next_f64();
+                let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
+                let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
+                let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
+                let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
 
-            let solver = solver_for(vec![eq1, eq2])
-                .with_tolerance(1e-12)
-                .with_max_iterations(20);
+                let solver = solver_for_mode(vec![eq1, eq2], mode.clone())
+                    .with_tolerance(1e-12)
+                    .with_max_iterations(20);
 
-            let mut initial = HashMap::new();
-            for i in 0..n {
-                initial.insert(format!("x{i}"), 0.0);
+                let mut initial = HashMap::new();
+                for i in 0..n {
+                    initial.insert(format!("x{i}"), 0.0);
+                }
+
+                let solution = solver.solve(initial).expect("expected to solve");
+                if is_serial {
+                    serial_solutions.push(solution.clone());
+                } else {
+                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-10);
+                }
+                assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
+                assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
+                assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
+                assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
             }
-
-            let solution = solver.solve(initial).expect("expected to solve");
-            assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
-            assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
-            assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
-            assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
         }
     }
 }
