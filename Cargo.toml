@@ -1,9 +1,10 @@
 [package]
 name = "constraint-solver"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small, generic nonlinear constraint solver with symbolic expressions, compilation, and a modified Newton-Raphson method."
 license = "MIT"
+repository = "https://github.com/NeoCogi/constraint-solver"
 readme = "README.md"
 authors = ["Raja Lehtihet", "Wael El Oraiby"]
 keywords = [
@@ -19,10 +20,10 @@ categories = ["mathematics", "science", "algorithms"]
 rayon = "1.8"
 
 [dev-dependencies]
-criterion = "0.5"
-glow = "0.13"
-glfw = "0.55"
-rs-math3d = "0.9.24"
+criterion = "0.8"
+glow = "0.16"
+glfw = "0.61"
+rs-math3d = "0.10"
 
 [[bench]]
 name = "linear_algebra"

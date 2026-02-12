@@ -1,4 +1,5 @@
 # constraint-solver
+[![crates.io](https://img.shields.io/crates/v/constraint-solver?style=flat-square)](https://crates.io/crates/constraint-solver)
 
 A small, generic constraint-solving core for nonlinear systems. This crate provides:
 

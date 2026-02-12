@@ -27,6 +27,7 @@ use glfw::{Action, Context, Key, WindowEvent};
 use glow::HasContext;
 use rs_math3d::Vec2d;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::f64::consts::PI;
 
 // Link lengths and draw sizes (world units == screen pixels).
@@ -357,7 +358,11 @@ fn main() {
     window.set_framebuffer_size_polling(true);
 
     let gl = unsafe {
-        glow::Context::from_loader_function(|symbol| window.get_proc_address(symbol) as *const _)
+        glow::Context::from_loader_function(|symbol| {
+            window
+                .get_proc_address(symbol)
+                .map_or(std::ptr::null(), |proc| proc as *const () as *const c_void)
+        })
     };
     let gl_state = unsafe { build_gl_state(&gl) };
     unsafe {
