@@ -34,7 +34,7 @@ mod matrix_test;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
-pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
+pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError, MatrixOperand};
 pub use mode::Mode;
 pub use solver::{
     ConvergenceReason, EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution,

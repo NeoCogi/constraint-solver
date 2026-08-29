@@ -36,6 +36,26 @@ const PARALLEL_THRESHOLD: usize = 16_384;
 /// scalar normalization chosen by the caller.
 const QR_RANK_RELATIVE_EPSILON: f64 = 1e-12;
 
+/// Identifies which matrix operand contained a non-finite value before a
+/// checked linear solve began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixOperand {
+    /// Coefficient matrix being factorized or applied by the operation.
+    CoefficientMatrix,
+    /// Right-hand-side matrix supplied to a linear solve.
+    RightHandSide,
+}
+
+impl fmt::Display for MatrixOperand {
+    /// Render a stable human-readable operand name for structured error output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatrixOperand::CoefficientMatrix => write!(f, "coefficient matrix"),
+            MatrixOperand::RightHandSide => write!(f, "right-hand side"),
+        }
+    }
+}
+
 fn should_parallelize(rows: usize, cols: usize) -> bool {
     rows.saturating_mul(cols) >= PARALLEL_THRESHOLD
 }
@@ -111,6 +131,14 @@ pub enum MatrixError {
         /// Stable name of the operation whose tolerance was invalid.
         operation: &'static str,
     },
+    /// A coefficient or right-hand-side input contained NaN or infinity before
+    /// factorization began.
+    NonFiniteInput {
+        /// Stable name of the operation that validated the operand.
+        operation: &'static str,
+        /// Operand in which the invalid value was observed.
+        operand: MatrixOperand,
+    },
     /// A factorization encountered a pivot too small relative to its local
     /// scale to support a stable solve.
     Singular {
@@ -121,6 +149,12 @@ pub enum MatrixError {
     /// value.
     NonFiniteFactor {
         /// Stable name of the factorization or solve that detected the value.
+        operation: &'static str,
+    },
+    /// Finite inputs produced a non-finite solution through arithmetic overflow
+    /// or invalid intermediate cancellation.
+    NonFiniteResult {
+        /// Stable name of the solve that produced the invalid solution.
         operation: &'static str,
     },
     /// A QR solve could not determine a unique independent triangular system.
@@ -183,11 +217,17 @@ impl fmt::Display for MatrixError {
             MatrixError::InvalidTolerance { operation } => {
                 write!(f, "Invalid numerical tolerance for {operation}")
             }
+            MatrixError::NonFiniteInput { operation, operand } => {
+                write!(f, "Non-finite {operand} supplied to {operation}")
+            }
             MatrixError::Singular { operation } => {
                 write!(f, "Matrix is singular during {operation}")
             }
             MatrixError::NonFiniteFactor { operation } => {
                 write!(f, "Non-finite factor encountered during {operation}")
+            }
+            MatrixError::NonFiniteResult { operation } => {
+                write!(f, "Non-finite result produced during {operation}")
             }
             MatrixError::RankDeficient { operation } => {
                 write!(f, "Matrix is rank deficient during {operation}")
@@ -326,6 +366,12 @@ impl Matrix {
                 operation: "lu_decomposition",
             });
         }
+        if !self.all_finite() {
+            return Err(MatrixError::NonFiniteInput {
+                operation: "lu_decomposition",
+                operand: MatrixOperand::CoefficientMatrix,
+            });
+        }
 
         let n = self.rows;
         let mut l = Matrix::identity(n);
@@ -370,8 +416,18 @@ impl Matrix {
 
             for i in (k + 1)..n {
                 l[(i, k)] = u[(i, k)] / u[(k, k)];
+                if !l[(i, k)].is_finite() {
+                    return Err(MatrixError::NonFiniteFactor {
+                        operation: "lu_decomposition",
+                    });
+                }
                 for j in k..n {
                     u[(i, j)] -= l[(i, k)] * u[(k, j)];
+                    if !u[(i, j)].is_finite() {
+                        return Err(MatrixError::NonFiniteFactor {
+                            operation: "lu_decomposition",
+                        });
+                    }
                 }
             }
         }
@@ -405,6 +461,12 @@ impl Matrix {
                 right: (b.rows, b.cols),
             });
         }
+        if !b.all_finite() {
+            return Err(MatrixError::NonFiniteInput {
+                operation: "solve_lu",
+                operand: MatrixOperand::RightHandSide,
+            });
+        }
 
         let (l, u, pivot) = self.lu_decomposition_with_tolerance(singular_relative_epsilon)?;
 
@@ -428,6 +490,11 @@ impl Matrix {
                 x[(i, 0)] -= u[(i, j)] * x[(j, 0)];
             }
             x[(i, 0)] /= u[(i, i)];
+            if !x[(i, 0)].is_finite() {
+                return Err(MatrixError::NonFiniteResult {
+                    operation: "solve_lu",
+                });
+            }
         }
 
         Ok(x)
@@ -484,6 +551,18 @@ impl Matrix {
                 right: (b.rows, b.cols),
             });
         }
+        if !self.all_finite() {
+            return Err(MatrixError::NonFiniteInput {
+                operation: "solve_least_squares_qr",
+                operand: MatrixOperand::CoefficientMatrix,
+            });
+        }
+        if !b.all_finite() {
+            return Err(MatrixError::NonFiniteInput {
+                operation: "solve_least_squares_qr",
+                operand: MatrixOperand::RightHandSide,
+            });
+        }
 
         let m = self.rows;
         let n = self.cols;
@@ -499,11 +578,20 @@ impl Matrix {
             ));
         }
 
-        if m >= n {
+        let result = if m >= n {
             Self::solve_least_squares_qr_tall_with_info(self, b, parallel)
         } else {
             Self::solve_least_squares_qr_wide_with_info(self, b, parallel)
+        }?;
+
+        // A successful checked solve must never smuggle NaN or infinity through
+        // its `Ok` channel, even when finite inputs overflow during substitution.
+        if !result.0.all_finite() {
+            return Err(MatrixError::NonFiniteResult {
+                operation: "solve_least_squares_qr",
+            });
         }
+        Ok(result)
     }
 
     /// Estimate the one-norm condition number of an upper-triangular leading
@@ -672,6 +760,12 @@ impl Matrix {
                 col_norm = col_norm.hypot(r[(i, k)]);
             }
 
+            if !col_norm.is_finite() {
+                return Err(MatrixError::NonFiniteFactor {
+                    operation: "solve_least_squares_qr",
+                });
+            }
+
             if col_norm == 0.0 {
                 taus.push(0.0);
                 continue;
@@ -785,6 +879,20 @@ impl Matrix {
             r[(k, k)] = alpha;
         }
 
+        // Householder updates can overflow even when every input is finite.
+        // Validate the complete factor and transformed right-hand side before
+        // rank classification so overflow is not mislabeled as rank loss.
+        if !r.all_finite() {
+            return Err(MatrixError::NonFiniteFactor {
+                operation: "solve_least_squares_qr",
+            });
+        }
+        if !qt_b.all_finite() {
+            return Err(MatrixError::NonFiniteResult {
+                operation: "solve_least_squares_qr",
+            });
+        }
+
         let mut max_diag: f64 = 0.0;
         for i in 0..n {
             max_diag = max_diag.max(r[(i, i)].abs());
@@ -864,6 +972,12 @@ impl Matrix {
             let mut col_norm: f64 = 0.0;
             for i in k..n {
                 col_norm = col_norm.hypot(r[(i, k)]);
+            }
+
+            if !col_norm.is_finite() {
+                return Err(MatrixError::NonFiniteFactor {
+                    operation: "solve_least_squares_qr",
+                });
             }
 
             if col_norm == 0.0 {
@@ -950,6 +1064,14 @@ impl Matrix {
             r[(k, k)] = alpha;
         }
 
+        // Do not let overflow in the transposed Householder factor masquerade as
+        // a rank-deficient matrix during the diagonal threshold checks below.
+        if !r.all_finite() {
+            return Err(MatrixError::NonFiniteFactor {
+                operation: "solve_least_squares_qr",
+            });
+        }
+
         let mut max_diag: f64 = 0.0;
         for i in 0..m {
             max_diag = max_diag.max(r[(i, i)].abs());
@@ -997,6 +1119,11 @@ impl Matrix {
             }
 
             y[i] = sum / diag;
+            if !y[i].is_finite() {
+                return Err(MatrixError::NonFiniteResult {
+                    operation: "solve_least_squares_qr",
+                });
+            }
         }
 
         // Form w = [y; 0] in R^n.
@@ -1367,6 +1494,74 @@ mod tests {
         assert!(finite.all_finite());
         assert!(!with_nan.all_finite());
         assert!(!with_infinity.all_finite());
+    }
+
+    /// Ensure checked factorization APIs reject invalid operands through their
+    /// error channel rather than returning successful matrices containing NaN.
+    #[test]
+    fn test_linear_solvers_reject_non_finite_inputs() {
+        let identity = Matrix::identity(2);
+        let nan_rhs = Matrix::from_vec(vec![f64::NAN, 1.0], 2, 1).unwrap();
+
+        assert_eq!(
+            identity.solve_lu(&nan_rhs).unwrap_err(),
+            MatrixError::NonFiniteInput {
+                operation: "solve_lu",
+                operand: MatrixOperand::RightHandSide,
+            }
+        );
+        assert_eq!(
+            identity.solve_least_squares_qr(&nan_rhs).unwrap_err(),
+            MatrixError::NonFiniteInput {
+                operation: "solve_least_squares_qr",
+                operand: MatrixOperand::RightHandSide,
+            }
+        );
+
+        let nan_coefficient =
+            Matrix::from_vec(vec![1.0, f64::NAN, 0.0, 1.0], 2, 2).unwrap();
+        let finite_rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
+        assert_eq!(
+            nan_coefficient.solve_lu(&finite_rhs).unwrap_err(),
+            MatrixError::NonFiniteInput {
+                operation: "lu_decomposition",
+                operand: MatrixOperand::CoefficientMatrix,
+            }
+        );
+        assert_eq!(
+            nan_coefficient
+                .solve_least_squares_qr(&finite_rhs)
+                .unwrap_err(),
+            MatrixError::NonFiniteInput {
+                operation: "solve_least_squares_qr",
+                operand: MatrixOperand::CoefficientMatrix,
+            }
+        );
+    }
+
+    /// Confirm that arithmetic overflow from otherwise finite solve operands is
+    /// reported explicitly instead of escaping inside an `Ok(Matrix)` value.
+    #[test]
+    fn test_linear_solvers_reject_non_finite_results() {
+        let tiny_coefficient = Matrix::from_vec(vec![1e-308], 1, 1).unwrap();
+        let huge_rhs = Matrix::from_vec(vec![f64::MAX], 1, 1).unwrap();
+
+        assert_eq!(
+            tiny_coefficient
+                .solve_lu_with_tolerance(&huge_rhs, 0.0)
+                .unwrap_err(),
+            MatrixError::NonFiniteResult {
+                operation: "solve_lu",
+            }
+        );
+        assert_eq!(
+            tiny_coefficient
+                .solve_least_squares_qr(&huge_rhs)
+                .unwrap_err(),
+            MatrixError::NonFiniteResult {
+                operation: "solve_least_squares_qr",
+            }
+        );
     }
 
     #[test]
