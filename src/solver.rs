@@ -37,6 +37,29 @@ struct LeastSquaresWorkspace {
     num_variables: usize,
 }
 
+/// Borrowed numerical state required to test line-search candidates for one
+/// Newton iteration.
+///
+/// Grouping these related values keeps the line-search call site explicit while
+/// avoiding an error-prone positional argument list.
+struct LineSearchContext<'a> {
+    /// Symbolic evaluator used to compute residuals at candidate points.
+    jacobian: &'a Jacobian,
+    /// Current accepted variables, including solve variables and fixed
+    /// parameters.
+    vars: &'a HashMap<VarId, f64>,
+    /// Newton correction direction whose scalar multiplier is being searched.
+    delta: &'a Matrix,
+    /// Residual norm at the current accepted point.
+    current_error: f64,
+    /// One-based Newton iteration number for failure diagnostics.
+    iteration: usize,
+    /// Residual vector at the current accepted point.
+    current_residuals: &'a Matrix,
+    /// Reusable output storage for candidate residual evaluations.
+    candidate_residuals: &'a mut Matrix,
+}
+
 impl LeastSquaresWorkspace {
     fn new(num_equations: usize, num_variables: usize, sqrt_reg: f64) -> Self {
         let mut augmented_j = Matrix::new(num_equations + num_variables, num_variables);
@@ -664,15 +687,15 @@ impl NewtonRaphsonSolver {
                 // demonstrated sufficient residual reduction. Passing the
                 // current residuals lets an exhausted search report the state
                 // at which it failed rather than the final rejected candidate.
-                self.line_search(
-                    &jacobian,
-                    &vars,
-                    &delta,
-                    error,
-                    iter + 1,
-                    &f_vals,
-                    &mut line_search_f_vals,
-                )?
+                self.line_search(LineSearchContext {
+                    jacobian: &jacobian,
+                    vars: &vars,
+                    delta: &delta,
+                    current_error: error,
+                    iteration: iter + 1,
+                    current_residuals: &f_vals,
+                    candidate_residuals: &mut line_search_f_vals,
+                })?
             } else {
                 // Use current damping factor as step size
                 damping
@@ -1204,7 +1227,7 @@ impl NewtonRaphsonSolver {
     /// Tries progressively smaller step sizes until one is found that reduces the error.
     /// This helps prevent oscillation and improves convergence robustness.
     ///
-    /// # Arguments
+    /// # Context fields
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
@@ -1218,16 +1241,19 @@ impl NewtonRaphsonSolver {
     /// satisfies the sufficient-decrease condition. If no tested step is
     /// acceptable, the method returns `NoConvergence`; it never substitutes an
     /// untested or previously rejected fallback step.
-    fn line_search(
-        &self,
-        jacobian: &Jacobian,
-        vars: &HashMap<VarId, f64>,
-        delta: &Matrix,
-        current_error: f64,
-        iteration: usize,
-        current_residuals: &Matrix,
-        candidate_residuals: &mut Matrix,
-    ) -> Result<f64, SolverError> {
+    fn line_search(&self, context: LineSearchContext<'_>) -> Result<f64, SolverError> {
+        // Give the context fields concise numerical names for the candidate loop
+        // while preserving their documented grouping at the call boundary.
+        let LineSearchContext {
+            jacobian,
+            vars,
+            delta,
+            current_error,
+            iteration,
+            current_residuals,
+            candidate_residuals,
+        } = context;
+
         // A difficult but recoverable Newton direction can require far more
         // than twenty halvings. Sixty-four trials cover the useful binary range
         // down to the explicit minimum without making the search unbounded.
