@@ -924,6 +924,18 @@ impl Matrix {
         }
     }
 
+    /// Return whether every stored matrix element is a finite floating-point
+    /// value.
+    ///
+    /// Solver code uses this check at numerical boundaries so NaN and infinity
+    /// are reported as evaluation failures rather than flowing into rank,
+    /// convergence, or regularization logic.
+    pub fn all_finite(&self) -> bool {
+        // `Iterator::all` stops at the first invalid element and does not expose
+        // the matrix's private storage to callers.
+        self.data.iter().all(|value| value.is_finite())
+    }
+
     pub fn try_add(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         if self.rows != rhs.rows || self.cols != rhs.cols {
             return Err(MatrixError::DimensionMismatch {
@@ -1152,6 +1164,21 @@ mod tests {
 
         assert!(with_nan.norm().is_nan());
         assert_eq!(with_infinity.norm(), f64::INFINITY);
+    }
+
+    /// Cover finite-state detection for empty, ordinary, NaN, and infinite
+    /// matrices.
+    #[test]
+    fn test_all_finite_identifies_invalid_components() {
+        let empty = Matrix::new(0, 0);
+        let finite = Matrix::from_vec(vec![-1.0, 0.0, 2.5], 3, 1).unwrap();
+        let with_nan = Matrix::from_vec(vec![0.0, f64::NAN], 2, 1).unwrap();
+        let with_infinity = Matrix::from_vec(vec![f64::NEG_INFINITY], 1, 1).unwrap();
+
+        assert!(empty.all_finite());
+        assert!(finite.all_finite());
+        assert!(!with_nan.all_finite());
+        assert!(!with_infinity.all_finite());
     }
 
     #[test]

@@ -170,6 +170,9 @@ pub enum SolverError {
     SingularMatrix(SolverRunDiagnostic),
     /// Failed to converge within the maximum number of iterations
     NoConvergence(SolverRunDiagnostic),
+    /// Expression, Jacobian, update, or residual-gradient evaluation produced
+    /// NaN or infinity.
+    NonFiniteEvaluation(SolverRunDiagnostic),
     /// A required variable was missing during evaluation
     MissingVariable(MissingVarError),
     /// Invalid input parameters or system setup
@@ -354,27 +357,47 @@ impl NewtonRaphsonSolver {
             .and_then(|entry| entry.as_ref())
     }
 
-    /// Override the maximum number of iterations
+    /// Override the maximum number of accepted Newton updates.
+    ///
+    /// Configuration is validated when a solve begins; zero is rejected as
+    /// `SolverError::InvalidInput`.
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        // Preserve the caller's exact value so validation can report invalid
+        // input rather than silently substituting a different iteration limit.
         self.max_iterations = max_iterations;
         self
     }
 
-    /// Override the convergence tolerance
+    /// Override the positive, finite residual/step/stationarity tolerance.
+    ///
+    /// Configuration is validated when a solve begins.
     pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        // Store without clamping so NaN, infinity, zero, and negative values are
+        // observable to the common configuration validator.
         self.tolerance = tolerance;
         self
     }
 
-    /// Override the damping factor (clamped to [0.1, 1.0] for stability)
+    /// Override the finite initial damping factor in the interval `(0, 1]`.
+    ///
+    /// Configuration is validated when a solve begins; invalid values are not
+    /// silently clamped.
     pub fn with_damping(mut self, damping_factor: f64) -> Self {
-        self.damping_factor = damping_factor.clamp(0.1, 1.0);
+        // Preserve the requested value for deterministic validation and error
+        // reporting at the shared solve entry point.
+        self.damping_factor = damping_factor;
         self
     }
 
-    /// Override the base regularization parameter used when the system is ill-conditioned
+    /// Override the finite non-negative regularization parameter used when the
+    /// system is ill-conditioned.
+    ///
+    /// Configuration is validated when a solve begins; negative values are not
+    /// converted to zero implicitly.
     pub fn with_regularization(mut self, regularization: f64) -> Self {
-        self.regularization = regularization.max(0.0);
+        // Retain non-finite and negative values until validation so the caller
+        // receives an explicit configuration error.
+        self.regularization = regularization;
         self
     }
 
@@ -393,6 +416,9 @@ impl NewtonRaphsonSolver {
 
     /// Solve the system using standard Newton-Raphson method
     pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
+        // Reject invalid reusable settings before translating or validating the
+        // caller's variable map.
+        self.validate_configuration()?;
         let vars = self.map_initial_guess(initial_guess)?;
         self.run_in_mode(|| self.solve_modified_internal(vars, false))
     }
@@ -416,6 +442,9 @@ impl NewtonRaphsonSolver {
         initial_guess: HashMap<VarId, f64>,
         use_line_search: bool,
     ) -> Result<Solution, SolverError> {
+        // Defensively repeat validation at the internal boundary so future
+        // private entry points cannot bypass the public checks.
+        self.validate_configuration()?;
         self.validate_initial_guess(&initial_guess)?;
 
         let mut vars = initial_guess.clone();
@@ -454,6 +483,22 @@ impl NewtonRaphsonSolver {
         for iter in 0..self.max_iterations {
             // Step 1: Evaluate function values f(x)
             jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
+            if !f_vals.all_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Residual evaluation produced NaN or infinity",
+                    iter,
+                    &vars,
+                    &f_vals,
+                ));
+            }
+            if !jacobian_workspace.jacobian().all_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Jacobian evaluation produced NaN or infinity",
+                    iter,
+                    &vars,
+                    &f_vals,
+                ));
+            }
             let error = f_vals.norm();
             convergence_history.push(error);
 
@@ -466,6 +511,8 @@ impl NewtonRaphsonSolver {
                     jacobian_workspace.jacobian(),
                     &f_vals,
                     parallel,
+                    &vars,
+                    iter,
                 )?;
                 return Ok(self.build_solution(
                     &vars,
@@ -586,6 +633,15 @@ impl NewtonRaphsonSolver {
                 }
             };
 
+            if !delta.all_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Linear solve produced a non-finite Newton correction",
+                    iter + 1,
+                    &vars,
+                    &f_vals,
+                ));
+            }
+
             // Step 4: Determine step size (damping or line search)
             let step_size = if use_line_search {
                 // Use backtracking line search to find a step that has actually
@@ -619,7 +675,23 @@ impl NewtonRaphsonSolver {
             // Any convergence result below must describe this new state, not
             // the residual that preceded the update.
             jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
+            if !f_vals.all_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Accepted Newton update produced non-finite residuals",
+                    iter + 1,
+                    &vars,
+                    &f_vals,
+                ));
+            }
             jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+            if !jacobian_workspace.jacobian().all_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Accepted Newton update produced a non-finite Jacobian",
+                    iter + 1,
+                    &vars,
+                    &f_vals,
+                ));
+            }
             let updated_error = f_vals.norm();
 
             if updated_error < self.tolerance || applied_step_norm < self.tolerance {
@@ -630,6 +702,8 @@ impl NewtonRaphsonSolver {
                     jacobian_workspace.jacobian(),
                     &f_vals,
                     parallel,
+                    &vars,
+                    iter + 1,
                 )?;
 
                 if updated_error < self.tolerance {
@@ -673,6 +747,14 @@ impl NewtonRaphsonSolver {
 
         // Failed to converge within max iterations
         let residuals = jacobian.evaluate_functions_checked(&vars)?;
+        if !residuals.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Final residual evaluation produced NaN or infinity",
+                self.max_iterations,
+                &vars,
+                &residuals,
+            ));
+        }
         let diag = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
@@ -900,11 +982,18 @@ impl NewtonRaphsonSolver {
         initial_guess: HashMap<String, f64>,
     ) -> Result<HashMap<VarId, f64>, SolverError> {
         let mut unknown = Vec::new();
+        let mut non_finite = Vec::new();
         let mut vars = HashMap::new();
 
         for (name, value) in initial_guess {
             if let Some(id) = self.var_table.get_id(&name) {
-                vars.insert(id, value);
+                if value.is_finite() {
+                    // Only validated finite values are allowed into the compact
+                    // internal variable map used by expression evaluation.
+                    vars.insert(id, value);
+                } else {
+                    non_finite.push(name);
+                }
             } else {
                 unknown.push(name);
             }
@@ -917,8 +1006,58 @@ impl NewtonRaphsonSolver {
             )));
         }
 
+        if !non_finite.is_empty() {
+            // Sort names to make diagnostics deterministic despite HashMap's
+            // intentionally unspecified iteration order.
+            non_finite.sort();
+            return Err(SolverError::InvalidInput(format!(
+                "Initial guess includes non-finite values for variables: {non_finite:?}"
+            )));
+        }
+
         self.validate_initial_guess(&vars)?;
         Ok(vars)
+    }
+
+    /// Validate solver settings that must be finite and meaningful before
+    /// expression evaluation or iteration begins.
+    fn validate_configuration(&self) -> Result<(), SolverError> {
+        // A zero update budget cannot even test an accepted Newton step and used
+        // to turn exact roots into misleading no-convergence diagnostics.
+        if self.max_iterations == 0 {
+            return Err(SolverError::InvalidInput(
+                "max_iterations must be greater than zero".to_string(),
+            ));
+        }
+
+        // The same tolerance controls residual, step, and stationarity tests;
+        // it must therefore be strictly positive and finite.
+        if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(SolverError::InvalidInput(
+                "tolerance must be finite and greater than zero".to_string(),
+            ));
+        }
+
+        // Damping represents a fraction of a Newton correction. Values outside
+        // `(0, 1]` either reverse/amplify the step or eliminate it entirely.
+        if !self.damping_factor.is_finite()
+            || self.damping_factor <= 0.0
+            || self.damping_factor > 1.0
+        {
+            return Err(SolverError::InvalidInput(
+                "damping_factor must be finite and in the interval (0, 1]".to_string(),
+            ));
+        }
+
+        // Regularization is later square-rooted for augmented QR, so negative or
+        // non-finite values must not reach workspace construction.
+        if !self.regularization.is_finite() || self.regularization < 0.0 {
+            return Err(SolverError::InvalidInput(
+                "regularization must be finite and non-negative".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn validate_initial_guess(&self, vars: &HashMap<VarId, f64>) -> Result<(), SolverError> {
@@ -985,12 +1124,42 @@ impl NewtonRaphsonSolver {
         jacobian: &Matrix,
         residuals: &Matrix,
         parallel: bool,
+        vars: &HashMap<VarId, f64>,
+        iterations: usize,
     ) -> Result<f64, SolverError> {
         // Form J^T using the same execution policy as the surrounding solve,
         // then multiply it by the current residual column vector.
         let jacobian_transpose = jacobian.transpose_with_parallel(parallel);
         let gradient = jacobian_transpose.try_mul_with_parallel(residuals, parallel)?;
+        if !gradient.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Residual-gradient evaluation produced NaN or infinity",
+                iterations,
+                vars,
+                residuals,
+            ));
+        }
         Ok(gradient.norm())
+    }
+
+    /// Build the dedicated error variant for non-finite numerical states while
+    /// preserving the current values and residual vector for diagnosis.
+    fn non_finite_evaluation_error(
+        &self,
+        message: impl Into<String>,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+    ) -> SolverError {
+        // `build_diagnostic` intentionally preserves a NaN or infinite residual
+        // norm; hiding it behind a finite sentinel would discard useful failure
+        // evidence.
+        SolverError::NonFiniteEvaluation(self.build_diagnostic(
+            message.into(),
+            iterations,
+            vars,
+            residuals,
+        ))
     }
 
     fn build_diagnostic(
@@ -1109,6 +1278,9 @@ impl NewtonRaphsonSolver {
         &self,
         initial_guess: HashMap<String, f64>,
     ) -> Result<Solution, SolverError> {
+        // Apply exactly the same configuration contract as the standard solve
+        // before mapping caller-visible variable names to internal IDs.
+        self.validate_configuration()?;
         let vars = self.map_initial_guess(initial_guess)?;
         self.run_in_mode(|| self.solve_modified_internal(vars, true))
     }
@@ -1344,6 +1516,124 @@ mod tests {
                     assert!(msg.contains("y"), "unexpected message: {msg}");
                 }
                 other => panic!("expected InvalidInput, got {:?}", other),
+            }
+        }
+    }
+
+    /// Verify that every externally configurable numerical parameter enforces
+    /// its documented finite range before iteration begins.
+    #[test]
+    fn test_solver_rejects_invalid_configuration() {
+        // Each case constructs a fresh solver because builder methods consume
+        // and return the solver by value.
+        let invalid_cases: Vec<(&str, Box<dyn Fn(NewtonRaphsonSolver) -> NewtonRaphsonSolver>)> =
+            vec![
+                ("max_iterations", Box::new(|solver| solver.with_max_iterations(0))),
+                ("tolerance", Box::new(|solver| solver.with_tolerance(0.0))),
+                ("tolerance", Box::new(|solver| solver.with_tolerance(f64::NAN))),
+                ("damping_factor", Box::new(|solver| solver.with_damping(0.0))),
+                ("damping_factor", Box::new(|solver| solver.with_damping(1.1))),
+                (
+                    "damping_factor",
+                    Box::new(|solver| solver.with_damping(f64::INFINITY)),
+                ),
+                (
+                    "regularization",
+                    Box::new(|solver| solver.with_regularization(-1.0)),
+                ),
+                (
+                    "regularization",
+                    Box::new(|solver| solver.with_regularization(f64::INFINITY)),
+                ),
+            ];
+
+        for (expected_parameter, configure) in invalid_cases {
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let compiled = Compiler::compile(&[equation]).expect("compile failed");
+            let solver = configure(NewtonRaphsonSolver::new(compiled));
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("invalid configuration must be rejected");
+            match error {
+                SolverError::InvalidInput(message) => {
+                    assert!(message.contains(expected_parameter), "{message}");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+    }
+
+    /// Reject NaN and infinity in the caller's initial map before expression
+    /// evaluation can obscure their origin.
+    #[test]
+    fn test_solver_rejects_non_finite_initial_values() {
+        for invalid_value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let compiled = Compiler::compile(&[equation]).expect("compile failed");
+            let solver = NewtonRaphsonSolver::new(compiled);
+            let initial = HashMap::from([("x".to_string(), invalid_value)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("non-finite initial values must be rejected");
+            match error {
+                SolverError::InvalidInput(message) => {
+                    assert!(message.contains("non-finite"), "{message}");
+                    assert!(message.contains("x"), "{message}");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+    }
+
+    /// Distinguish an invalid expression domain from singularity or ordinary
+    /// iteration exhaustion.
+    #[test]
+    fn test_solver_reports_non_finite_residual_evaluation() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+            let equation = Exp::ln(x);
+            let solver = solver_for_mode(vec![equation], mode);
+            let initial = HashMap::from([("x".to_string(), -1.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("ln of a negative value is outside the real domain");
+            match error {
+                SolverError::NonFiniteEvaluation(diagnostic) => {
+                    assert!(diagnostic.message.contains("Residual evaluation"));
+                    assert_eq!(diagnostic.iterations, 0);
+                    assert!(diagnostic.error.is_nan());
+                }
+                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+            }
+        }
+    }
+
+    /// Detect a finite residual paired with a non-finite symbolic derivative.
+    #[test]
+    fn test_solver_reports_non_finite_jacobian_evaluation() {
+        for mode in test_modes() {
+            // sqrt(x)-1 is finite at x=0, but its derivative is positive
+            // infinity there.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::power(x, 0.5), Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("non-finite derivative must be reported explicitly");
+            match error {
+                SolverError::NonFiniteEvaluation(diagnostic) => {
+                    assert!(diagnostic.message.contains("Jacobian evaluation"));
+                    assert_eq!(diagnostic.error, 1.0);
+                }
+                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
             }
         }
     }
