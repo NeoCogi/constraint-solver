@@ -27,7 +27,10 @@ rayon = "1.8"
 [dev-dependencies]
 criterion = "0.8"
 glow = "0.16"
-glfw = "0.61"
+# The IK example needs window/context creation only. Disabling GLFW's `all`
+# default avoids unrelated image, Vulkan, logging, and dual-backend dependency
+# trees; prebuilt native libraries retain portable example compilation.
+glfw = { version = "0.61", default-features = false, features = ["prebuilt-libs", "raw-window-handle-v0-6", "x11"] }
 rs-math3d = "0.10"
 
 [[bench]]
