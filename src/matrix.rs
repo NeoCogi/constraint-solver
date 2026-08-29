@@ -115,6 +115,16 @@ pub enum MatrixError {
         /// Requested column count.
         cols: usize,
     },
+    /// The element count fit in `usize`, but contiguous storage could not be
+    /// reserved for the requested matrix.
+    AllocationFailed {
+        /// Requested row count.
+        rows: usize,
+        /// Requested column count.
+        cols: usize,
+        /// Number of `f64` elements that the allocation would contain.
+        elements: usize,
+    },
     /// Adding logical dimensions overflowed `usize` before a matrix shape could
     /// be constructed.
     DimensionSumOverflow {
@@ -226,6 +236,14 @@ impl fmt::Display for MatrixError {
             MatrixError::ElementCountOverflow { rows, cols } => write!(
                 f,
                 "Matrix shape {rows}x{cols} exceeds the addressable element count"
+            ),
+            MatrixError::AllocationFailed {
+                rows,
+                cols,
+                elements,
+            } => write!(
+                f,
+                "Could not allocate {elements} elements for matrix shape {rows}x{cols}"
             ),
             MatrixError::DimensionSumOverflow {
                 operation,
@@ -402,20 +420,31 @@ impl Matrix {
 
     /// Allocate a zero-filled matrix with a fully validated shape.
     ///
-    /// Unlike [`Matrix::new`], this constructor never panics for dimension
-    /// arithmetic overflow. Allocation exhaustion can still abort according to
-    /// the process allocator, as with ordinary `Vec` construction.
+    /// Unlike [`Matrix::new`], this constructor reports both dimension overflow
+    /// and storage-reservation failure as structured errors.
     pub fn try_new(rows: usize, cols: usize) -> Result<Self, MatrixError> {
         // Detect dimension arithmetic overflow explicitly; allowing release-mode
         // wrapping would create storage inconsistent with the public shape.
         let element_count = rows
             .checked_mul(cols)
             .ok_or(MatrixError::ElementCountOverflow { rows, cols })?;
-        Ok(Matrix {
-            data: vec![0.0; element_count],
-            rows,
-            cols,
-        })
+
+        // Reserve fallibly before initializing elements. `vec![value; len]`
+        // uses an infallible capacity path and therefore panics for shapes such
+        // as `usize::MAX x 1`, even though their element-count multiplication
+        // itself does not overflow.
+        let mut data = Vec::new();
+        data.try_reserve_exact(element_count)
+            .map_err(|_| MatrixError::AllocationFailed {
+                rows,
+                cols,
+                elements: element_count,
+            })?;
+        // The exact reservation above guarantees that zero initialization does
+        // not need another allocation attempt.
+        data.resize(element_count, 0.0);
+
+        Ok(Matrix { data, rows, cols })
     }
 
     /// Construct a row-major matrix from an owned element buffer.
@@ -2442,6 +2471,23 @@ mod tests {
             MatrixError::ElementCountOverflow {
                 rows: usize::MAX,
                 cols: 2,
+            }
+        );
+    }
+
+    /// Verify that a representable element count with an impossible byte
+    /// capacity is returned as an allocation error instead of panicking.
+    #[test]
+    fn test_try_new_reports_capacity_overflow() {
+        let error = Matrix::try_new(usize::MAX, 1)
+            .expect_err("an impossible contiguous allocation must be rejected");
+
+        assert_eq!(
+            error,
+            MatrixError::AllocationFailed {
+                rows: usize::MAX,
+                cols: 1,
+                elements: usize::MAX,
             }
         );
     }
