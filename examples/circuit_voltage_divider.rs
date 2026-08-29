@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 fn main() {
@@ -48,14 +48,24 @@ fn main() {
     let compiled = Compiler::compile(&[eq1, eq2, eq3]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new(compiled);
 
+    // Deliberately violate both Ohm's-law equations and KCL so this example
+    // demonstrates the solver rather than merely validating an exact initial
+    // root.
     let mut initial = HashMap::new();
-    initial.insert("vout".to_string(), 8.0);
-    initial.insert("i1".to_string(), 0.004);
-    initial.insert("i2".to_string(), 0.004);
+    initial.insert("vout".to_string(), 6.0);
+    initial.insert("i1".to_string(), 0.005);
+    initial.insert("i2".to_string(), 0.002);
 
     let solution = solver.solve(initial).expect("solve failed");
     let vout_sol = solution.values.get("vout").copied().unwrap();
     let i_sol = solution.values.get("i1").copied().unwrap();
 
+    // A runnable example doubles as a release smoke test when it verifies the
+    // known divider solution and confirms that a numerical update occurred.
+    assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+    assert!(solution.iterations > 0);
+    assert!((vout_sol - 8.0).abs() < 1e-8);
+    assert!((i_sol - 0.004).abs() < 1e-10);
+    assert!((solution.values["i2"] - i_sol).abs() < 1e-10);
     println!("vout={:.6} V, current={:.6} A", vout_sol, i_sol);
 }
