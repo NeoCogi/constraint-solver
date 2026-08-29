@@ -59,8 +59,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Prevented norm, normalized-gradient, stationarity, and line-search slope
-  calculations from overflowing or underflowing at extreme finite scales.
+- Prevented norm, column-scaled stationarity, and line-search slope calculations
+  from overflowing or underflowing at extreme finite scales.
 - Corrected Householder reflector scaling and triangular condition estimation,
   including off-diagonal growth and uniform matrix rescaling.
 - Corrected LU pivot classification so every pivot, including the final one,

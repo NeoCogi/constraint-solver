@@ -40,7 +40,7 @@ The solver supports all three system shapes:
   linearization.
 - Over-constrained systems (equations > variables): solved via QR/SVD least
   squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
-  system that reaches first-order stationarity returns
+  system whose residual is orthogonal to every Jacobian column returns
   `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
 
 Every system shape has the same success contract: `Ok(Solution)` means the
