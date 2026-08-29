@@ -56,7 +56,13 @@ struct LineSearchContext<'a> {
     /// Newton correction direction whose scalar multiplier is being searched.
     delta: &'a Matrix,
     /// Residual norm at the current accepted point.
-    current_error: f64,
+    current_residual_norm: f64,
+    /// Directional derivative of `0.5 * ||f||^2` along `delta`.
+    ///
+    /// For residual vector `f`, Jacobian `J`, and candidate direction `p`, this
+    /// value is `f^T J p`. A negative value proves that sufficiently small
+    /// positive steps descend the least-squares objective.
+    objective_directional_derivative: f64,
     /// Number of Newton updates accepted before this line search began.
     ///
     /// Keeping this as an accepted-update count, rather than a one-based attempt
@@ -689,12 +695,19 @@ impl NewtonRaphsonSolver {
                     match j_matrix.solve_lu(&f_neg) {
                         Ok(d) => d,
                         Err(_) => {
-                            // Matrix is singular - try with increased regularization
-                            let diag_size = j_matrix.rows().min(j_matrix.cols());
+                            // A singular square Jacobian gets one regularized
+                            // fallback. Work on a clone so the cached matrix
+                            // remains the derivative of the actual residuals;
+                            // line-search slope calculations must use J, not the
+                            // numerically modified system used only to obtain p.
+                            let mut regularized_jacobian = j_matrix.clone();
+                            let diag_size = regularized_jacobian
+                                .rows()
+                                .min(regularized_jacobian.cols());
                             for i in 0..diag_size {
-                                j_matrix[(i, i)] += self.regularization * 100.0;
+                                regularized_jacobian[(i, i)] += self.regularization * 100.0;
                             }
-                            match j_matrix.solve_lu(&f_neg) {
+                            match regularized_jacobian.solve_lu(&f_neg) {
                                 Ok(d) => d,
                                 Err(e) => {
                                     let diag = self.build_diagnostic(
@@ -770,11 +783,21 @@ impl NewtonRaphsonSolver {
                 // demonstrated sufficient residual reduction. Passing the
                 // current residuals lets an exhausted search report the state
                 // at which it failed rather than the final rejected candidate.
+                let objective_directional_derivative =
+                    self.least_squares_directional_derivative(
+                        jacobian_workspace.jacobian(),
+                        &f_vals,
+                        &delta,
+                        parallel,
+                        &vars,
+                        iter,
+                    )?;
                 self.line_search(LineSearchContext {
                     jacobian: &jacobian,
                     vars: &vars,
                     delta: &delta,
-                    current_error: error,
+                    current_residual_norm: error,
+                    objective_directional_derivative,
                     accepted_updates: iter,
                     current_residuals: &f_vals,
                     candidate_residuals: &mut line_search_f_vals,
@@ -1265,6 +1288,72 @@ impl NewtonRaphsonSolver {
         Ok(gradient.norm())
     }
 
+    /// Compute the directional derivative of the nonlinear least-squares
+    /// objective `0.5 * ||f||^2` along a proposed solver direction.
+    ///
+    /// The derivative is `f^T J p`, where `p` is the Newton or Gauss-Newton
+    /// correction. Keeping this calculation in one checked helper ensures the
+    /// line search never applies an Armijo test to a non-finite or mismatched
+    /// numerical state.
+    fn least_squares_directional_derivative(
+        &self,
+        jacobian: &Matrix,
+        residuals: &Matrix,
+        direction: &Matrix,
+        parallel: bool,
+        vars: &HashMap<VarId, f64>,
+        accepted_updates: usize,
+    ) -> Result<f64, SolverError> {
+        // Multiplying J by the candidate direction produces the residual-space
+        // velocity used by the chain rule. The multiplication honors the
+        // solver's selected execution mode and retains structured shape errors.
+        let residual_velocity = jacobian.try_mul_with_parallel(direction, parallel)?;
+        if !residual_velocity.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search directional derivative produced NaN or infinity",
+                accepted_updates,
+                vars,
+                residuals,
+            ));
+        }
+
+        // Accumulate the dot product with Neumaier compensation. Compensation
+        // reduces cancellation error when signed residual contributions differ
+        // greatly in magnitude, which is common near a least-squares optimum.
+        let mut sum = 0.0;
+        let mut compensation = 0.0;
+        for row in 0..residuals.rows() {
+            let product = residuals[(row, 0)] * residual_velocity[(row, 0)];
+            if !product.is_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Line-search directional derivative overflowed",
+                    accepted_updates,
+                    vars,
+                    residuals,
+                ));
+            }
+
+            let next = sum + product;
+            if sum.abs() >= product.abs() {
+                compensation += (sum - next) + product;
+            } else {
+                compensation += (product - next) + sum;
+            }
+            sum = next;
+        }
+
+        let derivative = sum + compensation;
+        if !derivative.is_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search directional derivative accumulation overflowed",
+                accepted_updates,
+                vars,
+                residuals,
+            ));
+        }
+        Ok(derivative)
+    }
+
     /// Build the dedicated error variant for non-finite numerical states while
     /// preserving the current values and residual vector for diagnosis.
     fn non_finite_evaluation_error(
@@ -1324,7 +1413,8 @@ impl NewtonRaphsonSolver {
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
-    /// * `current_error` - Current function error |f(x)|
+    /// * `current_residual_norm` - Current function error `||f(x)||`
+    /// * `objective_directional_derivative` - Value of `f^T J delta`
     /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
     /// * `candidate_residuals` - Reusable storage for each trial point
@@ -1341,7 +1431,8 @@ impl NewtonRaphsonSolver {
             jacobian,
             vars,
             delta,
-            current_error,
+            current_residual_norm,
+            objective_directional_derivative,
             accepted_updates,
             current_residuals,
             candidate_residuals,
@@ -1352,7 +1443,40 @@ impl NewtonRaphsonSolver {
         // down to the explicit minimum without making the search unbounded.
         const MAX_LINE_SEARCH_TRIALS: usize = 64;
         const MIN_LINE_SEARCH_STEP: f64 = 1e-12;
-        const SUFFICIENT_DECREASE_FRACTION: f64 = 0.5;
+        // A small Armijo coefficient asks only for a decrease consistent with
+        // the local objective slope. Unlike the previous fixed 50% residual
+        // reduction, this remains attainable near a non-zero residual floor.
+        const ARMIJO_COEFFICIENT: f64 = 1e-4;
+
+        // A non-negative derivative means the proposed correction is not a
+        // descent direction for the least-squares objective. Backtracking cannot
+        // repair such a direction, so preserve the current state and explain the
+        // numerical cause without evaluating misleading trial points.
+        if objective_directional_derivative >= 0.0 {
+            let diagnostic = self.build_diagnostic(
+                format!(
+                    "Line search cannot proceed because the proposed correction is not a descent direction (f^T J delta = {objective_directional_derivative:.2e})"
+                ),
+                accepted_updates,
+                vars,
+                current_residuals,
+            );
+            return Err(SolverError::NoConvergence(diagnostic));
+        }
+
+        // Applying Armijo to the residual norm avoids squaring very large but
+        // finite norms. The derivative of `||f||` is `(f^T J p) / ||f||` away
+        // from a root; roots have already terminated before line search begins.
+        let residual_norm_directional_derivative =
+            objective_directional_derivative / current_residual_norm;
+        if !residual_norm_directional_derivative.is_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search residual-norm slope produced NaN or infinity",
+                accepted_updates,
+                vars,
+                current_residuals,
+            ));
+        }
 
         // Begin with the caller's configured maximum step and reuse a cloned
         // variable map for all candidates so fixed parameters remain present on
@@ -1377,9 +1501,9 @@ impl NewtonRaphsonSolver {
             // alpha instead of aborting at its first overflow.
             jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
             let new_error = candidate_residuals.norm();
-            let required_error =
-                current_error * (1.0 - SUFFICIENT_DECREASE_FRACTION * alpha);
-            if new_error.is_finite() && new_error < required_error {
+            let required_error = current_residual_norm
+                + ARMIJO_COEFFICIENT * alpha * residual_norm_directional_derivative;
+            if new_error.is_finite() && new_error <= required_error {
                 return Ok(alpha);
             }
 
@@ -1947,7 +2071,11 @@ mod tests {
                     // the unchanged initial state rather than the first attempted
                     // Newton update.
                     assert_eq!(diagnostic.iterations, 0);
-                    assert!(diagnostic.message.contains("Line search failed"));
+                    assert!(
+                        diagnostic.message.contains("not a descent direction"),
+                        "{}",
+                        diagnostic.message
+                    );
                     assert_eq!(diagnostic.values["x"], 0.0);
                     assert_eq!(diagnostic.error, 1.0);
                 }
@@ -2131,6 +2259,45 @@ mod tests {
             assert!(solution.values["x"].abs() < 1e-8);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
             assert!(solution.gradient_norm < 1e-8);
+        }
+    }
+
+    /// Confirm that line search uses the local least-squares slope rather than
+    /// demanding an impossible fixed reduction near a non-zero residual floor.
+    #[test]
+    fn test_line_search_reaches_inconsistent_least_squares_stationarity() {
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+
+            // Moving from x=0.1 to x=0 only improves the residual norm by about
+            // half a percent because sqrt(2) is unavoidable. A valid Armijo test
+            // accepts that slope-consistent improvement, whereas the former 50%
+            // requirement rejected every possible positive step.
+            let x = Exp::var("x");
+            let equations = vec![
+                Exp::sub(x.clone(), Exp::val(1.0)),
+                Exp::add(x, Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.1)]);
+
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("Armijo line search should reach the least-squares optimum");
+
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert_eq!(
+                solution.reason,
+                ConvergenceReason::LeastSquaresStationary
+            );
+            assert!(solution.values["x"].abs() < 1e-8);
+            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
         }
     }
 
