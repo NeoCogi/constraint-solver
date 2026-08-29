@@ -610,6 +610,81 @@ impl NewtonRaphsonSolver {
             let error = f_vals.norm();
             convergence_history.push(error);
 
+            // The origin-based point policy cannot damp a vector directly from
+            // an arbitrary current point to the projected Newton point: doing so
+            // retains the same fraction of the current Jacobian-null-space
+            // component. Remove that component as its own accepted update first.
+            // Subsequent damped corrections then remain entirely in the row
+            // space and are minimum-norm solutions of their damped linearization.
+            if num_equations < num_variables
+                && self.underdetermined_policy
+                    == UnderdeterminedPolicy::MinimumNormLinearizedSolution
+            {
+                let projection_result = self.project_underdetermined_current_point(
+                    jacobian_workspace.jacobian(),
+                    &vars,
+                    least_squares_workspace.as_mut(),
+                    parallel,
+                );
+                let projected_values = match projection_result {
+                    Ok(projected_values) => projected_values,
+                    Err(LeastSquaresSolveError::InvalidInput(err)) => {
+                        return Err(SolverError::InvalidInput(err.to_string()));
+                    }
+                    Err(LeastSquaresSolveError::Singular {
+                        unregularized_qr_error,
+                        regularized_qr_error,
+                    }) => {
+                        let diagnostic = self.build_diagnostic(
+                            format!(
+                                "Could not project the current point out of the Jacobian null space (unregularized_qr_error: {unregularized_qr_error}; regularized_qr_error: {regularized_qr_error})"
+                            ),
+                            iter,
+                            &vars,
+                            &f_vals,
+                        );
+                        return Err(SolverError::SingularMatrix(diagnostic));
+                    }
+                };
+
+                if let Some(projected_values) = projected_values {
+                    // Apply the full null-space projection. Partial application
+                    // would preserve null-space content and violate the selected
+                    // point policy; damping is reserved for the residual-space
+                    // Newton correction on the following iteration.
+                    for (index, &var_id) in self.variables.iter().enumerate() {
+                        vars.insert(var_id, projected_values[(index, 0)]);
+                    }
+
+                    // A projection is an accepted variable update and receives
+                    // the same finite-state validation as an ordinary Newton
+                    // update before the next linearization is constructed.
+                    jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
+                    if !f_vals.all_finite() {
+                        return Err(self.non_finite_evaluation_error(
+                            "Minimum-norm point projection produced non-finite residuals",
+                            iter + 1,
+                            &vars,
+                            &f_vals,
+                        ));
+                    }
+                    jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+                    if !jacobian_workspace.jacobian().all_finite() {
+                        return Err(self.non_finite_evaluation_error(
+                            "Minimum-norm point projection produced a non-finite Jacobian",
+                            iter + 1,
+                            &vars,
+                            &f_vals,
+                        ));
+                    }
+
+                    // Restart from the projected state so convergence, line
+                    // search, and damping all use residuals and derivatives from
+                    // exactly the same accepted point.
+                    continue;
+                }
+            }
+
             // Check for convergence: |f(x)| < tolerance
             if error < self.tolerance {
                 // The Jacobian workspace already corresponds to `vars`, so the
@@ -874,6 +949,28 @@ impl NewtonRaphsonSolver {
             ));
         }
         let final_error = residuals.norm();
+        if final_error < self.tolerance {
+            // A minimum-norm null-space projection can consume the final allowed
+            // update and land directly on a root. There is no following loop
+            // iteration to run the ordinary residual check, so accept that final
+            // state here with diagnostics evaluated at the returned values.
+            let gradient_norm = self.residual_gradient_norm(
+                jacobian_workspace.jacobian(),
+                &residuals,
+                parallel,
+                &vars,
+                self.max_iterations,
+            )?;
+            convergence_history.push(final_error);
+            return Ok(self.build_solution(
+                &vars,
+                self.max_iterations,
+                final_error,
+                gradient_norm,
+                ConvergenceReason::ResidualTolerance,
+                convergence_history,
+            ));
+        }
         if num_equations > num_variables {
             // The loop normally checks stationarity at the start of the next
             // iteration. When the final allowed update lands on an optimum there
@@ -969,6 +1066,59 @@ impl NewtonRaphsonSolver {
                     .try_sub(&current_values)
                     .map_err(LeastSquaresSolveError::InvalidInput)
             }
+        }
+    }
+
+    /// Project the current solve-variable vector onto the row space of a wide
+    /// Jacobian when origin-based minimum-norm point semantics are requested.
+    ///
+    /// Solving `J * x_projected = J * x_current` for its minimum-norm solution
+    /// removes exactly the component of `x_current` in the null space of `J`.
+    /// The returned `None` means the current point is already projected to
+    /// floating-point accuracy; `Some` contains a full replacement vector whose
+    /// application must not be damped.
+    fn project_underdetermined_current_point(
+        &self,
+        j_matrix: &Matrix,
+        vars: &HashMap<VarId, f64>,
+        workspace: Option<&mut LeastSquaresWorkspace>,
+        parallel: bool,
+    ) -> Result<Option<Matrix>, LeastSquaresSolveError> {
+        // Assemble solve variables in Jacobian-column order. Fixed parameters do
+        // not appear in this vector and remain untouched by the projection.
+        let mut current_values = Matrix::new(self.variables.len(), 1);
+        for (index, &var_id) in self.variables.iter().enumerate() {
+            current_values[(index, 0)] = vars[&var_id];
+        }
+
+        // J*x is invariant under removal of any Jacobian-null-space component.
+        // Re-solving this right-hand side with the wide minimum-norm solver
+        // therefore produces the row-space representative of the same local
+        // linearized state.
+        let projected_rhs = j_matrix
+            .try_mul_with_parallel(&current_values, parallel)
+            .map_err(LeastSquaresSolveError::InvalidInput)?;
+        let projected_values = self.solve_least_squares_system(
+            j_matrix,
+            &projected_rhs,
+            workspace,
+            parallel,
+        )?;
+        let projection_delta = projected_values
+            .try_sub(&current_values)
+            .map_err(LeastSquaresSolveError::InvalidInput)?;
+
+        // Avoid consuming iterations on roundoff-sized reprojections. Scaling by
+        // the current vector norm makes the threshold invariant under unit
+        // changes while the epsilon multiplier allows ordinary QR noise.
+        const PROJECTION_EPSILON_MULTIPLIER: f64 = 64.0;
+        let projection_threshold = PROJECTION_EPSILON_MULTIPLIER
+            * f64::EPSILON
+            * current_values.norm().max(1.0);
+        if projection_delta.norm() <= projection_threshold {
+            Ok(None)
+        } else {
+            Ok(Some(projected_values))
         }
     }
 
@@ -2405,6 +2555,55 @@ mod tests {
             assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
             assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
+        }
+    }
+
+    /// Verify that damping changes only residual-space progress and never leaves
+    /// a fraction of an inherited Jacobian-null-space component in the result.
+    #[test]
+    fn test_damped_linearized_solution_policy_remains_minimum_norm() {
+        for use_line_search in [false, true] {
+            let mut serial_solution: Option<Solution> = None;
+            for mode in test_modes() {
+                let is_serial = matches!(mode, Mode::Serial);
+
+                // The initial values have a null-space component of magnitude
+                // 1e8. Damping the old current-to-target delta left about 0.0058
+                // of that component when residual tolerance terminated, yielding
+                // visibly unequal coordinates despite the point policy.
+                let x = Exp::var("x");
+                let y = Exp::var("y");
+                let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+                let solver = solver_for_mode(vec![equation], mode)
+                    .with_underdetermined_policy(
+                        UnderdeterminedPolicy::MinimumNormLinearizedSolution,
+                    )
+                    .with_damping(0.5)
+                    .with_tolerance(1e-10)
+                    .with_max_iterations(100);
+                let initial = HashMap::from([
+                    ("x".to_string(), 1.0e8),
+                    ("y".to_string(), -1.0e8),
+                ]);
+
+                let solution = if use_line_search {
+                    solver.solve_with_line_search(initial)
+                } else {
+                    solver.solve(initial)
+                }
+                .expect("damped point policy should retain minimum-norm semantics");
+
+                if is_serial {
+                    serial_solution = Some(solution.clone());
+                } else {
+                    let serial = serial_solution.as_ref().expect("serial solution missing");
+                    assert_solution_close(serial, &solution, 1e-10);
+                }
+                assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+                assert!((solution.values["x"] - 0.5).abs() < 1e-9);
+                assert!((solution.values["y"] - 0.5).abs() < 1e-9);
+                assert!((solution.values["x"] - solution.values["y"]).abs() < 1e-10);
+            }
         }
     }
 
