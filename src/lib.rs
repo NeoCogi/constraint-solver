@@ -33,7 +33,7 @@ SOFTWARE.
 //! # Quick start
 //!
 //! ```
-//! use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+//! use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 //! use std::collections::HashMap;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,7 +44,7 @@ SOFTWARE.
 //! let initial = HashMap::from([("x".to_string(), 0.0)]);
 //!
 //! let solution = solver.solve(initial)?;
-//! assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+//! assert!(solution.error < 1e-10);
 //! assert!((solution.values["x"] - 2.0).abs() < 1e-10);
 //! # Ok(())
 //! # }
@@ -67,8 +67,8 @@ pub use exp::Exp;
 pub use matrix::{LeastSquaresInfo, LeastSquaresMethod, Matrix, MatrixError, MatrixOperand};
 pub use mode::Mode;
 pub use solver::{
-    ConvergenceReason, EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution,
-    SolverError, SolverRunDiagnostic, UnderdeterminedPolicy,
+    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError,
+    SolverRunDiagnostic, UnderdeterminedPolicy,
 };
 
 /// Documentation-only container that makes every Rust block in the repository

@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 fn main() {
@@ -62,7 +62,7 @@ fn main() {
 
     // A runnable example doubles as a release smoke test when it verifies the
     // known divider solution and confirms that a numerical update occurred.
-    assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+    assert!(solution.error < 1e-10);
     assert!(solution.iterations > 0);
     assert!((vout_sol - 8.0).abs() < 1e-8);
     assert!((i_sol - 0.004).abs() < 1e-10);

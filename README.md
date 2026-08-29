@@ -31,15 +31,14 @@ The solver supports all three system shapes:
   preserves null-space continuity, and the minimum-norm solution of each local
   linearization.
 - Over-constrained systems (equations > variables): solved via QR/SVD least
-  squares, minimizing the residual error. Inconsistent systems can converge at
-  a nonzero residual when the scale-independent least-squares gradient is
-  stationary. This is a first-order condition, not a guarantee of a global
-  minimum.
+  squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
+  system that reaches first-order stationarity returns
+  `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
 
 ### Square system example
 
 ```rust
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -59,15 +58,13 @@ initial.insert("x".to_string(), 0.5);
 initial.insert("y".to_string(), 0.866);
 
 let solution = solver.solve(initial).expect("solve failed");
-assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+assert!(solution.error < 1e-10);
 ```
 
 ### Under-constrained example (minimum-norm linearized solution)
 
 ```rust
-use constraint_solver::{
-    Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver, UnderdeterminedPolicy,
-};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, UnderdeterminedPolicy};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -85,7 +82,7 @@ let mut initial = HashMap::new();
 initial.insert("x".to_string(), 10.0);
 initial.insert("y".to_string(), -10.0);
 let solution = solver.solve(initial).expect("solve failed");
-assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+assert!(solution.error < 1e-10);
 assert!((solution.values["x"] - 0.5).abs() < 1e-10);
 assert!((solution.values["y"] - 0.5).abs() < 1e-10);
 ```
@@ -93,7 +90,7 @@ assert!((solution.values["y"] - 0.5).abs() < 1e-10);
 ### Over-constrained example (least squares)
 
 ```rust
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -108,13 +105,13 @@ let solver = NewtonRaphsonSolver::new(compiled);
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.0);
 let solution = solver.solve(initial).expect("solve failed");
-assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+assert!(solution.error < 1e-10);
 ```
 
 ### Line search and regularization
 
 ```rust
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -124,7 +121,7 @@ let f2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
 let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
 let solver = NewtonRaphsonSolver::new(compiled)
-    .with_tolerance(1e-8)
+    .with_residual_tolerance(1e-8)
     .with_max_iterations(50)
     .with_regularization(1e-8);
 
@@ -135,7 +132,7 @@ initial.insert("y".to_string(), 0.25);
 let solution = solver
     .solve_with_line_search(initial)
     .expect("solve failed");
-assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+assert!(solution.error < 1e-8);
 ```
 
 ### Execution mode (serial vs parallel)

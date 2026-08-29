@@ -92,10 +92,10 @@ struct ResidualGradientMeasure {
     absolute_norm: f64,
     /// Dimensionless norm `||(J / ||J||_F)^T (f / ||f||_2)||`.
     ///
-    /// The value is absent when either normalization denominator is zero. A
-    /// non-zero residual with a zero Jacobian is deliberately not accepted as a
-    /// least-squares optimum because first-order information cannot distinguish
-    /// a minimum from a flat point or local maximum there.
+    /// The value is absent when either normalization denominator is zero. At a
+    /// non-root with a zero Jacobian, the raw gradient is still exactly zero and
+    /// therefore satisfies first-order stationarity without implying a local
+    /// minimum.
     relative_norm: Option<f64>,
 }
 
@@ -103,11 +103,12 @@ impl ResidualGradientMeasure {
     /// Return whether the dimensionless gradient meets the configured
     /// first-order stationarity tolerance.
     fn is_stationary(self, tolerance: f64) -> bool {
-        // Require an actual normalized measure. Treating an undefined `0 / 0`
-        // normalization as zero caused zero-Jacobian non-roots to be returned as
-        // successful least-squares solutions.
+        // Prefer the scale-independent measure whenever it exists. A missing
+        // measure paired with an exactly zero raw gradient is the zero-Jacobian
+        // case: it is mathematically stationary and is now reported as an error,
+        // so recognizing it cannot misclassify a non-root as success.
         self.relative_norm
-            .is_some_and(|relative_norm| relative_norm < tolerance)
+            .map_or(self.absolute_norm == 0.0, |norm| norm < tolerance)
     }
 }
 
@@ -190,8 +191,11 @@ pub struct NewtonRaphsonSolver {
     var_table: VarTable,
     /// Maximum number of iterations before giving up
     max_iterations: usize,
-    /// Convergence tolerance (solution found when |f(x)| < tolerance)
-    tolerance: f64,
+    /// Positive finite residual norm threshold required for a successful solve.
+    residual_tolerance: f64,
+    /// Positive finite normalized-gradient threshold used to identify a
+    /// stationary state that has not satisfied the constraints.
+    stationarity_tolerance: f64,
     /// Initial damping factor (step size multiplier, 0 < damping <= 1)
     /// Lower values make convergence more stable but slower
     damping_factor: f64,
@@ -214,27 +218,11 @@ pub struct NewtonRaphsonSolver {
     pool: Option<ThreadPool>,
 }
 
-/// Describes the mathematical condition that caused a successful solve to
-/// terminate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConvergenceReason {
-    /// The Euclidean residual norm satisfied the requested root tolerance.
-    ResidualTolerance,
-    /// An overdetermined system reached scale-independent first-order
-    /// least-squares stationarity even though its residual could not be driven to
-    /// zero.
-    ///
-    /// This reason certifies a small normalized residual gradient, not a global
-    /// minimum. As with other first-order nonlinear optimizers, callers that need
-    /// stronger optimality guarantees must perform problem-specific checks.
-    LeastSquaresStationary,
-}
-
 /// Successful solver result with values and explicit convergence diagnostics.
 ///
-/// The solver returns failures as `SolverError`, so there is no redundant
-/// boolean success field. Callers can inspect `reason` to distinguish an
-/// approximate root from a stationary overdetermined least-squares result.
+/// Constructing this value certifies that the Euclidean residual norm satisfied
+/// the configured root tolerance. Stationary non-roots are returned through
+/// [`SolverError::StationaryNonRoot`] and can never produce `Solution`.
 #[derive(Debug, Clone)]
 pub struct Solution {
     /// Final values of every compiled variable, including fixed parameters.
@@ -250,12 +238,9 @@ pub struct Solution {
     /// Dimensionless scale-independent norm of the residual gradient.
     ///
     /// `None` means either the residual norm or Jacobian Frobenius norm was zero,
-    /// so the normalized first-order measure was undefined. Residual roots are
-    /// accepted before this distinction matters; non-root zero-Jacobian states
-    /// are not classified as successful least-squares stationary points.
+    /// so the normalized first-order measure was undefined. A successful root
+    /// commonly has a zero residual and therefore reports `None` here.
     pub relative_gradient_norm: Option<f64>,
-    /// Mathematical convergence test that accepted the returned values.
-    pub reason: ConvergenceReason,
     /// Residual norms for the initial point and each accepted update through the
     /// returned point.
     pub convergence_history: Vec<f64>,
@@ -292,6 +277,14 @@ pub struct SolverRunDiagnostic {
     pub iterations: usize,
     /// Euclidean norm of all entries in `equations`.
     pub error: f64,
+    /// Norm of `J^T f` when the terminating path evaluated stationarity.
+    ///
+    /// Other failures report `None` because computing a fresh Jacobian merely
+    /// for diagnostics could itself fail or obscure the original error.
+    pub gradient_norm: Option<f64>,
+    /// Dimensionless normalized residual-gradient norm when it was defined and
+    /// evaluated at the diagnostic state.
+    pub relative_gradient_norm: Option<f64>,
     /// Variable values at the end of the run, keyed by compiled variable name.
     pub values: HashMap<String, f64>,
     /// Per-equation residuals enriched with any attached source metadata.
@@ -302,12 +295,23 @@ pub struct SolverRunDiagnostic {
 #[derive(Debug, Clone)]
 pub enum SolverError {
     /// The Jacobian or regularized least-squares system could not be solved.
-    SingularMatrix(SolverRunDiagnostic),
+    /// The diagnostic is boxed so successful `Result` values do not carry space
+    /// for maps and per-equation details that exist only on failure.
+    SingularMatrix(Box<SolverRunDiagnostic>),
     /// The configured update budget or line search ended without convergence.
-    NoConvergence(SolverRunDiagnostic),
+    /// The diagnostic is boxed to keep the error enum compact.
+    NoConvergence(Box<SolverRunDiagnostic>),
     /// Expression, Jacobian, update, or residual-gradient evaluation produced
     /// NaN or infinity.
-    NonFiniteEvaluation(SolverRunDiagnostic),
+    /// The diagnostic is boxed to keep the error enum compact.
+    NonFiniteEvaluation(Box<SolverRunDiagnostic>),
+    /// The residual remains above its root tolerance while the first-order
+    /// residual gradient satisfies the stationarity tolerance.
+    ///
+    /// This applies uniformly to square, underdetermined, and overdetermined
+    /// systems. It does not claim the state is a local minimum; stationary
+    /// maxima and saddles use the same non-success result.
+    StationaryNonRoot(Box<SolverRunDiagnostic>),
     /// Invalid input parameters or system setup.
     InvalidInput(String),
 }
@@ -325,6 +329,13 @@ impl fmt::Display for SolverError {
             }
             SolverError::NonFiniteEvaluation(diagnostic) => {
                 write!(f, "Non-finite solver evaluation: {}", diagnostic.message)
+            }
+            SolverError::StationaryNonRoot(diagnostic) => {
+                write!(
+                    f,
+                    "Stationary point is not a constraint root: {}",
+                    diagnostic.message
+                )
             }
             SolverError::InvalidInput(message) => write!(f, "Invalid solver input: {message}"),
         }
@@ -356,8 +367,9 @@ impl NewtonRaphsonSolver {
     /// Create a new Newton-Raphson solver with adaptive parameters
     ///
     /// Parameters are automatically adjusted based on system type:
-    /// - Over-constrained systems get more iterations, relaxed tolerance, conservative damping
-    /// - Normal systems use standard parameters for fast convergence
+    /// - Over-constrained systems get more iterations, conservative damping,
+    ///   and stronger regularization
+    /// - Every shape uses the same residual and stationarity tolerances
     ///
     /// # Arguments
     /// * `compiled` - Compiled system of equations (each should evaluate to 0 at solution)
@@ -432,8 +444,10 @@ impl NewtonRaphsonSolver {
             var_table: compiled.var_table,
             // Over-constrained systems are harder to converge, so give them more iterations
             max_iterations: if is_over_constrained { 200 } else { 100 },
-            // Over-constrained systems use relaxed tolerance since exact solutions may not exist
-            tolerance: if is_over_constrained { 1e-8 } else { 1e-10 },
+            // Success always means the same residual threshold regardless of
+            // equation shape; incompatible systems now return an explicit error.
+            residual_tolerance: 1e-10,
+            stationarity_tolerance: 1e-10,
             // Over-constrained systems use conservative damping for stability
             damping_factor: if is_over_constrained { 0.7 } else { 1.0 },
             min_damping: 0.001,
@@ -538,16 +552,28 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the positive, finite residual and relative-stationarity
-    /// tolerance.
+    /// Override the positive, finite residual norm required for success.
     ///
     /// The solver deliberately does not treat a small applied update as
     /// convergence because damping can make a useful correction arbitrarily
     /// small. Configuration is validated when a solve begins.
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+    pub fn with_residual_tolerance(mut self, residual_tolerance: f64) -> Self {
         // Store without clamping so NaN, infinity, zero, and negative values are
         // observable to the common configuration validator.
-        self.tolerance = tolerance;
+        self.residual_tolerance = residual_tolerance;
+        self
+    }
+
+    /// Override the positive, finite normalized-gradient threshold used to
+    /// identify stationary non-roots.
+    ///
+    /// This value does not permit a successful least-squares result. It controls
+    /// when the solver stops with [`SolverError::StationaryNonRoot`] instead of
+    /// spending the remaining update budget at a first-order fixed point.
+    pub fn with_stationarity_tolerance(mut self, stationarity_tolerance: f64) -> Self {
+        // Preserve invalid values for deterministic validation at the shared
+        // solve boundary rather than silently clamping numerical policy.
+        self.stationarity_tolerance = stationarity_tolerance;
         self
     }
 
@@ -709,7 +735,7 @@ impl NewtonRaphsonSolver {
                             &vars,
                             &f_vals,
                         );
-                        return Err(SolverError::SingularMatrix(diagnostic));
+                        return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
                     }
                 };
 
@@ -751,8 +777,9 @@ impl NewtonRaphsonSolver {
                 }
             }
 
-            // Check for convergence: |f(x)| < tolerance
-            if error < self.tolerance {
+            // A successful result requires the actual constraints to satisfy
+            // the residual threshold, independently of system shape.
+            if error < self.residual_tolerance {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
@@ -762,38 +789,21 @@ impl NewtonRaphsonSolver {
                     &vars,
                     iter,
                 )?;
-                return Ok(self.build_solution(
-                    &vars,
-                    iter,
-                    error,
-                    gradient,
-                    ConvergenceReason::ResidualTolerance,
-                    convergence_history,
-                ));
+                return Ok(self.build_solution(&vars, iter, error, gradient, convergence_history));
             }
 
-            // A non-zero residual can still be the mathematically correct result
-            // of an inconsistent overdetermined system. Test first-order
-            // least-squares stationarity before damping adaptation so the small
-            // objective changes near a residual floor cannot be misclassified as
-            // solver stagnation.
-            if num_equations > num_variables {
-                let gradient = self.residual_gradient_measure(
-                    jacobian_workspace.jacobian(),
-                    &f_vals,
-                    &vars,
-                    iter,
-                )?;
-                if gradient.is_stationary(self.tolerance) {
-                    return Ok(self.build_solution(
-                        &vars,
-                        iter,
-                        error,
-                        gradient,
-                        ConvergenceReason::LeastSquaresStationary,
-                        convergence_history,
-                    ));
-                }
+            // Every system shape can reach a first-order fixed point that is not
+            // a root, particularly after rank truncation or regularization.
+            // Detect it before damping or another identical linear solve and
+            // return a non-success result with the exact stationary state.
+            let gradient = self.residual_gradient_measure(
+                jacobian_workspace.jacobian(),
+                &f_vals,
+                &vars,
+                iter,
+            )?;
+            if gradient.is_stationary(self.stationarity_tolerance) {
+                return Err(self.stationary_non_root_error(iter, &vars, &f_vals, gradient));
             }
 
             // Adaptive damping belongs only to the standard solver. Line search
@@ -868,7 +878,7 @@ impl NewtonRaphsonSolver {
                         &vars,
                         &f_vals,
                     );
-                    return Err(SolverError::SingularMatrix(diagnostic));
+                    return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
                 }
             };
 
@@ -939,7 +949,7 @@ impl NewtonRaphsonSolver {
             }
             let updated_error = f_vals.norm();
 
-            if updated_error < self.tolerance {
+            if updated_error < self.residual_tolerance {
                 // A terminating candidate belongs in the history even though a
                 // subsequent loop iteration will not push it.
                 convergence_history.push(updated_error);
@@ -955,7 +965,6 @@ impl NewtonRaphsonSolver {
                     iter + 1,
                     updated_error,
                     gradient,
-                    ConvergenceReason::ResidualTolerance,
                     convergence_history,
                 ));
             }
@@ -977,7 +986,7 @@ impl NewtonRaphsonSolver {
             ));
         }
         let final_error = residuals.norm();
-        if final_error < self.tolerance {
+        if final_error < self.residual_tolerance {
             // A minimum-norm null-space projection can consume the final allowed
             // update and land directly on a root. There is no following loop
             // iteration to run the ordinary residual check, so accept that final
@@ -994,32 +1003,27 @@ impl NewtonRaphsonSolver {
                 self.max_iterations,
                 final_error,
                 gradient,
-                ConvergenceReason::ResidualTolerance,
                 convergence_history,
             ));
         }
-        if num_equations > num_variables {
-            // The loop normally checks stationarity at the start of the next
-            // iteration. When the final allowed update lands on an optimum there
-            // is no next iteration, so perform the same test here before
-            // reporting budget exhaustion.
-            let gradient = self.residual_gradient_measure(
-                jacobian_workspace.jacobian(),
-                &residuals,
-                &vars,
+
+        // The loop normally checks stationarity at the start of the next
+        // iteration. When the final allowed update lands on a fixed point there
+        // is no next iteration, so apply the same shape-independent error rule
+        // before reporting mere budget exhaustion.
+        let gradient = self.residual_gradient_measure(
+            jacobian_workspace.jacobian(),
+            &residuals,
+            &vars,
+            self.max_iterations,
+        )?;
+        if gradient.is_stationary(self.stationarity_tolerance) {
+            return Err(self.stationary_non_root_error(
                 self.max_iterations,
-            )?;
-            if gradient.is_stationary(self.tolerance) {
-                convergence_history.push(final_error);
-                return Ok(self.build_solution(
-                    &vars,
-                    self.max_iterations,
-                    final_error,
-                    gradient,
-                    ConvergenceReason::LeastSquaresStationary,
-                    convergence_history,
-                ));
-            }
+                &vars,
+                &residuals,
+                gradient,
+            ));
         }
 
         let diag = self.build_diagnostic(
@@ -1031,7 +1035,7 @@ impl NewtonRaphsonSolver {
             &vars,
             &residuals,
         );
-        Err(SolverError::NoConvergence(diag))
+        Err(SolverError::NoConvergence(Box::new(diag)))
     }
 
     /// Compute the Newton correction for a wide Jacobian according to the
@@ -1353,12 +1357,19 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // The same tolerance controls the residual-root and normalized-gradient
-        // stationarity tests; it must therefore be strictly positive and
-        // finite. Applied step size is intentionally not a convergence test.
-        if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+        // Residual tolerance is the sole success threshold, so reject values
+        // that could make every state succeed or no finite state succeed.
+        if !self.residual_tolerance.is_finite() || self.residual_tolerance <= 0.0 {
             return Err(SolverError::InvalidInput(
-                "tolerance must be finite and greater than zero".to_string(),
+                "residual_tolerance must be finite and greater than zero".to_string(),
+            ));
+        }
+
+        // Stationarity has a separate scale-independent threshold because it
+        // controls an error classification, not acceptance of a constraint root.
+        if !self.stationarity_tolerance.is_finite() || self.stationarity_tolerance <= 0.0 {
+            return Err(SolverError::InvalidInput(
+                "stationarity_tolerance must be finite and greater than zero".to_string(),
             ));
         }
 
@@ -1422,7 +1433,6 @@ impl NewtonRaphsonSolver {
         iterations: usize,
         error: f64,
         gradient: ResidualGradientMeasure,
-        reason: ConvergenceReason,
         convergence_history: Vec<f64>,
     ) -> Solution {
         // Convert internal IDs only after all numerical convergence checks have
@@ -1433,9 +1443,36 @@ impl NewtonRaphsonSolver {
             error,
             gradient_norm: gradient.absolute_norm,
             relative_gradient_norm: gradient.relative_norm,
-            reason,
             convergence_history,
         }
+    }
+
+    /// Construct the shape-independent error returned when a non-root satisfies
+    /// the configured first-order stationarity threshold.
+    fn stationary_non_root_error(
+        &self,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+        gradient: ResidualGradientMeasure,
+    ) -> SolverError {
+        // Start with the same values and per-equation trace data as every other
+        // run failure, then attach the already-computed gradient measures so no
+        // second numerical evaluation can disagree with the terminating test.
+        let mut diagnostic = self.build_diagnostic(
+            format!(
+                "Residual norm {:.2e} exceeds tolerance {:.2e}, while the normalized residual gradient satisfies stationarity tolerance {:.2e}",
+                residuals.norm(),
+                self.residual_tolerance,
+                self.stationarity_tolerance,
+            ),
+            iterations,
+            vars,
+            residuals,
+        );
+        diagnostic.gradient_norm = Some(gradient.absolute_norm);
+        diagnostic.relative_gradient_norm = gradient.relative_norm;
+        SolverError::StationaryNonRoot(Box::new(diagnostic))
     }
 
     /// Compute absolute and dimensionless first-order least-squares gradients.
@@ -1609,12 +1646,12 @@ impl NewtonRaphsonSolver {
         // `build_diagnostic` intentionally preserves a NaN or infinite residual
         // norm; hiding it behind a finite sentinel would discard useful failure
         // evidence.
-        SolverError::NonFiniteEvaluation(self.build_diagnostic(
+        SolverError::NonFiniteEvaluation(Box::new(self.build_diagnostic(
             message.into(),
             iterations,
             vars,
             residuals,
-        ))
+        )))
     }
 
     /// Capture a failure message together with the exact variable and
@@ -1642,6 +1679,8 @@ impl NewtonRaphsonSolver {
             message,
             iterations,
             error: residuals_matrix.norm(),
+            gradient_norm: None,
+            relative_gradient_norm: None,
             values: self.values_by_name(vars),
             equations,
         }
@@ -1706,7 +1745,7 @@ impl NewtonRaphsonSolver {
                 vars,
                 current_residuals,
             );
-            return Err(SolverError::NoConvergence(diagnostic));
+            return Err(SolverError::NoConvergence(Box::new(diagnostic)));
         }
 
         // Roots terminate before line search begins, and the helper has already
@@ -1769,7 +1808,7 @@ impl NewtonRaphsonSolver {
             vars,
             current_residuals,
         );
-        Err(SolverError::NoConvergence(diagnostic))
+        Err(SolverError::NoConvergence(Box::new(diagnostic)))
     }
 
     /// Solve the system using Newton-Raphson with line search
@@ -1856,6 +1895,17 @@ mod tests {
         }
     }
 
+    /// Extract the structured state from the strict non-root stationarity error
+    /// while producing a focused test failure for any other variant.
+    fn expect_stationary_non_root(error: SolverError) -> SolverRunDiagnostic {
+        // Centralizing this match keeps stationarity regression tests focused on
+        // their numerical state rather than repeating variant boilerplate.
+        match error {
+            SolverError::StationaryNonRoot(diagnostic) => *diagnostic,
+            other => panic!("expected StationaryNonRoot, got {other:?}"),
+        }
+    }
+
     fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new_with_mode(compiled, mode).expect("failed to set solver mode")
@@ -1906,7 +1956,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!(solution.error < 1e-10);
 
             let x_sol = solution.values.get("x").copied().unwrap();
@@ -1927,7 +1976,7 @@ mod tests {
             let x = Exp::var("x");
             let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
             let solver = solver_for_mode(vec![equation], mode)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(20);
 
             // Both calls borrow the same construction-time symbolic Jacobian
@@ -1939,14 +1988,6 @@ mod tests {
                 .solve(HashMap::from([("x".to_string(), -3.0)]))
                 .expect("negative initial guess should converge");
 
-            assert_eq!(
-                positive_solution.reason,
-                ConvergenceReason::ResidualTolerance
-            );
-            assert_eq!(
-                negative_solution.reason,
-                ConvergenceReason::ResidualTolerance
-            );
             assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
             assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
         }
@@ -1965,7 +2006,7 @@ mod tests {
             let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
             let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_tolerance(1e-8)
+                .with_residual_tolerance(1e-8)
                 .with_max_iterations(50)
                 .with_regularization(1e-8);
 
@@ -1983,7 +2024,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             let x_sol = solution.values.get("x").copied().unwrap();
             let y_sol = solution.values.get("y").copied().unwrap();
             assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
@@ -2072,10 +2112,21 @@ mod tests {
                 "max_iterations",
                 Box::new(|solver| solver.with_max_iterations(0)),
             ),
-            ("tolerance", Box::new(|solver| solver.with_tolerance(0.0))),
             (
-                "tolerance",
-                Box::new(|solver| solver.with_tolerance(f64::NAN)),
+                "residual_tolerance",
+                Box::new(|solver| solver.with_residual_tolerance(0.0)),
+            ),
+            (
+                "residual_tolerance",
+                Box::new(|solver| solver.with_residual_tolerance(f64::NAN)),
+            ),
+            (
+                "stationarity_tolerance",
+                Box::new(|solver| solver.with_stationarity_tolerance(0.0)),
+            ),
+            (
+                "stationarity_tolerance",
+                Box::new(|solver| solver.with_stationarity_tolerance(f64::INFINITY)),
             ),
             (
                 "damping_factor",
@@ -2305,7 +2356,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
         }
     }
@@ -2325,7 +2375,7 @@ mod tests {
             let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
             let solver = solver_for_mode(vec![equation], mode)
                 .with_max_iterations(100)
-                .with_tolerance(1e-10);
+                .with_residual_tolerance(1e-10);
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let solution = solver
@@ -2361,7 +2411,6 @@ mod tests {
                 .solve_with_line_search(initial)
                 .expect("scale-safe residual-norm slope should permit the Newton step");
 
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert_eq!(solution.values["x"], 1.0);
             assert_eq!(solution.error, 0.0);
         }
@@ -2370,7 +2419,7 @@ mod tests {
     /// Verify that exhaustion preserves the current state and reports failure
     /// instead of applying an untested minimum-damping fallback.
     #[test]
-    fn test_line_search_rejects_every_step_for_constant_residual() {
+    fn test_line_search_reports_constant_residual_as_stationary_non_root() {
         for mode in test_modes() {
             // Multiplying x by zero registers it as a solve variable while the
             // residual remains exactly one for every possible candidate.
@@ -2381,23 +2430,16 @@ mod tests {
 
             let error = solver
                 .solve_with_line_search(initial)
-                .expect_err("a constant residual has no acceptable descent step");
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    // Every trial was rejected, so the public count must describe
-                    // the unchanged initial state rather than the first attempted
-                    // Newton update.
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert!(
-                        diagnostic.message.contains("not a descent direction"),
-                        "{}",
-                        diagnostic.message
-                    );
-                    assert_eq!(diagnostic.values["x"], 0.0);
-                    assert_eq!(diagnostic.error, 1.0);
-                }
-                other => panic!("expected line-search NoConvergence, got {other:?}"),
-            }
+                .expect_err("a constant residual is stationary but not a root");
+            let diagnostic = expect_stationary_non_root(error);
+
+            // Stationarity is visible before line search attempts an unusable
+            // zero correction, so the unchanged initial state has zero updates.
+            assert_eq!(diagnostic.iterations, 0);
+            assert_eq!(diagnostic.values["x"], 0.0);
+            assert_eq!(diagnostic.error, 1.0);
+            assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            assert_eq!(diagnostic.relative_gradient_norm, None);
         }
     }
 
@@ -2471,7 +2513,7 @@ mod tests {
                 let equation = Exp::sub(x, Exp::val(1.0));
                 let solver = solver_for_mode(vec![equation], mode)
                     .with_damping(0.1)
-                    .with_tolerance(1e-10)
+                    .with_residual_tolerance(1e-10)
                     .with_max_iterations(300);
                 let initial = HashMap::from([("x".to_string(), 0.0)]);
 
@@ -2482,7 +2524,6 @@ mod tests {
                 }
                 .expect("damped linear updates should eventually reach the root");
 
-                assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
                 assert!(solution.error < 1e-10);
             }
         }
@@ -2505,7 +2546,6 @@ mod tests {
                 .expect("scaled linear root should solve");
 
             let returned_residual = 1e20 * solution.values["x"] + 1.0;
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert_eq!(solution.iterations, 1);
             assert_eq!(solution.error, returned_residual.abs());
             assert_eq!(solution.error, 0.0);
@@ -2513,8 +2553,8 @@ mod tests {
         }
     }
 
-    /// Distinguish a non-zero stationary least-squares result from an
-    /// approximate root in an inconsistent overdetermined system.
+    /// Distinguish a stationary non-root error from a successful constraint root
+    /// in an inconsistent overdetermined system.
     #[test]
     fn test_inconsistent_overdetermined_system_reports_stationarity() {
         for mode in test_modes() {
@@ -2528,18 +2568,65 @@ mod tests {
             let solver = solver_for_mode(equations, mode);
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver
+            let error = solver
                 .solve(initial)
-                .expect("stationary least-squares result should be explicit");
+                .expect_err("stationary least-squares state is not a constraint root");
+            let diagnostic = expect_stationary_non_root(error);
 
-            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
-            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-12);
-            assert!(solution.gradient_norm < 1e-10);
+            assert_eq!(diagnostic.iterations, 0);
+            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+            assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-10));
             assert!(
-                solution
+                diagnostic
                     .relative_gradient_norm
                     .is_some_and(|norm| norm < 1e-10)
             );
+        }
+    }
+
+    /// Verify strict stationary-non-root semantics do not depend on the number
+    /// of equations relative to solve variables.
+    #[test]
+    fn test_stationary_non_root_error_is_shape_independent() {
+        for mode in test_modes() {
+            // Square case: two incompatible equations constrain x while y is a
+            // registered but unused solve variable. Their gradient cancels at
+            // the initial point even though neither residual is zero.
+            let square_x = Exp::var("square_x");
+            let square_y = Exp::var("square_y");
+            let square_zero_y = Exp::mul(square_y, Exp::val(0.0));
+            let square_equations = vec![
+                Exp::add(Exp::sub(square_x.clone(), Exp::val(1.0)), square_zero_y),
+                Exp::add(square_x, Exp::val(1.0)),
+            ];
+            let square_initial =
+                HashMap::from([("square_x".to_string(), 0.0), ("square_y".to_string(), 0.0)]);
+
+            // Underdetermined case: the positive residual x^2 + 1 has a zero
+            // derivative at x=0, and multiplication by zero registers a second
+            // solve variable without changing the equation.
+            let wide_x = Exp::var("wide_x");
+            let wide_y = Exp::var("wide_y");
+            let wide_equations = vec![Exp::add(
+                Exp::add(Exp::power(wide_x, 2.0), Exp::val(1.0)),
+                Exp::mul(wide_y, Exp::val(0.0)),
+            )];
+            let wide_initial =
+                HashMap::from([("wide_x".to_string(), 0.0), ("wide_y".to_string(), 0.0)]);
+
+            for (shape, equations, initial) in [
+                ("square", square_equations, square_initial),
+                ("underdetermined", wide_equations, wide_initial),
+            ] {
+                let error = solver_for_mode(equations, mode.clone())
+                    .solve(initial)
+                    .expect_err("a stationary non-root must never be successful");
+                let diagnostic = expect_stationary_non_root(error);
+
+                assert_eq!(diagnostic.iterations, 0, "unexpected {shape} update");
+                assert!(diagnostic.error > 0.0, "missing {shape} residual");
+                assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            }
         }
     }
 
@@ -2561,14 +2648,14 @@ mod tests {
             let solver = solver_for_mode(equations, mode);
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver
+            let error = solver
                 .solve(initial)
-                .expect("normalized stationarity should survive raw-product overflow");
+                .expect_err("normalized stationary non-root should survive raw overflow");
+            let diagnostic = expect_stationary_non_root(error);
 
-            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
-            assert_eq!(solution.gradient_norm, 0.0);
-            assert_eq!(solution.relative_gradient_norm, Some(0.0));
-            assert!((solution.error / 1e200 - 2.0_f64.sqrt()).abs() < 1e-12);
+            assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+            assert!((diagnostic.error / 1e200 - 2.0_f64.sqrt()).abs() < 1e-12);
         }
     }
 
@@ -2591,17 +2678,16 @@ mod tests {
                 .solve(initial)
                 .expect("a scaled consistent linear system should reach its root");
 
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert_eq!(solution.iterations, 1);
             assert!((solution.values["x"] - 1e5).abs() < 1e-9);
             assert!(solution.error < 1e-12);
         }
     }
 
-    /// Reject a non-root zero-Jacobian point instead of treating an undefined
-    /// normalized gradient as evidence of a least-squares minimum.
+    /// Classify a non-root zero-Jacobian point as stationary without claiming it
+    /// is a successful least-squares minimum.
     #[test]
-    fn test_zero_jacobian_nonminimum_is_not_stationary_success() {
+    fn test_zero_jacobian_nonminimum_is_stationary_non_root() {
         for mode in test_modes() {
             // Both equations have exact roots at +/-1. At x=0 their residual is
             // non-zero and the squared-residual objective has a local maximum,
@@ -2616,14 +2702,12 @@ mod tests {
                 .solve(initial)
                 .expect_err("a zero-Jacobian local maximum must not be successful");
 
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert_eq!(diagnostic.iterations, 1);
-                    assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
-                    assert_eq!(diagnostic.values["x"], 0.0);
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
-            }
+            let diagnostic = expect_stationary_non_root(error);
+            assert_eq!(diagnostic.iterations, 0);
+            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+            assert_eq!(diagnostic.values["x"], 0.0);
+            assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            assert_eq!(diagnostic.relative_gradient_norm, None);
         }
     }
 
@@ -2631,7 +2715,7 @@ mod tests {
     /// instead of treating the naturally shrinking objective changes as failure.
     #[test]
     fn test_inconsistent_overdetermined_system_reaches_stationarity_from_away() {
-        let mut serial_solution: Option<Solution> = None;
+        let mut serial_diagnostic: Option<SolverRunDiagnostic> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
 
@@ -2647,22 +2731,25 @@ mod tests {
             let solver = solver_for_mode(equations, mode);
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            let solution = solver
+            let error = solver
                 .solve(initial)
-                .expect("default damping should reach least-squares stationarity");
+                .expect_err("default damping should identify a stationary non-root");
+            let diagnostic = expect_stationary_non_root(error);
 
             if is_serial {
-                serial_solution = Some(solution.clone());
+                serial_diagnostic = Some(diagnostic.clone());
             } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
+                let serial = serial_diagnostic
+                    .as_ref()
+                    .expect("serial diagnostic missing");
+                assert!((serial.values["x"] - diagnostic.values["x"]).abs() < 1e-10);
+                assert!((serial.error - diagnostic.error).abs() < 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
-            assert!(solution.values["x"].abs() < 1e-8);
-            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
-            assert!(solution.gradient_norm < 1e-8);
+            assert!(diagnostic.values["x"].abs() < 1e-8);
+            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
+            assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-8));
             assert!(
-                solution
+                diagnostic
                     .relative_gradient_norm
                     .is_some_and(|norm| norm < 1e-8)
             );
@@ -2673,7 +2760,7 @@ mod tests {
     /// demanding an impossible fixed reduction near a non-zero residual floor.
     #[test]
     fn test_line_search_reaches_inconsistent_least_squares_stationarity() {
-        let mut serial_solution: Option<Solution> = None;
+        let mut serial_diagnostic: Option<SolverRunDiagnostic> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
 
@@ -2689,19 +2776,22 @@ mod tests {
             let solver = solver_for_mode(equations, mode);
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            let solution = solver
+            let error = solver
                 .solve_with_line_search(initial)
-                .expect("Armijo line search should reach the least-squares optimum");
+                .expect_err("Armijo line search should reach a stationary non-root");
+            let diagnostic = expect_stationary_non_root(error);
 
             if is_serial {
-                serial_solution = Some(solution.clone());
+                serial_diagnostic = Some(diagnostic.clone());
             } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
+                let serial = serial_diagnostic
+                    .as_ref()
+                    .expect("serial diagnostic missing");
+                assert!((serial.values["x"] - diagnostic.values["x"]).abs() < 1e-10);
+                assert!((serial.error - diagnostic.error).abs() < 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
-            assert!(solution.values["x"].abs() < 1e-8);
-            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
+            assert!(diagnostic.values["x"].abs() < 1e-8);
+            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
         }
     }
 
@@ -2717,7 +2807,6 @@ mod tests {
 
             let solution = solver.solve(initial).expect("initial point is a root");
 
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.convergence_history, vec![0.0]);
         }
@@ -2775,7 +2864,7 @@ mod tests {
                 .with_regularization(0.0)
                 .with_damping(1.0)
                 .with_max_iterations(10)
-                .with_tolerance(1e-10);
+                .with_residual_tolerance(1e-10);
 
             let mut initial = HashMap::new();
             initial.insert("x".to_string(), 0.0);
@@ -2791,7 +2880,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
             assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
         }
@@ -2810,7 +2898,7 @@ mod tests {
 
             let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
             let solver = solver_for_mode(vec![eq], mode)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(10)
                 .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormLinearizedSolution);
 
@@ -2825,7 +2913,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
             assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
         }
@@ -2852,7 +2939,7 @@ mod tests {
                         UnderdeterminedPolicy::MinimumNormLinearizedSolution,
                     )
                     .with_damping(0.5)
-                    .with_tolerance(1e-10)
+                    .with_residual_tolerance(1e-10)
                     .with_max_iterations(100);
                 let initial = HashMap::from([("x".to_string(), 1.0e8), ("y".to_string(), -1.0e8)]);
 
@@ -2869,7 +2956,6 @@ mod tests {
                     let serial = serial_solution.as_ref().expect("serial solution missing");
                     assert_solution_close(serial, &solution, 1e-10);
                 }
-                assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
                 assert!((solution.values["x"] - 0.5).abs() < 1e-9);
                 assert!((solution.values["y"] - 0.5).abs() < 1e-9);
                 assert!((solution.values["x"] - solution.values["y"]).abs() < 1e-10);
@@ -2895,7 +2981,6 @@ mod tests {
                 .solve(initial)
                 .expect("linear constraint should solve");
 
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values["x"] - 10.5).abs() < 1e-10);
             assert!((solution.values["y"] + 9.5).abs() < 1e-10);
         }
@@ -2924,7 +3009,7 @@ mod tests {
             );
 
             let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(10);
 
             let mut initial = HashMap::new();
@@ -2938,7 +3023,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
             assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
         }
@@ -2969,7 +3053,7 @@ mod tests {
 
             let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
                 .with_regularization(0.0)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(10);
 
             let mut initial = HashMap::new();
@@ -2985,7 +3069,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values["x"] - 1.0).abs() < 1e-10);
             assert!(solution.values["y"].abs() < 1e-10);
         }
@@ -3008,7 +3091,7 @@ mod tests {
             let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
             let solver = solver_for_mode(vec![first_equation, second_equation], mode)
                 .with_regularization(0.0)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(10);
 
             // A symmetric initial point makes the pseudoinverse's minimum-norm
@@ -3027,7 +3110,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!(solution.error < 1e-12);
             assert!((solution.values["x"] - 0.5).abs() < 1e-10);
             assert!((solution.values["y"] - 0.5).abs() < 1e-10);
@@ -3050,7 +3132,7 @@ mod tests {
             );
             let second_equation = Exp::sub(y, Exp::val(1.0));
             let solver = solver_for_mode(vec![first_equation, second_equation], mode)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(1);
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
@@ -3080,7 +3162,7 @@ mod tests {
             let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
 
             let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_tolerance(1e-12)
+                .with_residual_tolerance(1e-12)
                 .with_max_iterations(10);
 
             let mut initial = HashMap::new();
@@ -3093,7 +3175,6 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
         }
     }
@@ -3130,7 +3211,7 @@ mod tests {
                     .collect();
 
                 let solver = solver_for_mode(equations, mode.clone())
-                    .with_tolerance(1e-12)
+                    .with_residual_tolerance(1e-12)
                     .with_max_iterations(20);
 
                 let mut initial = HashMap::new();
@@ -3188,7 +3269,7 @@ mod tests {
                     .collect();
 
                 let solver = solver_for_mode(equations, mode.clone())
-                    .with_tolerance(1e-12)
+                    .with_residual_tolerance(1e-12)
                     .with_max_iterations(20);
 
                 let mut initial = HashMap::new();
@@ -3229,7 +3310,7 @@ mod tests {
                 let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
 
                 let solver = solver_for_mode(vec![eq1, eq2], mode.clone())
-                    .with_tolerance(1e-12)
+                    .with_residual_tolerance(1e-12)
                     .with_max_iterations(20);
 
                 let mut initial = HashMap::new();

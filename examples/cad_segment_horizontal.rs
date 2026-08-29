@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 fn main() {
@@ -63,7 +63,7 @@ fn main() {
     // Keep the runnable example self-checking: the positive-x branch selected
     // by the initial guess must satisfy both constraints after at least one
     // accepted update.
-    assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+    assert!(solution.error < 1e-10);
     assert!(solution.iterations > 0);
     assert!((bx_sol - 6.0).abs() < 1e-8);
     assert!((by_sol - y_target).abs() < 1e-8);
