@@ -291,7 +291,8 @@ pub struct NewtonRaphsonSolver {
 /// [`SolverError::StationaryNonRoot`] and can never produce `Solution`.
 #[derive(Debug, Clone)]
 pub struct Solution {
-    /// Final values of every compiled variable, including fixed parameters.
+    /// Finite final values of every compiled variable, including fixed
+    /// parameters.
     pub values: HashMap<String, f64>,
     /// Number of accepted Newton updates. An already-solved initial guess
     /// therefore reports zero iterations.
@@ -1060,9 +1061,20 @@ impl NewtonRaphsonSolver {
                 damping
             };
 
-            // Step 5: Update variables: x_new = x_old + step_size * delta.
-            for (i, &var_id) in self.variables.iter().enumerate() {
-                vars.insert(var_id, vars[&var_id] + step_size * delta[(i, 0)]);
+            // Commit the correction only when every resulting coordinate is
+            // finite. Checking the residual afterward is insufficient because an
+            // expression such as a reciprocal can map an infinite variable back
+            // to a finite value and make an invalid iterate look like a root.
+            if !self.apply_finite_step(&mut vars, &delta, step_size) {
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Newton update would produce a non-finite variable value",
+                        iter,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
+                ));
             }
 
             // Refresh both the residual and Jacobian at the accepted point.
@@ -1711,6 +1723,39 @@ impl NewtonRaphsonSolver {
         values
     }
 
+    /// Apply one correction atomically when every proposed variable value is
+    /// finite.
+    ///
+    /// The first pass validates the complete candidate without changing
+    /// `vars`. The second pass commits the same arithmetic only after success,
+    /// so a failure cannot leave a mixture of old and partially updated values.
+    /// Fixed parameters are absent from `self.variables` and remain untouched.
+    fn apply_finite_step(
+        &self,
+        vars: &mut HashMap<VarId, f64>,
+        delta: &Matrix,
+        step_size: f64,
+    ) -> bool {
+        if self
+            .variables
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(index, var_id)| {
+                let value = vars[&var_id] + step_size * delta[(index, 0)];
+                !value.is_finite()
+            })
+        {
+            return false;
+        }
+
+        for (index, &var_id) in self.variables.iter().enumerate() {
+            let value = vars[&var_id] + step_size * delta[(index, 0)];
+            vars.insert(var_id, value);
+        }
+        true
+    }
+
     /// Construct a successful result from numerical quantities that have all
     /// been evaluated at the same accepted variable state.
     ///
@@ -2076,22 +2121,22 @@ impl NewtonRaphsonSolver {
             attempted_trials += 1;
             new_vars.clone_from(vars);
 
-            // Compute the candidate values without mutating the accepted solver
-            // state. Only solve variables move; fixed parameters are copied.
-            for (i, &var_id) in self.variables.iter().enumerate() {
-                new_vars.insert(var_id, vars[&var_id] + alpha * delta[(i, 0)]);
-            }
-
-            // Non-finite candidate residuals are rejected by the finite Armijo
-            // comparison and backtracked just like any other unusable trial.
-            // This permits a large exponential step to recover at a smaller
-            // alpha instead of aborting at its first overflow.
-            jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
-            let new_error = candidate_residuals.norm();
-            let required_error = current_residual_norm
-                + self.options.armijo_coefficient * alpha * residual_norm_directional_derivative;
-            if new_error.is_finite() && new_error <= required_error {
-                return Ok(alpha);
+            // Build the candidate transactionally. Variable overflow is rejected
+            // before expression evaluation, while a finite smaller step remains
+            // eligible on the next backtracking trial.
+            if self.apply_finite_step(&mut new_vars, delta, alpha) {
+                // Non-finite residuals are likewise rejected by the finite Armijo
+                // comparison. This permits a large exponential step to recover at
+                // a smaller alpha without accepting an invalid candidate.
+                jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
+                let new_error = candidate_residuals.norm();
+                let required_error = current_residual_norm
+                    + self.options.armijo_coefficient
+                        * alpha
+                        * residual_norm_directional_derivative;
+                if new_error.is_finite() && new_error <= required_error {
+                    return Ok(alpha);
+                }
             }
 
             // Stop only after the current minimum-sized candidate has actually
@@ -2565,6 +2610,59 @@ mod tests {
                     assert!(message.contains("x"), "{message}");
                 }
                 other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+    }
+
+    /// Prevent a finite residual from hiding overflow in the variable state
+    /// produced by either solver update path.
+    #[test]
+    fn test_solver_never_commits_non_finite_variable_updates() {
+        for mode in test_modes() {
+            // At x=1e308 the reciprocal expression and its derivative are both
+            // finite, but the undamped Newton correction is another 1e308. The
+            // resulting x would overflow to infinity while the reciprocal of
+            // that invalid value evaluates to the deceptively finite value zero.
+            let x = Exp::var("x");
+            let scaled_x = Exp::mul(Exp::val(1e-308), x);
+            let equation = Exp::div(Exp::val(1.0), scaled_x);
+            let initial = HashMap::from([("x".to_string(), 1e308)]);
+
+            // The ordinary Newton path has no smaller candidate to try. It must
+            // reject the update and report the last finite accepted point.
+            let solver =
+                solver_for_mode(vec![equation.clone()], mode.clone()).with_regularization(0.0);
+            let error = solver
+                .solve(initial.clone())
+                .expect_err("an overflowing Newton update must not become a solution");
+            match error {
+                SolverError::NonFiniteEvaluation(diagnostic) => {
+                    assert!(diagnostic.message.contains("non-finite variable value"));
+                    assert_eq!(diagnostic.iterations, 0);
+                    assert_eq!(diagnostic.values["x"], 1e308);
+                    assert!(diagnostic.values.values().all(|value| value.is_finite()));
+                }
+                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+            }
+
+            // A line search treats the same overflowing full step as a rejected
+            // candidate. Limiting the search to that one trial makes the
+            // preserved-state behavior deterministic for this regression.
+            let solver = configure_options(
+                solver_for_mode(vec![equation], mode).with_regularization(0.0),
+                |options| options.line_search_max_trials = 1,
+            );
+            let error = solver
+                .solve_with_line_search(initial)
+                .expect_err("an overflowing line-search candidate must be rejected");
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert!(diagnostic.message.contains("Line search failed"));
+                    assert_eq!(diagnostic.iterations, 0);
+                    assert_eq!(diagnostic.values["x"], 1e308);
+                    assert!(diagnostic.values.values().all(|value| value.is_finite()));
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
             }
         }
     }
