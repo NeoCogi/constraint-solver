@@ -72,6 +72,17 @@ jobs:
       - name: Run unit and example tests
         run: cargo test --all-targets
 
+      # `cargo test --all-targets` builds example harnesses but does not execute
+      # their `main` functions. Run every headless example so solver failures and
+      # their self-checking numerical assertions participate in the release
+      # gate; the interactive GLFW program cannot run on a headless CI worker.
+      - name: Run headless examples
+        run: |
+          cargo run --locked --example cad_circle_intersection
+          cargo run --locked --example cad_segment_horizontal
+          cargo run --locked --example circuit_diode
+          cargo run --locked --example circuit_voltage_divider
+
       - name: Run documentation tests
         run: cargo test --doc
 
