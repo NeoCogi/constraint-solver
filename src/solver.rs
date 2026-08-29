@@ -79,6 +79,37 @@ struct LineSearchContext<'a> {
     candidate_residuals: &'a mut Matrix,
 }
 
+/// Absolute and scale-independent measures of the nonlinear least-squares
+/// gradient at one accepted solver state.
+///
+/// Keeping the two values together prevents convergence checks from using the
+/// scale-sensitive absolute gradient while result diagnostics accidentally
+/// report a differently evaluated quantity.
+#[derive(Debug, Clone, Copy)]
+struct ResidualGradientMeasure {
+    /// Euclidean norm of the raw gradient `J^T f` in caller-provided units.
+    absolute_norm: f64,
+    /// Dimensionless norm `||(J / ||J||_F)^T (f / ||f||_2)||`.
+    ///
+    /// The value is absent when either normalization denominator is zero. A
+    /// non-zero residual with a zero Jacobian is deliberately not accepted as a
+    /// least-squares optimum because first-order information cannot distinguish
+    /// a minimum from a flat point or local maximum there.
+    relative_norm: Option<f64>,
+}
+
+impl ResidualGradientMeasure {
+    /// Return whether the dimensionless gradient meets the configured
+    /// first-order stationarity tolerance.
+    fn is_stationary(self, tolerance: f64) -> bool {
+        // Require an actual normalized measure. Treating an undefined `0 / 0`
+        // normalization as zero caused zero-Jacobian non-roots to be returned as
+        // successful least-squares solutions.
+        self.relative_norm
+            .is_some_and(|relative_norm| relative_norm < tolerance)
+    }
+}
+
 impl LeastSquaresWorkspace {
     /// Allocate zero-filled augmented matrices for repeated regularized solves.
     fn new(num_equations: usize, num_variables: usize) -> Result<Self, MatrixError> {
@@ -185,8 +216,13 @@ pub struct NewtonRaphsonSolver {
 pub enum ConvergenceReason {
     /// The Euclidean residual norm satisfied the requested root tolerance.
     ResidualTolerance,
-    /// An overdetermined system reached first-order least-squares stationarity
-    /// with a small step, even though its residual could not be driven to zero.
+    /// An overdetermined system reached scale-independent first-order
+    /// least-squares stationarity even though its residual could not be driven to
+    /// zero.
+    ///
+    /// This reason certifies a small normalized residual gradient, not a global
+    /// minimum. As with other first-order nonlinear optimizers, callers that need
+    /// stronger optimality guarantees must perform problem-specific checks.
     LeastSquaresStationary,
 }
 
@@ -207,6 +243,13 @@ pub struct Solution {
     /// Norm of `J^T f` at the returned values, measuring first-order
     /// least-squares stationarity.
     pub gradient_norm: f64,
+    /// Dimensionless scale-independent norm of the residual gradient.
+    ///
+    /// `None` means either the residual norm or Jacobian Frobenius norm was zero,
+    /// so the normalized first-order measure was undefined. Residual roots are
+    /// accepted before this distinction matters; non-root zero-Jacobian states
+    /// are not classified as successful least-squares stationary points.
+    pub relative_gradient_norm: Option<f64>,
     /// Mathematical convergence test that accepted the returned values.
     pub reason: ConvergenceReason,
     /// Residual norms for the initial point and each accepted update through the
@@ -700,7 +743,7 @@ impl NewtonRaphsonSolver {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
-                let gradient_norm = self.residual_gradient_norm(
+                let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
                     parallel,
@@ -711,7 +754,7 @@ impl NewtonRaphsonSolver {
                     &vars,
                     iter,
                     error,
-                    gradient_norm,
+                    gradient,
                     ConvergenceReason::ResidualTolerance,
                     convergence_history,
                 ));
@@ -723,19 +766,19 @@ impl NewtonRaphsonSolver {
             // objective changes near a residual floor cannot be misclassified as
             // solver stagnation.
             if num_equations > num_variables {
-                let gradient_norm = self.residual_gradient_norm(
+                let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
                     parallel,
                     &vars,
                     iter,
                 )?;
-                if gradient_norm < self.tolerance {
+                if gradient.is_stationary(self.tolerance) {
                     return Ok(self.build_solution(
                         &vars,
                         iter,
                         error,
-                        gradient_norm,
+                        gradient,
                         ConvergenceReason::LeastSquaresStationary,
                         convergence_history,
                     ));
@@ -920,7 +963,7 @@ impl NewtonRaphsonSolver {
                 // A terminating candidate belongs in the history even though a
                 // subsequent loop iteration will not push it.
                 convergence_history.push(updated_error);
-                let gradient_norm = self.residual_gradient_norm(
+                let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
                     parallel,
@@ -932,7 +975,7 @@ impl NewtonRaphsonSolver {
                     &vars,
                     iter + 1,
                     updated_error,
-                    gradient_norm,
+                    gradient,
                     ConvergenceReason::ResidualTolerance,
                     convergence_history,
                 ));
@@ -960,7 +1003,7 @@ impl NewtonRaphsonSolver {
             // update and land directly on a root. There is no following loop
             // iteration to run the ordinary residual check, so accept that final
             // state here with diagnostics evaluated at the returned values.
-            let gradient_norm = self.residual_gradient_norm(
+            let gradient = self.residual_gradient_measure(
                 jacobian_workspace.jacobian(),
                 &residuals,
                 parallel,
@@ -972,7 +1015,7 @@ impl NewtonRaphsonSolver {
                 &vars,
                 self.max_iterations,
                 final_error,
-                gradient_norm,
+                gradient,
                 ConvergenceReason::ResidualTolerance,
                 convergence_history,
             ));
@@ -982,20 +1025,20 @@ impl NewtonRaphsonSolver {
             // iteration. When the final allowed update lands on an optimum there
             // is no next iteration, so perform the same test here before
             // reporting budget exhaustion.
-            let gradient_norm = self.residual_gradient_norm(
+            let gradient = self.residual_gradient_measure(
                 jacobian_workspace.jacobian(),
                 &residuals,
                 parallel,
                 &vars,
                 self.max_iterations,
             )?;
-            if gradient_norm < self.tolerance {
+            if gradient.is_stationary(self.tolerance) {
                 convergence_history.push(final_error);
                 return Ok(self.build_solution(
                     &vars,
                     self.max_iterations,
                     final_error,
-                    gradient_norm,
+                    gradient,
                     ConvergenceReason::LeastSquaresStationary,
                     convergence_history,
                 ));
@@ -1400,7 +1443,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         iterations: usize,
         error: f64,
-        gradient_norm: f64,
+        gradient: ResidualGradientMeasure,
         reason: ConvergenceReason,
         convergence_history: Vec<f64>,
     ) -> Solution {
@@ -1410,26 +1453,31 @@ impl NewtonRaphsonSolver {
             values: self.values_by_name(vars),
             iterations,
             error,
-            gradient_norm,
+            gradient_norm: gradient.absolute_norm,
+            relative_gradient_norm: gradient.relative_norm,
             reason,
             convergence_history,
         }
     }
 
-    /// Compute the first-order least-squares optimality measure `||J^T f||`.
+    /// Compute absolute and dimensionless first-order least-squares gradients.
     ///
     /// A small Newton step is not sufficient evidence of convergence: it can
     /// also result from regularization, scaling, or numerical cancellation.
-    /// The residual gradient supplies the additional stationarity condition
-    /// needed for a non-zero overdetermined least-squares residual.
-    fn residual_gradient_norm(
+    /// The raw `||J^T f||` value remains useful caller-facing diagnostic data,
+    /// but it changes when equations are multiplied by a unit-conversion factor.
+    /// Convergence therefore uses
+    /// `||(J / ||J||_F)^T (f / ||f||_2)||`, whose factors are normalized before
+    /// multiplication so very large or small finite scales cannot overflow or
+    /// underflow an otherwise representable relative measure.
+    fn residual_gradient_measure(
         &self,
         jacobian: &Matrix,
         residuals: &Matrix,
         parallel: bool,
         vars: &HashMap<VarId, f64>,
         iterations: usize,
-    ) -> Result<f64, SolverError> {
+    ) -> Result<ResidualGradientMeasure, SolverError> {
         // Form J^T using the same execution policy as the surrounding solve,
         // then multiply it by the current residual column vector.
         let jacobian_transpose = jacobian.transpose_with_parallel(parallel);
@@ -1442,7 +1490,71 @@ impl NewtonRaphsonSolver {
                 residuals,
             ));
         }
-        Ok(gradient.norm())
+        let absolute_norm = gradient.norm();
+        if !absolute_norm.is_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Residual-gradient norm produced infinity",
+                iterations,
+                vars,
+                residuals,
+            ));
+        }
+
+        // Normalize individual entries before forming dot products. Computing
+        // `absolute_norm / (||J|| * ||f||)` after the raw multiplication would
+        // still permit intermediate overflow and underflow to corrupt the
+        // scale-independent convergence test.
+        let jacobian_norm = jacobian.norm();
+        let residual_norm = residuals.norm();
+        let relative_norm = if jacobian_norm > 0.0
+            && jacobian_norm.is_finite()
+            && residual_norm > 0.0
+            && residual_norm.is_finite()
+        {
+            let mut normalized_gradient = Matrix::new(jacobian.cols(), 1);
+            for column in 0..jacobian.cols() {
+                let mut sum = 0.0;
+                let mut compensation = 0.0;
+                for row in 0..jacobian.rows() {
+                    let normalized_jacobian = jacobian[(row, column)] / jacobian_norm;
+                    let normalized_residual = residuals[(row, 0)] / residual_norm;
+                    let product = normalized_jacobian * normalized_residual;
+
+                    // Neumaier compensation limits cancellation error when
+                    // positive and negative equation contributions nearly cancel
+                    // at a genuine least-squares stationary point.
+                    let next = sum + product;
+                    if sum.abs() >= product.abs() {
+                        compensation += (sum - next) + product;
+                    } else {
+                        compensation += (product - next) + sum;
+                    }
+                    sum = next;
+                }
+                normalized_gradient[(column, 0)] = sum + compensation;
+            }
+
+            let norm = normalized_gradient.norm();
+            if !norm.is_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Normalized residual-gradient evaluation produced NaN or infinity",
+                    iterations,
+                    vars,
+                    residuals,
+                ));
+            }
+            Some(norm)
+        } else {
+            // A root has already terminated before this helper is used for
+            // stationarity. For a non-root, a zero Jacobian supplies no evidence
+            // that the current point is a least-squares minimum.
+            None
+        };
+
+        Ok(ResidualGradientMeasure {
+            absolute_norm,
+            relative_norm,
+        })
     }
 
     /// Compute the directional derivative of the nonlinear least-squares
@@ -2390,6 +2502,66 @@ mod tests {
             assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-12);
             assert!(solution.gradient_norm < 1e-10);
+            assert!(
+                solution
+                    .relative_gradient_norm
+                    .is_some_and(|norm| norm < 1e-10)
+            );
+        }
+    }
+
+    /// Ensure equation-unit changes cannot make an exactly solvable system look
+    /// stationary before its first Newton update.
+    #[test]
+    fn test_scaled_consistent_overdetermined_system_does_not_false_converge() {
+        for mode in test_modes() {
+            // The absolute gradient at x=0 is only 2e-13, below the default
+            // overdetermined tolerance, but it is perfectly aligned with the
+            // residual after normalization. The exact shared root is x=100000.
+            let x = Exp::var("x");
+            let residual = Exp::sub(Exp::mul(Exp::val(1e-9), x), Exp::val(1e-4));
+            let solver = solver_for_mode(vec![residual.clone(), residual], mode)
+                .with_damping(1.0)
+                .with_regularization(0.0);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("a scaled consistent linear system should reach its root");
+
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert_eq!(solution.iterations, 1);
+            assert!((solution.values["x"] - 1e5).abs() < 1e-9);
+            assert!(solution.error < 1e-12);
+        }
+    }
+
+    /// Reject a non-root zero-Jacobian point instead of treating an undefined
+    /// normalized gradient as evidence of a least-squares minimum.
+    #[test]
+    fn test_zero_jacobian_nonminimum_is_not_stationary_success() {
+        for mode in test_modes() {
+            // Both equations have exact roots at +/-1. At x=0 their residual is
+            // non-zero and the squared-residual objective has a local maximum,
+            // even though the raw first derivative is zero.
+            let x = Exp::var("x");
+            let residual = Exp::sub(Exp::power(x, 2.0), Exp::val(1.0));
+            let solver =
+                solver_for_mode(vec![residual.clone(), residual], mode).with_max_iterations(1);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("a zero-Jacobian local maximum must not be successful");
+
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert_eq!(diagnostic.iterations, 1);
+                    assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+                    assert_eq!(diagnostic.values["x"], 0.0);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
+            }
         }
     }
 
@@ -2427,6 +2599,11 @@ mod tests {
             assert!(solution.values["x"].abs() < 1e-8);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
             assert!(solution.gradient_norm < 1e-8);
+            assert!(
+                solution
+                    .relative_gradient_norm
+                    .is_some_and(|norm| norm < 1e-8)
+            );
         }
     }
 

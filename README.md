@@ -30,7 +30,9 @@ The solver supports all three system shapes:
   linearization.
 - Over-constrained systems (equations > variables): solved via QR/SVD least
   squares, minimizing the residual error. Inconsistent systems can converge at
-  a nonzero residual when the least-squares gradient is stationary.
+  a nonzero residual when the scale-independent least-squares gradient is
+  stationary. This is a first-order condition, not a guarantee of a global
+  minimum.
 
 ### Square system example
 

@@ -43,6 +43,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pre-update failures do not masquerade as accepted Newton updates.
 - Prevented inconsistent overdetermined problems from being reported as stalled
   solely because their optimal residual is nonzero.
+- Prevented absolute equation scaling and zero-Jacobian non-root points from
+  being accepted as least-squares stationary solutions by using a normalized
+  first-order gradient measure.
 - Prevented damping adaptation from reacting to artificial residual-history
   sentinels or treating deliberately damped progress as stagnation.
 - Rejected NaN, infinity, and finite-input arithmetic overflow at matrix solve
