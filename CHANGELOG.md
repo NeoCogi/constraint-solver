@@ -26,7 +26,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Replaced the QR-named public least-squares methods and diagnostics with the
-  factorization-independent `solve_least_squares*`, `LeastSquaresInfo`, and
+  factorization-independent `solve_least_squares`, `LeastSquaresSolution`, and
   `LeastSquaresMethod` API. Backward compatibility with the pre-0.3 API is not
   retained.
 - Restricted the compiled-expression `Jacobian` implementation to crate scope;

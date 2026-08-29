@@ -1229,13 +1229,13 @@ impl NewtonRaphsonSolver {
         let mut unreg_delta: Option<Matrix> = None;
         let mut unreg_info: Option<LeastSquaresInfo> = None;
 
-        match j_matrix.solve_least_squares_with_options(rhs, self.options.least_squares, parallel) {
-            Ok((delta, info)) => {
-                if !is_ill_conditioned(&info) {
-                    return Ok(delta);
+        match j_matrix.solve_least_squares(rhs, self.options.least_squares, parallel) {
+            Ok(result) => {
+                if !is_ill_conditioned(&result.info) {
+                    return Ok(result.solution);
                 }
-                unreg_delta = Some(delta);
-                unreg_info = Some(info);
+                unreg_delta = Some(result.solution);
+                unreg_info = Some(result.info);
             }
             Err(err) => {
                 unregularized_error = Some(err.to_string());
@@ -1293,7 +1293,7 @@ impl NewtonRaphsonSolver {
                         workspace.augmented_j[(workspace.num_equations + i, i)] = sqrt_reg;
                     }
 
-                    workspace.augmented_j.solve_least_squares_with_options(
+                    workspace.augmented_j.solve_least_squares(
                         &workspace.augmented_b,
                         self.options.least_squares,
                         parallel,
@@ -1324,7 +1324,7 @@ impl NewtonRaphsonSolver {
                         augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
                         augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
                     }
-                    augmented_j.solve_least_squares_with_options(
+                    augmented_j.solve_least_squares(
                         &augmented_b,
                         self.options.least_squares,
                         parallel,
@@ -1333,9 +1333,9 @@ impl NewtonRaphsonSolver {
             };
 
             match reg_result {
-                Ok((delta, info)) => {
-                    last_solution = Some(delta);
-                    if !is_ill_conditioned(&info) {
+                Ok(result) => {
+                    last_solution = Some(result.solution);
+                    if !is_ill_conditioned(&result.info) {
                         return Ok(last_solution.unwrap());
                     }
                 }

@@ -212,6 +212,16 @@ pub struct LeastSquaresInfo {
     pub method: LeastSquaresMethod,
 }
 
+/// Checked least-squares solution paired with the factorization diagnostics
+/// that justify its numerical interpretation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeastSquaresSolution {
+    /// Full-column, least-squares, or minimum-norm solution vector.
+    pub solution: Matrix,
+    /// Rank, retained-subspace condition estimate, and factorization method.
+    pub info: LeastSquaresInfo,
+}
+
 /// Numerical policy shared by QR rank detection and the SVD pseudoinverse.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LeastSquaresOptions {
@@ -706,59 +716,20 @@ impl Matrix {
         Ok(x)
     }
 
-    /// Solve a possibly rectangular least-squares problem with automatic
-    /// rank-deficient minimum-norm handling.
+    /// Solve a possibly rectangular least-squares problem with explicit rank
+    /// and parallelism policy.
     ///
     /// Full-rank systems use Householder QR. If QR detects numerical rank loss,
-    /// a one-sided Jacobi SVD computes the Moore-Penrose pseudoinverse solution.
-    pub fn solve_least_squares(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
-        self.solve_least_squares_with_info(b)
-            .map(|(solution, _)| solution)
-    }
-
-    /// Solve a rectangular least-squares problem while optionally parallelizing
-    /// the full-rank QR fast path.
-    ///
-    /// The SVD fallback currently runs serially because cyclic Jacobi rotations
-    /// update shared column pairs; the public result is identical in both modes.
-    pub fn solve_least_squares_with_parallel(
-        &self,
-        b: &Matrix,
-        parallel: bool,
-    ) -> Result<Matrix, MatrixError> {
-        self.solve_least_squares_with_info_with_parallel(b, parallel)
-            .map(|(solution, _)| solution)
-    }
-
-    /// Solve a rectangular least-squares problem and return rank, conditioning,
-    /// and factorization-method diagnostics.
-    pub fn solve_least_squares_with_info(
-        &self,
-        b: &Matrix,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
-        self.solve_least_squares_with_info_with_parallel(b, false)
-    }
-
-    /// Solve a rectangular least-squares problem with optional QR parallelism
-    /// and return complete numerical diagnostics.
-    pub fn solve_least_squares_with_info_with_parallel(
-        &self,
-        b: &Matrix,
-        parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
-        // Preserve the concise default-policy entry point while routing all
-        // factorization through the configurable implementation.
-        self.solve_least_squares_with_options(b, LeastSquaresOptions::default(), parallel)
-    }
-
-    /// Solve a rectangular least-squares problem with explicit rank and
-    /// parallelism policy, returning complete numerical diagnostics.
-    pub fn solve_least_squares_with_options(
+    /// a one-sided Jacobi SVD computes the Moore-Penrose minimum-norm solution.
+    /// The named return type always preserves factorization diagnostics so
+    /// callers cannot silently discard rank and conditioning by choosing a
+    /// less-informative overload.
+    pub fn solve_least_squares(
         &self,
         b: &Matrix,
         options: LeastSquaresOptions,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+    ) -> Result<LeastSquaresSolution, MatrixError> {
         // Rank tolerance participates in every QR/SVD classification, so reject
         // invalid values once before either factorization can observe them.
         if !options.relative_rank_tolerance.is_finite() || options.relative_rank_tolerance < 0.0 {
@@ -806,14 +777,14 @@ impl Matrix {
         // Trivial cases have a unique zero-length or minimum-norm zero solution
         // and require no numerical factorization.
         if n == 0 || m == 0 {
-            return Ok((
-                Matrix::new(n, 1),
-                LeastSquaresInfo {
+            return Ok(LeastSquaresSolution {
+                solution: Matrix::new(n, 1),
+                info: LeastSquaresInfo {
                     rank: 0,
                     cond_est: f64::INFINITY,
                     method: LeastSquaresMethod::Empty,
                 },
-            ));
+            });
         }
 
         let qr_result = if m >= n {
@@ -854,7 +825,10 @@ impl Matrix {
                 operation: "solve_least_squares",
             });
         }
-        Ok(result)
+        Ok(LeastSquaresSolution {
+            solution: result.0,
+            info: result.1,
+        })
     }
 
     /// Compute a Moore-Penrose pseudoinverse solution with a one-sided Jacobi
@@ -2025,6 +1999,16 @@ mod tests {
         }
     }
 
+    /// Run the canonical least-squares API with default rank policy for tests
+    /// that vary only serial versus parallel QR execution.
+    fn solve_default(coefficients: &Matrix, rhs: &Matrix, parallel: bool) -> LeastSquaresSolution {
+        // Unwrap here so individual numerical tests can focus on their expected
+        // solution and diagnostic fields.
+        coefficients
+            .solve_least_squares(rhs, LeastSquaresOptions::default(), parallel)
+            .expect("least-squares solve failed")
+    }
+
     #[test]
     fn test_matrix_creation() {
         let m = Matrix::new(2, 3);
@@ -2095,7 +2079,9 @@ mod tests {
             }
         );
         assert_eq!(
-            identity.solve_least_squares(&nan_rhs).unwrap_err(),
+            identity
+                .solve_least_squares(&nan_rhs, LeastSquaresOptions::default(), false)
+                .unwrap_err(),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
                 operand: MatrixOperand::RightHandSide,
@@ -2113,7 +2099,7 @@ mod tests {
         );
         assert_eq!(
             nan_coefficient
-                .solve_least_squares(&finite_rhs)
+                .solve_least_squares(&finite_rhs, LeastSquaresOptions::default(), false)
                 .unwrap_err(),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
@@ -2138,7 +2124,9 @@ mod tests {
             }
         );
         assert_eq!(
-            tiny_coefficient.solve_least_squares(&huge_rhs).unwrap_err(),
+            tiny_coefficient
+                .solve_least_squares(&huge_rhs, LeastSquaresOptions::default(), false)
+                .unwrap_err(),
             MatrixError::NonFiniteResult {
                 operation: "solve_least_squares",
             }
@@ -2250,29 +2238,21 @@ mod tests {
         let n = size;
         let tall = random_matrix(m, n, &mut rng);
         let tall_b = random_matrix(m, 1, &mut rng);
-        let (x_serial, info_serial) = tall
-            .solve_least_squares_with_info_with_parallel(&tall_b, false)
-            .unwrap();
-        let (x_parallel, info_parallel) = tall
-            .solve_least_squares_with_info_with_parallel(&tall_b, true)
-            .unwrap();
-        assert_eq!(info_serial.rank, info_parallel.rank);
-        assert!(info_serial.cond_est.is_finite());
-        assert!(info_parallel.cond_est.is_finite());
-        assert_matrix_close(&x_serial, &x_parallel, 1e-7);
+        let serial = solve_default(&tall, &tall_b, false);
+        let parallel = solve_default(&tall, &tall_b, true);
+        assert_eq!(serial.info.rank, parallel.info.rank);
+        assert!(serial.info.cond_est.is_finite());
+        assert!(parallel.info.cond_est.is_finite());
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-7);
 
         let wide = random_matrix(n, m, &mut rng);
         let wide_b = random_matrix(n, 1, &mut rng);
-        let (x_serial, info_serial) = wide
-            .solve_least_squares_with_info_with_parallel(&wide_b, false)
-            .unwrap();
-        let (x_parallel, info_parallel) = wide
-            .solve_least_squares_with_info_with_parallel(&wide_b, true)
-            .unwrap();
-        assert_eq!(info_serial.rank, info_parallel.rank);
-        assert!(info_serial.cond_est.is_finite());
-        assert!(info_parallel.cond_est.is_finite());
-        assert_matrix_close(&x_serial, &x_parallel, 1e-7);
+        let serial = solve_default(&wide, &wide_b, false);
+        let parallel = solve_default(&wide, &wide_b, true);
+        assert_eq!(serial.info.rank, parallel.info.rank);
+        assert!(serial.info.cond_est.is_finite());
+        assert!(parallel.info.cond_est.is_finite());
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-7);
     }
 
     #[test]
@@ -2410,11 +2390,11 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let x_serial = a.solve_least_squares_with_parallel(&b, false).unwrap();
-        let x_parallel = a.solve_least_squares_with_parallel(&b, true).unwrap();
-        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
-        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+        assert!((serial.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((serial.solution[(1, 0)] - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -2423,11 +2403,11 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 1.0], 1, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
 
-        let x_serial = a.solve_least_squares_with_parallel(&b, false).unwrap();
-        let x_parallel = a.solve_least_squares_with_parallel(&b, true).unwrap();
-        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
-        assert!((x_serial[(0, 0)] - 0.5).abs() < 1e-12);
-        assert!((x_serial[(1, 0)] - 0.5).abs() < 1e-12);
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+        assert!((serial.solution[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!((serial.solution[(1, 0)] - 0.5).abs() < 1e-12);
     }
 
     /// Ensure that uniformly scaling a tall matrix does not change its
@@ -2438,16 +2418,16 @@ mod tests {
         // tolerance floor misreported as rank zero.
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
         let tiny_b = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
-        let (tiny_solution, tiny_info) = tiny.solve_least_squares_with_info(&tiny_b).unwrap();
+        let tiny_result = solve_default(&tiny, &tiny_b, false);
 
         let unit = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
         let unit_b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
-        let (_, unit_info) = unit.solve_least_squares_with_info(&unit_b).unwrap();
+        let unit_result = solve_default(&unit, &unit_b, false);
 
-        assert_eq!(tiny_info.rank, 1);
-        assert_eq!(tiny_info.rank, unit_info.rank);
-        assert!((tiny_info.cond_est - unit_info.cond_est).abs() < 1e-12);
-        assert!((tiny_solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert_eq!(tiny_result.info.rank, 1);
+        assert_eq!(tiny_result.info.rank, unit_result.info.rank);
+        assert!((tiny_result.info.cond_est - unit_result.info.cond_est).abs() < 1e-12);
+        assert!((tiny_result.solution[(0, 0)] - 1.0).abs() < 1e-12);
     }
 
     /// Ensure that the transpose-based wide QR path applies the same
@@ -2458,12 +2438,12 @@ mod tests {
         // minimum-norm solution [0.2, 0.4].
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 1, 2).unwrap();
         let tiny_b = Matrix::from_vec(vec![1e-15], 1, 1).unwrap();
-        let (solution, info) = tiny.solve_least_squares_with_info(&tiny_b).unwrap();
+        let result = solve_default(&tiny, &tiny_b, false);
 
-        assert_eq!(info.rank, 1);
-        assert!(info.cond_est.is_finite());
-        assert!((solution[(0, 0)] - 0.2).abs() < 1e-12);
-        assert!((solution[(1, 0)] - 0.4).abs() < 1e-12);
+        assert_eq!(result.info.rank, 1);
+        assert!(result.info.cond_est.is_finite());
+        assert!((result.solution[(0, 0)] - 0.2).abs() < 1e-12);
+        assert!((result.solution[(1, 0)] - 0.4).abs() < 1e-12);
     }
 
     /// Verify that callers can deliberately change numerical-rank policy
@@ -2474,9 +2454,9 @@ mod tests {
         // discarded by the explicit 1e-3 policy.
         let coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-6], 2, 2).unwrap();
         let rhs = Matrix::from_vec(vec![1.0, 1e-6], 2, 1).unwrap();
-        let (_, default_info) = coefficients.solve_least_squares_with_info(&rhs).unwrap();
-        let (truncated_solution, truncated_info) = coefficients
-            .solve_least_squares_with_options(
+        let default_result = solve_default(&coefficients, &rhs, false);
+        let truncated_result = coefficients
+            .solve_least_squares(
                 &rhs,
                 LeastSquaresOptions {
                     relative_rank_tolerance: 1e-3,
@@ -2485,11 +2465,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(default_info.rank, 2);
-        assert_eq!(truncated_info.rank, 1);
-        assert_eq!(truncated_info.method, LeastSquaresMethod::JacobiSvd);
-        assert!((truncated_solution[(0, 0)] - 1.0).abs() < 1e-12);
-        assert_eq!(truncated_solution[(1, 0)], 0.0);
+        assert_eq!(default_result.info.rank, 2);
+        assert_eq!(truncated_result.info.rank, 1);
+        assert_eq!(truncated_result.info.method, LeastSquaresMethod::JacobiSvd);
+        assert!((truncated_result.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert_eq!(truncated_result.solution[(1, 0)], 0.0);
     }
 
     /// Ensure invalid public rank policy is rejected before factorization.
@@ -2498,7 +2478,7 @@ mod tests {
         let coefficients = Matrix::identity(1);
         let rhs = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
         let error = coefficients
-            .solve_least_squares_with_options(
+            .solve_least_squares(
                 &rhs,
                 LeastSquaresOptions {
                     relative_rank_tolerance: f64::NAN,
@@ -2522,17 +2502,15 @@ mod tests {
         let coefficient = Matrix::from_vec(vec![1e308, 1e308], 2, 1).unwrap();
         let right_hand_side = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
 
-        let (solution, info) = coefficient
-            .solve_least_squares_with_info(&right_hand_side)
-            .unwrap();
+        let result = solve_default(&coefficient, &right_hand_side, false);
 
         // Both equations are identical after scaling, so x=1e-308 is the exact
         // least-squares solution. Compare by ratio because the expected value is
         // subnormal enough that an absolute tolerance would hide a large error.
-        let relative_error = (solution[(0, 0)] / 1e-308 - 1.0).abs();
+        let relative_error = (result.solution[(0, 0)] / 1e-308 - 1.0).abs();
         assert!(relative_error < 1e-12, "relative error: {relative_error}");
-        assert_eq!(info.rank, 1);
-        assert_eq!(info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(result.info.rank, 1);
+        assert_eq!(result.info.method, LeastSquaresMethod::HouseholderQr);
     }
 
     /// Exercise the same scale-safe reflector construction through the
@@ -2542,22 +2520,20 @@ mod tests {
         let coefficient = Matrix::from_vec(vec![1e308, 1e308], 1, 2).unwrap();
         let right_hand_side = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
 
-        let (solution, info) = coefficient
-            .solve_least_squares_with_info(&right_hand_side)
-            .unwrap();
+        let result = solve_default(&coefficient, &right_hand_side, false);
 
         // Symmetry gives the minimum-norm solution [5e-309, 5e-309]. Check each
         // component relatively so the regression remains sensitive at this scale.
         for row in 0..2 {
-            let relative_error = (solution[(row, 0)] / 5e-309 - 1.0).abs();
+            let relative_error = (result.solution[(row, 0)] / 5e-309 - 1.0).abs();
             assert!(relative_error < 1e-12, "relative error: {relative_error}");
         }
-        assert_eq!(info.rank, 1);
-        assert_eq!(info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(result.info.rank, 1);
+        assert_eq!(result.info.method, LeastSquaresMethod::HouseholderQr);
     }
 
     #[test]
-    fn test_solve_least_squares_with_info_random_tall_full_rank() {
+    fn test_solve_least_squares_random_tall_full_rank() {
         let mut rng = TestRng::new(0x5eed_1234_5678_9abc);
         for _ in 0..5 {
             let mut a = random_matrix(6, 3, &mut rng);
@@ -2568,20 +2544,16 @@ mod tests {
             let x_mat = Matrix::from_vec(x_true.clone(), 3, 1).unwrap();
             let b = &a * &x_mat;
 
-            let (x_serial, info_serial) = a
-                .solve_least_squares_with_info_with_parallel(&b, false)
-                .unwrap();
-            let (x_parallel, info_parallel) = a
-                .solve_least_squares_with_info_with_parallel(&b, true)
-                .unwrap();
-            assert_eq!(info_serial.rank, 3);
-            assert_eq!(info_parallel.rank, 3);
-            assert!(info_serial.cond_est.is_finite());
-            assert!(info_parallel.cond_est.is_finite());
-            assert_matrix_close(&x_serial, &x_parallel, 1e-8);
-            for i in 0..3 {
-                assert!((x_serial[(i, 0)] - x_true[i]).abs() < 1e-8);
-                assert!((x_parallel[(i, 0)] - x_true[i]).abs() < 1e-8);
+            let serial = solve_default(&a, &b, false);
+            let parallel = solve_default(&a, &b, true);
+            assert_eq!(serial.info.rank, 3);
+            assert_eq!(parallel.info.rank, 3);
+            assert!(serial.info.cond_est.is_finite());
+            assert!(parallel.info.cond_est.is_finite());
+            assert_matrix_close(&serial.solution, &parallel.solution, 1e-8);
+            for (row, expected) in x_true.iter().enumerate() {
+                assert!((serial.solution[(row, 0)] - expected).abs() < 1e-8);
+                assert!((parallel.solution[(row, 0)] - expected).abs() < 1e-8);
             }
         }
     }
@@ -2621,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_with_info_random_wide_min_norm() {
+    fn test_solve_least_squares_random_wide_min_norm() {
         let mut rng = TestRng::new(0x1234_5678_9abc_def0);
         let mut a = Matrix::new(2, 4);
         a[(0, 0)] = 1.0;
@@ -2632,53 +2604,45 @@ mod tests {
             let b1 = rng.next_f64();
             let b = Matrix::from_vec(vec![b0, b1], 2, 1).unwrap();
 
-            let (x_serial, info_serial) = a
-                .solve_least_squares_with_info_with_parallel(&b, false)
-                .unwrap();
-            let (x_parallel, info_parallel) = a
-                .solve_least_squares_with_info_with_parallel(&b, true)
-                .unwrap();
-            assert_eq!(info_serial.rank, 2);
-            assert_eq!(info_parallel.rank, 2);
-            assert!(info_serial.cond_est.is_finite());
-            assert!(info_parallel.cond_est.is_finite());
-            assert_matrix_close(&x_serial, &x_parallel, 1e-12);
-            assert!((x_serial[(0, 0)] - b0).abs() < 1e-12);
-            assert!((x_serial[(1, 0)] - b1).abs() < 1e-12);
-            assert!((x_serial[(2, 0)]).abs() < 1e-12);
-            assert!((x_serial[(3, 0)]).abs() < 1e-12);
-            assert!((x_parallel[(0, 0)] - b0).abs() < 1e-12);
-            assert!((x_parallel[(1, 0)] - b1).abs() < 1e-12);
-            assert!((x_parallel[(2, 0)]).abs() < 1e-12);
-            assert!((x_parallel[(3, 0)]).abs() < 1e-12);
+            let serial = solve_default(&a, &b, false);
+            let parallel = solve_default(&a, &b, true);
+            assert_eq!(serial.info.rank, 2);
+            assert_eq!(parallel.info.rank, 2);
+            assert!(serial.info.cond_est.is_finite());
+            assert!(parallel.info.cond_est.is_finite());
+            assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+            assert!((serial.solution[(0, 0)] - b0).abs() < 1e-12);
+            assert!((serial.solution[(1, 0)] - b1).abs() < 1e-12);
+            assert!((serial.solution[(2, 0)]).abs() < 1e-12);
+            assert!((serial.solution[(3, 0)]).abs() < 1e-12);
+            assert!((parallel.solution[(0, 0)] - b0).abs() < 1e-12);
+            assert!((parallel.solution[(1, 0)] - b1).abs() < 1e-12);
+            assert!((parallel.solution[(2, 0)]).abs() < 1e-12);
+            assert!((parallel.solution[(3, 0)]).abs() < 1e-12);
         }
     }
 
     #[test]
-    fn test_solve_least_squares_with_info_detects_ill_conditioning() {
+    fn test_solve_least_squares_detects_ill_conditioning() {
         let mut a = Matrix::identity(3);
         for i in 0..3 {
             a[(i, 2)] *= 1e-8;
         }
         let b = Matrix::from_vec(vec![0.0, 0.0, 0.0], 3, 1).unwrap();
 
-        let (_x_serial, info_serial) = a
-            .solve_least_squares_with_info_with_parallel(&b, false)
-            .unwrap();
-        let (_x_parallel, info_parallel) = a
-            .solve_least_squares_with_info_with_parallel(&b, true)
-            .unwrap();
-        assert_eq!(info_serial.rank, 3);
-        assert_eq!(info_parallel.rank, 3);
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
+        assert_eq!(serial.info.rank, 3);
+        assert_eq!(parallel.info.rank, 3);
         assert!(
-            info_serial.cond_est > 1e6,
+            serial.info.cond_est > 1e6,
             "cond_est was {}",
-            info_serial.cond_est
+            serial.info.cond_est
         );
         assert!(
-            info_parallel.cond_est > 1e6,
+            parallel.info.cond_est > 1e6,
             "cond_est was {}",
-            info_parallel.cond_est
+            parallel.info.cond_est
         );
     }
 
@@ -2691,84 +2655,72 @@ mod tests {
         // this triangular matrix is approximately 1e16.
         let a = Matrix::from_vec(vec![1.0, 1e8, 0.0, 1.0], 2, 2).unwrap();
         let b = Matrix::from_vec(vec![0.0, 0.0], 2, 1).unwrap();
-        let (_, info) = a.solve_least_squares_with_info(&b).unwrap();
+        let result = solve_default(&a, &b, false);
 
-        assert_eq!(info.rank, 2);
+        assert_eq!(result.info.rank, 2);
         assert!(
-            info.cond_est > 1e15,
+            result.info.cond_est > 1e15,
             "off-diagonal condition estimate was {}",
-            info.cond_est
+            result.info.cond_est
         );
     }
 
     #[test]
-    fn test_solve_least_squares_with_info_tall_full_rank() {
+    fn test_solve_least_squares_tall_full_rank() {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let (x_serial, info_serial) = a
-            .solve_least_squares_with_info_with_parallel(&b, false)
-            .unwrap();
-        let (x_parallel, info_parallel) = a
-            .solve_least_squares_with_info_with_parallel(&b, true)
-            .unwrap();
-        assert_eq!(info_serial.rank, 2);
-        assert_eq!(info_parallel.rank, 2);
-        assert_eq!(info_serial.method, LeastSquaresMethod::HouseholderQr);
-        assert_eq!(info_parallel.method, LeastSquaresMethod::HouseholderQr);
-        assert!(info_serial.cond_est.is_finite());
-        assert!(info_parallel.cond_est.is_finite());
-        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
-        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
+        assert_eq!(serial.info.rank, 2);
+        assert_eq!(parallel.info.rank, 2);
+        assert_eq!(serial.info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(parallel.info.method, LeastSquaresMethod::HouseholderQr);
+        assert!(serial.info.cond_est.is_finite());
+        assert!(parallel.info.cond_est.is_finite());
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+        assert!((serial.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((serial.solution[(1, 0)] - 2.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_solve_least_squares_with_info_wide_full_rank() {
+    fn test_solve_least_squares_wide_full_rank() {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 2, 3).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
-        let (x_serial, info_serial) = a
-            .solve_least_squares_with_info_with_parallel(&b, false)
-            .unwrap();
-        let (x_parallel, info_parallel) = a
-            .solve_least_squares_with_info_with_parallel(&b, true)
-            .unwrap();
-        assert_eq!(info_serial.rank, 2);
-        assert_eq!(info_parallel.rank, 2);
-        assert_eq!(info_serial.method, LeastSquaresMethod::HouseholderQr);
-        assert_eq!(info_parallel.method, LeastSquaresMethod::HouseholderQr);
-        assert!(info_serial.cond_est.is_finite());
-        assert!(info_parallel.cond_est.is_finite());
-        assert_matrix_close(&x_serial, &x_parallel, 1e-12);
-        assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
-        assert!((x_serial[(2, 0)] - 0.0).abs() < 1e-12);
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
+        assert_eq!(serial.info.rank, 2);
+        assert_eq!(parallel.info.rank, 2);
+        assert_eq!(serial.info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(parallel.info.method, LeastSquaresMethod::HouseholderQr);
+        assert!(serial.info.cond_est.is_finite());
+        assert!(parallel.info.cond_est.is_finite());
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+        assert!((serial.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((serial.solution[(1, 0)] - 2.0).abs() < 1e-12);
+        assert!((serial.solution[(2, 0)] - 0.0).abs() < 1e-12);
     }
 
     /// Verify that a square rank-deficient system returns its unique
     /// minimum-norm pseudoinverse solution through the SVD fallback.
     #[test]
-    fn test_solve_least_squares_with_info_square_rank_deficient() {
+    fn test_solve_least_squares_square_rank_deficient() {
         let a = Matrix::from_vec(vec![1.0, 1.0, 2.0, 2.0], 2, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
         // Both parallel flags share the serial Jacobi fallback and must expose
         // identical numerical and method diagnostics.
-        let (serial_solution, serial_info) = a
-            .solve_least_squares_with_info_with_parallel(&b, false)
-            .unwrap();
-        let (parallel_solution, parallel_info) = a
-            .solve_least_squares_with_info_with_parallel(&b, true)
-            .unwrap();
+        let serial = solve_default(&a, &b, false);
+        let parallel = solve_default(&a, &b, true);
 
-        assert_matrix_close(&serial_solution, &parallel_solution, 1e-12);
-        assert!((serial_solution[(0, 0)] - 0.5).abs() < 1e-12);
-        assert!((serial_solution[(1, 0)] - 0.5).abs() < 1e-12);
-        assert_eq!(serial_info.rank, 1);
-        assert_eq!(serial_info.method, LeastSquaresMethod::JacobiSvd);
-        assert_eq!(parallel_info, serial_info);
-        assert!((serial_info.cond_est - 1.0).abs() < 1e-12);
+        assert_matrix_close(&serial.solution, &parallel.solution, 1e-12);
+        assert!((serial.solution[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!((serial.solution[(1, 0)] - 0.5).abs() < 1e-12);
+        assert_eq!(serial.info.rank, 1);
+        assert_eq!(serial.info.method, LeastSquaresMethod::JacobiSvd);
+        assert_eq!(parallel.info, serial.info);
+        assert!((serial.info.cond_est - 1.0).abs() < 1e-12);
     }
 
     /// Ensure SVD rank classification and its pseudoinverse solution remain
@@ -2779,16 +2731,16 @@ mod tests {
             let a = Matrix::from_vec(vec![scale, scale, 2.0 * scale, 2.0 * scale], 2, 2).unwrap();
             let b = Matrix::from_vec(vec![scale, 2.0 * scale], 2, 1).unwrap();
 
-            let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+            let result = solve_default(&a, &b, false);
 
             // Uniformly scaling both operands leaves the Moore-Penrose answer
             // unchanged, including at magnitudes where naïve squared norms
             // would underflow or overflow.
-            assert!((solution[(0, 0)] - 0.5).abs() < 1e-12);
-            assert!((solution[(1, 0)] - 0.5).abs() < 1e-12);
-            assert_eq!(info.rank, 1);
-            assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
-            assert!((info.cond_est - 1.0).abs() < 1e-12);
+            assert!((result.solution[(0, 0)] - 0.5).abs() < 1e-12);
+            assert!((result.solution[(1, 0)] - 0.5).abs() < 1e-12);
+            assert_eq!(result.info.rank, 1);
+            assert_eq!(result.info.method, LeastSquaresMethod::JacobiSvd);
+            assert!((result.info.cond_est - 1.0).abs() < 1e-12);
         }
     }
 
@@ -2799,15 +2751,15 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+        let result = solve_default(&a, &b, false);
 
         // The best fitted shared row value is mean(b)=2. Splitting that value
         // equally across duplicate columns minimizes the variable norm.
-        assert!((solution[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((solution[(1, 0)] - 1.0).abs() < 1e-12);
-        assert_eq!(info.rank, 1);
-        assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
-        let residual = &(&a * &solution) - &b;
+        assert!((result.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((result.solution[(1, 0)] - 1.0).abs() < 1e-12);
+        assert_eq!(result.info.rank, 1);
+        assert_eq!(result.info.method, LeastSquaresMethod::JacobiSvd);
+        let residual = &(&a * &result.solution) - &b;
         assert!((residual.norm() - 2.0_f64.sqrt()).abs() < 1e-12);
     }
 
@@ -2818,16 +2770,16 @@ mod tests {
         let a = Matrix::from_vec(vec![1.0, 0.0, 1.0, 2.0, 0.0, 2.0], 2, 3).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
-        let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+        let result = solve_default(&a, &b, false);
 
         // The constrained sum x0+x2=1 is divided equally; the unconstrained x1
         // component is zero in the Moore-Penrose solution.
-        assert!((solution[(0, 0)] - 0.5).abs() < 1e-12);
-        assert!(solution[(1, 0)].abs() < 1e-12);
-        assert!((solution[(2, 0)] - 0.5).abs() < 1e-12);
-        assert_eq!(info.rank, 1);
-        assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
-        let reconstructed = &a * &solution;
+        assert!((result.solution[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!(result.solution[(1, 0)].abs() < 1e-12);
+        assert!((result.solution[(2, 0)] - 0.5).abs() < 1e-12);
+        assert_eq!(result.info.rank, 1);
+        assert_eq!(result.info.method, LeastSquaresMethod::JacobiSvd);
+        let reconstructed = &a * &result.solution;
         assert!((&reconstructed - &b).norm() < 1e-12);
     }
 
