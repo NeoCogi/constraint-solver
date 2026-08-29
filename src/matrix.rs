@@ -29,8 +29,27 @@ use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 16_384;
 
+/// Relative diagonal threshold used to classify numerical rank after QR.
+///
+/// The threshold is intentionally relative to the largest diagonal magnitude
+/// in `R`. Introducing an absolute floor would make rank depend on the units or
+/// scalar normalization chosen by the caller.
+const QR_RANK_RELATIVE_EPSILON: f64 = 1e-12;
+
 fn should_parallelize(rows: usize, cols: usize) -> bool {
     rows.saturating_mul(cols) >= PARALLEL_THRESHOLD
+}
+
+/// Convert the relative QR rank threshold into the scale of a particular
+/// triangular factor.
+///
+/// A zero factor produces a zero tolerance and therefore rank zero because all
+/// diagonal comparisons use strict inequality. Non-finite factors are rejected
+/// later by the triangular solve, where a more specific error can be returned.
+fn qr_rank_tolerance(max_diagonal: f64) -> f64 {
+    // Multiplication, rather than `max_diagonal.max(1.0)`, preserves rank under
+    // uniform scaling of the input matrix.
+    QR_RANK_RELATIVE_EPSILON * max_diagonal
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,7 +456,9 @@ impl Matrix {
         for i in 0..n {
             max_diag = max_diag.max(r[(i, i)].abs());
         }
-        let tol = 1e-12 * max_diag.max(1.0);
+        // Base numerical rank only on the scale of `R`; an absolute floor here
+        // would incorrectly classify small, full-rank systems as rank zero.
+        let tol = qr_rank_tolerance(max_diag);
         let mut rank = 0;
         let mut min_diag = f64::INFINITY;
         for i in 0..n {
@@ -600,7 +621,9 @@ impl Matrix {
         for i in 0..m {
             max_diag = max_diag.max(r[(i, i)].abs());
         }
-        let tol = 1e-12 * max_diag.max(1.0);
+        // Use the same scale-relative criterion as the tall QR path so wide and
+        // tall systems report rank consistently under unit changes.
+        let tol = qr_rank_tolerance(max_diag);
         let mut rank = 0;
         let mut min_diag = f64::INFINITY;
         for i in 0..m {
@@ -1199,6 +1222,42 @@ mod tests {
         assert_matrix_close(&x_serial, &x_parallel, 1e-12);
         assert!((x_serial[(0, 0)] - 0.5).abs() < 1e-12);
         assert!((x_serial[(1, 0)] - 0.5).abs() < 1e-12);
+    }
+
+    /// Ensure that uniformly scaling a tall matrix does not change its
+    /// numerical rank or condition estimate.
+    #[test]
+    fn test_solve_least_squares_qr_tall_rank_is_scale_invariant() {
+        // This matrix is exactly the small-scale case that the former absolute
+        // tolerance floor misreported as rank zero.
+        let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
+        let tiny_b = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
+        let (tiny_solution, tiny_info) = tiny.solve_least_squares_qr_with_info(&tiny_b).unwrap();
+
+        let unit = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
+        let unit_b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
+        let (_, unit_info) = unit.solve_least_squares_qr_with_info(&unit_b).unwrap();
+
+        assert_eq!(tiny_info.rank, 1);
+        assert_eq!(tiny_info.rank, unit_info.rank);
+        assert!((tiny_info.cond_est - unit_info.cond_est).abs() < 1e-12);
+        assert!((tiny_solution[(0, 0)] - 1.0).abs() < 1e-12);
+    }
+
+    /// Ensure that the transpose-based wide QR path applies the same
+    /// scale-relative rank rule as the tall path.
+    #[test]
+    fn test_solve_least_squares_qr_wide_rank_is_scale_invariant() {
+        // The equation 1e-15*x0 + 2e-15*x1 = 1e-15 is full row rank and has
+        // minimum-norm solution [0.2, 0.4].
+        let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 1, 2).unwrap();
+        let tiny_b = Matrix::from_vec(vec![1e-15], 1, 1).unwrap();
+        let (solution, info) = tiny.solve_least_squares_qr_with_info(&tiny_b).unwrap();
+
+        assert_eq!(info.rank, 1);
+        assert!(info.cond_est.is_finite());
+        assert!((solution[(0, 0)] - 0.2).abs() < 1e-12);
+        assert!((solution[(1, 0)] - 0.4).abs() < 1e-12);
     }
 
     #[test]
