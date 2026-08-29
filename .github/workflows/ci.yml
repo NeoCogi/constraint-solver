@@ -24,7 +24,7 @@ jobs:
     steps:
       # Audit the exact locked transitive graph belonging to this revision.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # RustSec's maintained action installs cargo-audit, refreshes the advisory
       # database, and fails this job when the lockfile contains a vulnerability.
@@ -41,7 +41,7 @@ jobs:
       # Check out the same locked dependency graph consumed by the release
       # validation job below.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Linux builds GLFW from its bundled source because the crate's
       # `prebuilt-libs` feature only supplies binaries on Windows and macOS.
@@ -87,7 +87,7 @@ jobs:
     steps:
       # Use the exact source revision and dependency lockfile validated on Linux.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Portability tracks the current stable toolchain; the separate Linux job
       # above owns the lower-bound compiler contract.
@@ -112,7 +112,7 @@ jobs:
     steps:
       # Check out the exact revision whose source and manifest are being tested.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Clippy and all-target tests compile the GLFW example on Linux. The
       # runner image does not include the X11 development headers needed when
