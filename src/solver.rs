@@ -27,7 +27,7 @@ SOFTWARE.
 
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
-use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
+use crate::matrix::{LeastSquaresInfo, LeastSquaresOptions, Matrix, MatrixError};
 use crate::mode::{Mode, build_thread_pool};
 use rayon::ThreadPool;
 use std::collections::HashMap;
@@ -171,6 +171,72 @@ pub enum UnderdeterminedPolicy {
     MinimumNormLinearizedSolution,
 }
 
+/// Complete numerical policy for one reusable nonlinear solver.
+///
+/// Fields are public so pre-alpha callers can start from [`SolverOptions::default`]
+/// or from [`NewtonRaphsonSolver::options`], change only the relevant values,
+/// and install the result with [`NewtonRaphsonSolver::with_options`]. Every field
+/// is validated when a solve begins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolverOptions {
+    /// Maximum number of accepted Newton updates before `NoConvergence`.
+    pub max_iterations: usize,
+    /// Euclidean residual norm required for a successful `Solution`.
+    pub residual_tolerance: f64,
+    /// Normalized residual-gradient threshold used for `StationaryNonRoot`.
+    pub stationarity_tolerance: f64,
+    /// Initial standard-solver damping and maximum line-search trial step.
+    pub damping_factor: f64,
+    /// Smallest damping retained after adaptive reductions.
+    pub min_damping: f64,
+    /// Base ridge parameter for ill-conditioned augmented least squares.
+    pub regularization: f64,
+    /// Condition estimate above which augmented regularization is attempted.
+    pub condition_limit: f64,
+    /// Number of augmented regularization strengths attempted.
+    pub regularization_attempts: usize,
+    /// Multiplicative increase between regularization attempts.
+    pub regularization_growth_factor: f64,
+    /// QR/SVD numerical-rank policy used by every Jacobian shape.
+    pub least_squares: LeastSquaresOptions,
+    /// Policy for choosing among underdetermined linearized solutions.
+    pub underdetermined_policy: UnderdeterminedPolicy,
+    /// Armijo sufficient-decrease coefficient for residual-norm line search.
+    pub armijo_coefficient: f64,
+    /// Maximum number of candidate steps evaluated by one line search.
+    pub line_search_max_trials: usize,
+    /// Smallest positive candidate step evaluated by line search.
+    pub line_search_min_step: f64,
+    /// Multiplier on machine epsilon used to ignore roundoff-sized null-space
+    /// reprojections for the minimum-norm point policy.
+    pub projection_tolerance_multiplier: f64,
+}
+
+impl Default for SolverOptions {
+    /// Return the ordinary square/underdetermined solver policy.
+    fn default() -> Self {
+        // Keep every numerical constant visible in one value rather than
+        // scattering hidden policy through iteration and factorization bodies.
+        Self {
+            max_iterations: 100,
+            residual_tolerance: 1e-10,
+            stationarity_tolerance: 1e-10,
+            damping_factor: 1.0,
+            min_damping: 0.001,
+            regularization: 1e-8,
+            condition_limit: 1e12,
+            regularization_attempts: 3,
+            regularization_growth_factor: 10.0,
+            least_squares: LeastSquaresOptions::default(),
+            underdetermined_policy: UnderdeterminedPolicy::MinimumNormStep,
+            armijo_coefficient: 1e-4,
+            line_search_max_trials: 64,
+            line_search_min_step: 1e-12,
+            projection_tolerance_multiplier: 64.0,
+        }
+    }
+}
+
 /// Newton-Raphson solver for systems of nonlinear equations
 ///
 /// This solver can handle:
@@ -189,27 +255,9 @@ pub struct NewtonRaphsonSolver {
     variables: Vec<VarId>,
     /// Registry of all variables referenced by the compiled system
     var_table: VarTable,
-    /// Maximum number of iterations before giving up
-    max_iterations: usize,
-    /// Positive finite residual norm threshold required for a successful solve.
-    residual_tolerance: f64,
-    /// Positive finite normalized-gradient threshold used to identify a
-    /// stationary state that has not satisfied the constraints.
-    stationarity_tolerance: f64,
-    /// Initial damping factor (step size multiplier, 0 < damping <= 1)
-    /// Lower values make convergence more stable but slower
-    damping_factor: f64,
-    /// Lower bound applied when repeated residual growth reduces adaptive damping.
-    ///
-    /// Reaching this bound is not itself a convergence failure: a non-zero
-    /// least-squares residual can change very little near a valid stationary
-    /// point, so termination must be decided from `J^T f`, not damping size.
-    min_damping: f64,
-    /// Base regularization parameter used when the system is ill-conditioned
-    regularization: f64,
-    /// Policy used to resolve null-space freedom when equations are fewer than
-    /// solve variables.
-    underdetermined_policy: UnderdeterminedPolicy,
+    /// Validated numerical policy shared by iteration, line search, and linear
+    /// least-squares dispatch.
+    options: SolverOptions,
     /// Optional metadata describing the source of each equation in the system
     equation_traces: Vec<Option<EquationTrace>>,
     /// Execution mode for linear algebra (serial vs parallel)
@@ -438,24 +486,21 @@ impl NewtonRaphsonSolver {
         // repeated numerical solves share the result.
         let jacobian = Jacobian::new(compiled.equations, variables.clone());
 
+        // Begin with the public ordinary-system policy, then adjust only the
+        // workload and stabilization defaults for an overdetermined Jacobian.
+        // Residual and stationarity semantics remain identical for every shape.
+        let mut options = SolverOptions::default();
+        if is_over_constrained {
+            options.max_iterations = 200;
+            options.damping_factor = 0.7;
+            options.regularization = 1e-4;
+        }
+
         NewtonRaphsonSolver {
             jacobian,
             variables,
             var_table: compiled.var_table,
-            // Over-constrained systems are harder to converge, so give them more iterations
-            max_iterations: if is_over_constrained { 200 } else { 100 },
-            // Success always means the same residual threshold regardless of
-            // equation shape; incompatible systems now return an explicit error.
-            residual_tolerance: 1e-10,
-            stationarity_tolerance: 1e-10,
-            // Over-constrained systems use conservative damping for stability
-            damping_factor: if is_over_constrained { 0.7 } else { 1.0 },
-            min_damping: 0.001,
-            // Over-constrained systems need more regularization for numerical stability
-            regularization: if is_over_constrained { 1e-4 } else { 1e-8 },
-            // Preserve the prior continuity-oriented behavior unless the caller
-            // explicitly requests origin-based minimum-norm linearizations.
-            underdetermined_policy: UnderdeterminedPolicy::MinimumNormStep,
+            options,
             equation_traces: Vec::new(),
             mode: Mode::Serial,
             pool: None,
@@ -481,6 +526,21 @@ impl NewtonRaphsonSolver {
     /// Returns the current execution mode.
     pub fn mode(&self) -> &Mode {
         &self.mode
+    }
+
+    /// Borrow the complete numerical policy currently installed on the solver.
+    pub fn options(&self) -> &SolverOptions {
+        // Returning a shared reference makes inspection allocation-free while
+        // preventing validation from being bypassed during an active solve.
+        &self.options
+    }
+
+    /// Replace the complete numerical policy used by subsequent solves.
+    pub fn with_options(mut self, options: SolverOptions) -> Self {
+        // Preserve caller values verbatim. The common solve boundary validates
+        // the entire structure and returns one deterministic input error.
+        self.options = options;
+        self
     }
 
     fn set_mode(&mut self, mode: Mode) -> Result<(), SolverError> {
@@ -548,7 +608,7 @@ impl NewtonRaphsonSolver {
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         // Preserve the caller's exact value so validation can report invalid
         // input rather than silently substituting a different iteration limit.
-        self.max_iterations = max_iterations;
+        self.options.max_iterations = max_iterations;
         self
     }
 
@@ -560,7 +620,7 @@ impl NewtonRaphsonSolver {
     pub fn with_residual_tolerance(mut self, residual_tolerance: f64) -> Self {
         // Store without clamping so NaN, infinity, zero, and negative values are
         // observable to the common configuration validator.
-        self.residual_tolerance = residual_tolerance;
+        self.options.residual_tolerance = residual_tolerance;
         self
     }
 
@@ -573,7 +633,7 @@ impl NewtonRaphsonSolver {
     pub fn with_stationarity_tolerance(mut self, stationarity_tolerance: f64) -> Self {
         // Preserve invalid values for deterministic validation at the shared
         // solve boundary rather than silently clamping numerical policy.
-        self.stationarity_tolerance = stationarity_tolerance;
+        self.options.stationarity_tolerance = stationarity_tolerance;
         self
     }
 
@@ -586,7 +646,7 @@ impl NewtonRaphsonSolver {
     pub fn with_damping(mut self, damping_factor: f64) -> Self {
         // Preserve the requested value for deterministic validation and error
         // reporting at the shared solve entry point.
-        self.damping_factor = damping_factor;
+        self.options.damping_factor = damping_factor;
         self
     }
 
@@ -598,7 +658,7 @@ impl NewtonRaphsonSolver {
     pub fn with_regularization(mut self, regularization: f64) -> Self {
         // Retain non-finite and negative values until validation so the caller
         // receives an explicit configuration error.
-        self.regularization = regularization;
+        self.options.regularization = regularization;
         self
     }
 
@@ -608,7 +668,7 @@ impl NewtonRaphsonSolver {
     pub fn with_underdetermined_policy(mut self, policy: UnderdeterminedPolicy) -> Self {
         // Store the policy on the reusable solver so every solve invocation has
         // deterministic null-space behavior.
-        self.underdetermined_policy = policy;
+        self.options.underdetermined_policy = policy;
         self
     }
 
@@ -658,7 +718,7 @@ impl NewtonRaphsonSolver {
         // Standard solves begin with exactly the configured damping factor. A
         // previous residual is optional so the first iteration cannot pretend
         // it observed an improvement from an artificial infinity sentinel.
-        let mut damping = self.damping_factor;
+        let mut damping = self.options.damping_factor;
         let mut last_error: Option<f64> = None;
 
         let num_equations = jacobian.equation_count();
@@ -673,14 +733,14 @@ impl NewtonRaphsonSolver {
 
         let mut line_search_f_vals = Matrix::new(num_equations, 1);
 
-        let mut least_squares_workspace = if self.regularization > 0.0 {
+        let mut least_squares_workspace = if self.options.regularization > 0.0 {
             Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
         } else {
             None
         };
         let parallel = self.parallel_enabled();
 
-        for iter in 0..self.max_iterations {
+        for iter in 0..self.options.max_iterations {
             // Step 1: Evaluate function values f(x)
             jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
             if !f_vals.all_finite() {
@@ -709,7 +769,7 @@ impl NewtonRaphsonSolver {
             // Subsequent damped corrections then remain entirely in the row
             // space and are minimum-norm solutions of their damped linearization.
             if num_equations < num_variables
-                && self.underdetermined_policy
+                && self.options.underdetermined_policy
                     == UnderdeterminedPolicy::MinimumNormLinearizedSolution
             {
                 let projection_result = self.project_underdetermined_current_point(
@@ -779,7 +839,7 @@ impl NewtonRaphsonSolver {
 
             // A successful result requires the actual constraints to satisfy
             // the residual threshold, independently of system shape.
-            if error < self.residual_tolerance {
+            if error < self.options.residual_tolerance {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
@@ -802,7 +862,7 @@ impl NewtonRaphsonSolver {
                 &vars,
                 iter,
             )?;
-            if gradient.is_stationary(self.stationarity_tolerance) {
+            if gradient.is_stationary(self.options.stationarity_tolerance) {
                 return Err(self.stationary_non_root_error(iter, &vars, &f_vals, gradient));
             }
 
@@ -818,7 +878,7 @@ impl NewtonRaphsonSolver {
                     // expected near a non-zero least-squares optimum and is not
                     // evidence of stagnation.
                     if error > previous_error * 1.5 {
-                        damping = (damping * 0.5).max(self.min_damping);
+                        damping = (damping * 0.5).max(self.options.min_damping);
                     } else if error < previous_error * 0.5 {
                         damping = (damping * 1.2).min(1.0);
                     }
@@ -949,7 +1009,7 @@ impl NewtonRaphsonSolver {
             }
             let updated_error = f_vals.norm();
 
-            if updated_error < self.residual_tolerance {
+            if updated_error < self.options.residual_tolerance {
                 // A terminating candidate belongs in the history even though a
                 // subsequent loop iteration will not push it.
                 convergence_history.push(updated_error);
@@ -980,13 +1040,13 @@ impl NewtonRaphsonSolver {
         if !residuals.all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Final residual evaluation produced NaN or infinity",
-                self.max_iterations,
+                self.options.max_iterations,
                 &vars,
                 &residuals,
             ));
         }
         let final_error = residuals.norm();
-        if final_error < self.residual_tolerance {
+        if final_error < self.options.residual_tolerance {
             // A minimum-norm null-space projection can consume the final allowed
             // update and land directly on a root. There is no following loop
             // iteration to run the ordinary residual check, so accept that final
@@ -995,12 +1055,12 @@ impl NewtonRaphsonSolver {
                 jacobian_workspace.jacobian(),
                 &residuals,
                 &vars,
-                self.max_iterations,
+                self.options.max_iterations,
             )?;
             convergence_history.push(final_error);
             return Ok(self.build_solution(
                 &vars,
-                self.max_iterations,
+                self.options.max_iterations,
                 final_error,
                 gradient,
                 convergence_history,
@@ -1015,11 +1075,11 @@ impl NewtonRaphsonSolver {
             jacobian_workspace.jacobian(),
             &residuals,
             &vars,
-            self.max_iterations,
+            self.options.max_iterations,
         )?;
-        if gradient.is_stationary(self.stationarity_tolerance) {
+        if gradient.is_stationary(self.options.stationarity_tolerance) {
             return Err(self.stationary_non_root_error(
-                self.max_iterations,
+                self.options.max_iterations,
                 &vars,
                 &residuals,
                 gradient,
@@ -1029,9 +1089,9 @@ impl NewtonRaphsonSolver {
         let diag = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
-                self.max_iterations, final_error
+                self.options.max_iterations, final_error
             ),
-            self.max_iterations,
+            self.options.max_iterations,
             &vars,
             &residuals,
         );
@@ -1053,7 +1113,7 @@ impl NewtonRaphsonSolver {
         workspace: Option<&mut LeastSquaresWorkspace>,
         parallel: bool,
     ) -> Result<Matrix, LeastSquaresSolveError> {
-        match self.underdetermined_policy {
+        match self.options.underdetermined_policy {
             UnderdeterminedPolicy::MinimumNormStep => {
                 // The rectangular least-squares solver returns the smallest
                 // correction satisfying the linearized equation J*delta=-f.
@@ -1129,9 +1189,9 @@ impl NewtonRaphsonSolver {
         // the current vector norm makes the threshold invariant under unit
         // changes while the epsilon multiplier allows ordinary factorization
         // noise.
-        const PROJECTION_EPSILON_MULTIPLIER: f64 = 64.0;
-        let projection_threshold =
-            PROJECTION_EPSILON_MULTIPLIER * f64::EPSILON * current_values.norm().max(1.0);
+        let projection_threshold = self.options.projection_tolerance_multiplier
+            * f64::EPSILON
+            * current_values.norm().max(1.0);
         if projection_delta.norm() <= projection_threshold {
             Ok(None)
         } else {
@@ -1158,20 +1218,18 @@ impl NewtonRaphsonSolver {
         // QR, while rank-deficient systems use an SVD pseudoinverse. If the
         // retained singular subspace is still ill-conditioned, fall back to the
         // regularized augmented system [J; sqrt(lambda) I] * x ~= [rhs; 0].
-        const COND_LIMIT: f64 = 1e12;
-
         // Numerical rank loss alone is valid for a Moore-Penrose solve. The SVD
         // condition estimate describes only its retained image, so finite,
         // well-conditioned rank-deficient systems need no artificial damping.
         let is_ill_conditioned = |info: &LeastSquaresInfo| -> bool {
-            !info.cond_est.is_finite() || info.cond_est > COND_LIMIT
+            !info.cond_est.is_finite() || info.cond_est > self.options.condition_limit
         };
 
         let mut unregularized_error: Option<String> = None;
         let mut unreg_delta: Option<Matrix> = None;
         let mut unreg_info: Option<LeastSquaresInfo> = None;
 
-        match j_matrix.solve_least_squares_with_info_with_parallel(rhs, parallel) {
+        match j_matrix.solve_least_squares_with_options(rhs, self.options.least_squares, parallel) {
             Ok((delta, info)) => {
                 if !is_ill_conditioned(&info) {
                     return Ok(delta);
@@ -1184,7 +1242,7 @@ impl NewtonRaphsonSolver {
             }
         }
 
-        if self.regularization <= 0.0 {
+        if self.options.regularization <= 0.0 {
             if let Some(delta) = unreg_delta {
                 return Ok(delta);
             }
@@ -1195,12 +1253,12 @@ impl NewtonRaphsonSolver {
             });
         }
 
-        let reg_factors = [1.0, 10.0, 100.0];
         let mut last_err: Option<String> = None;
         let mut last_solution: Option<Matrix> = None;
+        let mut regularization_factor = 1.0;
 
-        for factor in reg_factors {
-            let lambda = self.regularization * factor;
+        for attempt in 0..self.options.regularization_attempts {
+            let lambda = self.options.regularization * regularization_factor;
             if lambda <= 0.0 {
                 continue;
             }
@@ -1235,12 +1293,11 @@ impl NewtonRaphsonSolver {
                         workspace.augmented_j[(workspace.num_equations + i, i)] = sqrt_reg;
                     }
 
-                    workspace
-                        .augmented_j
-                        .solve_least_squares_with_info_with_parallel(
-                            &workspace.augmented_b,
-                            parallel,
-                        )
+                    workspace.augmented_j.solve_least_squares_with_options(
+                        &workspace.augmented_b,
+                        self.options.least_squares,
+                        parallel,
+                    )
                 }
                 None => {
                     // This allocation fallback is normally avoided by the
@@ -1267,7 +1324,11 @@ impl NewtonRaphsonSolver {
                         augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
                         augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
                     }
-                    augmented_j.solve_least_squares_with_info_with_parallel(&augmented_b, parallel)
+                    augmented_j.solve_least_squares_with_options(
+                        &augmented_b,
+                        self.options.least_squares,
+                        parallel,
+                    )
                 }
             };
 
@@ -1281,6 +1342,13 @@ impl NewtonRaphsonSolver {
                 Err(err) => {
                     last_err = Some(err.to_string());
                 }
+            }
+
+            // Advance the geometric retry schedule only after the current
+            // strength has been attempted. Configuration validation guarantees
+            // every factor and resulting lambda remains finite.
+            if attempt + 1 < self.options.regularization_attempts {
+                regularization_factor *= self.options.regularization_growth_factor;
             }
         }
 
@@ -1351,7 +1419,7 @@ impl NewtonRaphsonSolver {
     fn validate_configuration(&self) -> Result<(), SolverError> {
         // A zero update budget cannot even test an accepted Newton step and used
         // to turn exact roots into misleading no-convergence diagnostics.
-        if self.max_iterations == 0 {
+        if self.options.max_iterations == 0 {
             return Err(SolverError::InvalidInput(
                 "max_iterations must be greater than zero".to_string(),
             ));
@@ -1359,7 +1427,7 @@ impl NewtonRaphsonSolver {
 
         // Residual tolerance is the sole success threshold, so reject values
         // that could make every state succeed or no finite state succeed.
-        if !self.residual_tolerance.is_finite() || self.residual_tolerance <= 0.0 {
+        if !self.options.residual_tolerance.is_finite() || self.options.residual_tolerance <= 0.0 {
             return Err(SolverError::InvalidInput(
                 "residual_tolerance must be finite and greater than zero".to_string(),
             ));
@@ -1367,7 +1435,9 @@ impl NewtonRaphsonSolver {
 
         // Stationarity has a separate scale-independent threshold because it
         // controls an error classification, not acceptance of a constraint root.
-        if !self.stationarity_tolerance.is_finite() || self.stationarity_tolerance <= 0.0 {
+        if !self.options.stationarity_tolerance.is_finite()
+            || self.options.stationarity_tolerance <= 0.0
+        {
             return Err(SolverError::InvalidInput(
                 "stationarity_tolerance must be finite and greater than zero".to_string(),
             ));
@@ -1375,20 +1445,112 @@ impl NewtonRaphsonSolver {
 
         // Damping represents a fraction of a Newton correction. Values outside
         // `(0, 1]` either reverse/amplify the step or eliminate it entirely.
-        if !self.damping_factor.is_finite()
-            || self.damping_factor <= 0.0
-            || self.damping_factor > 1.0
+        if !self.options.damping_factor.is_finite()
+            || self.options.damping_factor <= 0.0
+            || self.options.damping_factor > 1.0
         {
             return Err(SolverError::InvalidInput(
                 "damping_factor must be finite and in the interval (0, 1]".to_string(),
             ));
         }
 
+        // Adaptive damping may only reduce the configured initial fraction; a
+        // larger or non-positive floor would reverse that relationship.
+        if !self.options.min_damping.is_finite()
+            || self.options.min_damping <= 0.0
+            || self.options.min_damping > self.options.damping_factor
+        {
+            return Err(SolverError::InvalidInput(
+                "min_damping must be finite, positive, and no greater than damping_factor"
+                    .to_string(),
+            ));
+        }
+
         // Regularization is later square-rooted for augmented QR, so negative or
         // non-finite values must not reach workspace construction.
-        if !self.regularization.is_finite() || self.regularization < 0.0 {
+        if !self.options.regularization.is_finite() || self.options.regularization < 0.0 {
             return Err(SolverError::InvalidInput(
                 "regularization must be finite and non-negative".to_string(),
+            ));
+        }
+
+        // A finite positive condition cutoff gives the regularization dispatcher
+        // an ordered comparison for every successful factorization diagnostic.
+        if !self.options.condition_limit.is_finite() || self.options.condition_limit <= 0.0 {
+            return Err(SolverError::InvalidInput(
+                "condition_limit must be finite and greater than zero".to_string(),
+            ));
+        }
+
+        // The geometric retry schedule must contain at least one finite attempt
+        // and must not weaken regularization on later attempts.
+        if self.options.regularization_attempts == 0 {
+            return Err(SolverError::InvalidInput(
+                "regularization_attempts must be greater than zero".to_string(),
+            ));
+        }
+        if !self.options.regularization_growth_factor.is_finite()
+            || self.options.regularization_growth_factor < 1.0
+        {
+            return Err(SolverError::InvalidInput(
+                "regularization_growth_factor must be finite and at least one".to_string(),
+            ));
+        }
+        let mut scheduled_regularization = self.options.regularization;
+        for _ in 1..self.options.regularization_attempts {
+            scheduled_regularization *= self.options.regularization_growth_factor;
+            if !scheduled_regularization.is_finite() {
+                return Err(SolverError::InvalidInput(
+                    "regularization retry schedule must remain finite".to_string(),
+                ));
+            }
+        }
+
+        // QR and SVD share this relative threshold, including zero as an exact
+        // rank policy. Negative and non-finite values have no ordered meaning.
+        if !self
+            .options
+            .least_squares
+            .relative_rank_tolerance
+            .is_finite()
+            || self.options.least_squares.relative_rank_tolerance < 0.0
+        {
+            return Err(SolverError::InvalidInput(
+                "least_squares.relative_rank_tolerance must be finite and non-negative".to_string(),
+            ));
+        }
+
+        // Armijo's coefficient is a fraction of the predicted local decrease.
+        if !self.options.armijo_coefficient.is_finite()
+            || self.options.armijo_coefficient <= 0.0
+            || self.options.armijo_coefficient >= 1.0
+        {
+            return Err(SolverError::InvalidInput(
+                "armijo_coefficient must be finite and in the interval (0, 1)".to_string(),
+            ));
+        }
+        if self.options.line_search_max_trials == 0 {
+            return Err(SolverError::InvalidInput(
+                "line_search_max_trials must be greater than zero".to_string(),
+            ));
+        }
+        if !self.options.line_search_min_step.is_finite()
+            || self.options.line_search_min_step <= 0.0
+            || self.options.line_search_min_step > self.options.damping_factor
+        {
+            return Err(SolverError::InvalidInput(
+                "line_search_min_step must be finite, positive, and no greater than damping_factor"
+                    .to_string(),
+            ));
+        }
+
+        // Projection tolerance is a non-negative multiplier on machine epsilon;
+        // zero requests exact comparison without disabling projection itself.
+        if !self.options.projection_tolerance_multiplier.is_finite()
+            || self.options.projection_tolerance_multiplier < 0.0
+        {
+            return Err(SolverError::InvalidInput(
+                "projection_tolerance_multiplier must be finite and non-negative".to_string(),
             ));
         }
 
@@ -1463,8 +1625,8 @@ impl NewtonRaphsonSolver {
             format!(
                 "Residual norm {:.2e} exceeds tolerance {:.2e}, while the normalized residual gradient satisfies stationarity tolerance {:.2e}",
                 residuals.norm(),
-                self.residual_tolerance,
-                self.stationarity_tolerance,
+                self.options.residual_tolerance,
+                self.options.stationarity_tolerance,
             ),
             iterations,
             vars,
@@ -1722,16 +1884,6 @@ impl NewtonRaphsonSolver {
             candidate_residuals,
         } = context;
 
-        // A difficult but recoverable Newton direction can require far more
-        // than twenty halvings. Sixty-four trials cover the useful binary range
-        // down to the explicit minimum without making the search unbounded.
-        const MAX_LINE_SEARCH_TRIALS: usize = 64;
-        const MIN_LINE_SEARCH_STEP: f64 = 1e-12;
-        // A small Armijo coefficient asks only for a decrease consistent with
-        // the local objective slope. Unlike the previous fixed 50% residual
-        // reduction, this remains attainable near a non-zero residual floor.
-        const ARMIJO_COEFFICIENT: f64 = 1e-4;
-
         // A non-negative derivative means the proposed correction is not a
         // descent direction for the least-squares objective. Backtracking cannot
         // repair such a direction, so preserve the current state and explain the
@@ -1762,11 +1914,11 @@ impl NewtonRaphsonSolver {
         // Begin with the caller's configured maximum step and reuse a cloned
         // variable map for all candidates so fixed parameters remain present on
         // every trial.
-        let mut alpha = self.damping_factor;
+        let mut alpha = self.options.damping_factor;
         let mut new_vars = vars.clone();
         let mut attempted_trials = 0;
 
-        for _ in 0..MAX_LINE_SEARCH_TRIALS {
+        for _ in 0..self.options.line_search_max_trials {
             attempted_trials += 1;
             new_vars.clone_from(vars);
 
@@ -1783,7 +1935,7 @@ impl NewtonRaphsonSolver {
             jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
             let new_error = candidate_residuals.norm();
             let required_error = current_residual_norm
-                + ARMIJO_COEFFICIENT * alpha * residual_norm_directional_derivative;
+                + self.options.armijo_coefficient * alpha * residual_norm_directional_derivative;
             if new_error.is_finite() && new_error <= required_error {
                 return Ok(alpha);
             }
@@ -1791,10 +1943,10 @@ impl NewtonRaphsonSolver {
             // Stop only after the current minimum-sized candidate has actually
             // been tested and rejected. This ensures every returned success is
             // backed by an evaluated candidate.
-            if alpha <= MIN_LINE_SEARCH_STEP {
+            if alpha <= self.options.line_search_min_step {
                 break;
             }
-            alpha = (alpha * 0.5).max(MIN_LINE_SEARCH_STEP);
+            alpha = (alpha * 0.5).max(self.options.line_search_min_step);
         }
 
         // Applying any rejected fallback could increase the residual or leave
@@ -1904,6 +2056,20 @@ mod tests {
             SolverError::StationaryNonRoot(diagnostic) => *diagnostic,
             other => panic!("expected StationaryNonRoot, got {other:?}"),
         }
+    }
+
+    /// Clone, mutate, and reinstall a solver's shape-adjusted numerical policy
+    /// for focused configuration tests.
+    fn configure_options(
+        solver: NewtonRaphsonSolver,
+        configure: impl FnOnce(&mut SolverOptions),
+    ) -> NewtonRaphsonSolver {
+        // Begin from the solver's actual policy rather than `Default`, because
+        // overdetermined construction intentionally adjusts three workload and
+        // stabilization values.
+        let mut options = solver.options().clone();
+        configure(&mut options);
+        solver.with_options(options)
     }
 
     fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
@@ -2148,6 +2314,62 @@ mod tests {
                 "regularization",
                 Box::new(|solver| solver.with_regularization(f64::INFINITY)),
             ),
+            (
+                "min_damping",
+                Box::new(|solver| configure_options(solver, |options| options.min_damping = 0.0)),
+            ),
+            (
+                "condition_limit",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.condition_limit = f64::INFINITY)
+                }),
+            ),
+            (
+                "regularization_attempts",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.regularization_attempts = 0)
+                }),
+            ),
+            (
+                "regularization_growth_factor",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.regularization_growth_factor = 0.5)
+                }),
+            ),
+            (
+                "least_squares.relative_rank_tolerance",
+                Box::new(|solver| {
+                    configure_options(solver, |options| {
+                        options.least_squares.relative_rank_tolerance = f64::NAN
+                    })
+                }),
+            ),
+            (
+                "armijo_coefficient",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.armijo_coefficient = 1.0)
+                }),
+            ),
+            (
+                "line_search_max_trials",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.line_search_max_trials = 0)
+                }),
+            ),
+            (
+                "line_search_min_step",
+                Box::new(|solver| {
+                    configure_options(solver, |options| options.line_search_min_step = 0.0)
+                }),
+            ),
+            (
+                "projection_tolerance_multiplier",
+                Box::new(|solver| {
+                    configure_options(solver, |options| {
+                        options.projection_tolerance_multiplier = f64::NAN
+                    })
+                }),
+            ),
         ];
 
         for (expected_parameter, configure) in invalid_cases {
@@ -2390,6 +2612,36 @@ mod tests {
             }
             assert!(solution.error < 1e-10);
             assert!(solution.values["x"].abs() < 1e-8);
+        }
+    }
+
+    /// Verify that the public line-search trial budget controls candidate
+    /// exhaustion rather than serving as documentation-only metadata.
+    #[test]
+    fn test_line_search_honors_configured_trial_budget() {
+        for mode in test_modes() {
+            // The same exponential problem used by the deep-backtracking test
+            // cannot accept its full Newton step. Restricting the search to one
+            // candidate must therefore preserve the initial point and fail.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
+                options.line_search_max_trials = 1
+            });
+            let initial = HashMap::from([("x".to_string(), -20.0)]);
+
+            let error = solver
+                .solve_with_line_search(initial)
+                .expect_err("one rejected candidate must exhaust the configured search");
+
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert_eq!(diagnostic.iterations, 0);
+                    assert!(diagnostic.message.contains("after 1 rejected trial steps"));
+                    assert_eq!(diagnostic.values["x"], -20.0);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
+            }
         }
     }
 

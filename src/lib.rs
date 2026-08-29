@@ -64,10 +64,12 @@ mod matrix_test;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
-pub use matrix::{LeastSquaresInfo, LeastSquaresMethod, Matrix, MatrixError, MatrixOperand};
+pub use matrix::{
+    LeastSquaresInfo, LeastSquaresMethod, LeastSquaresOptions, Matrix, MatrixError, MatrixOperand,
+};
 pub use mode::Mode;
 pub use solver::{
-    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError,
+    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverOptions,
     SolverRunDiagnostic, UnderdeterminedPolicy,
 };
 
