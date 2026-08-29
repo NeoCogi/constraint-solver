@@ -41,6 +41,9 @@ fn random_matrix(rows: usize, cols: usize, rng: &mut LcgRng) -> Matrix {
 
 const SIZES: &[usize] = &[64, 128, 256, 512, 1024];
 const QR_RATIO: usize = 4;
+/// Dimensions for products whose output is small but whose shared inner
+/// dimension makes the total arithmetic large enough to parallelize.
+const SKINNY_MATMUL_SHAPES: &[(usize, usize, usize)] = &[(4, 16_384, 4)];
 
 fn assert_f64_close(a: f64, b: f64, abs_tol: f64, rel_tol: f64) {
     let diff = (a - b).abs();
@@ -109,6 +112,41 @@ fn bench_matmul(c: &mut Criterion) {
             })
         });
     }
+
+    // Benchmark the work-estimation regression independently from square
+    // products. The old rows*output-columns threshold classified this shape as
+    // sixteen operations even though it performs 262,144 multiply-adds.
+    for &(rows, inner, cols) in SKINNY_MATMUL_SHAPES {
+        let mut rng = LcgRng::new(0x51_1a_7e + inner as u64);
+        let a = random_matrix(rows, inner, &mut rng);
+        let b = random_matrix(inner, cols, &mut rng);
+        let serial = a.try_mul_with_parallel(&b, false).unwrap();
+        let parallel = pool.install(|| a.try_mul_with_parallel(&b, true).unwrap());
+        assert_matrix_close(&serial, &parallel, 1e-10, 1e-8);
+
+        let shape = format!("{rows}x{inner}x{cols}");
+        group.bench_with_input(
+            BenchmarkId::new("skinny/serial", &shape),
+            &shape,
+            |bench, _| {
+                bench.iter(|| {
+                    let result = a.try_mul_with_parallel(black_box(&b), false).unwrap();
+                    black_box(result)
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("skinny/parallel", &shape),
+            &shape,
+            |bench, _| {
+                bench.iter(|| {
+                    let result =
+                        pool.install(|| a.try_mul_with_parallel(black_box(&b), true).unwrap());
+                    black_box(result)
+                })
+            },
+        );
+    }
     group.finish();
 }
 
@@ -157,11 +195,11 @@ fn bench_qr(c: &mut Criterion) {
         let tall = random_matrix(m, n, &mut rng);
         let tall_b = random_matrix(m, 1, &mut rng);
         let (x_serial, info_serial) = tall
-            .solve_least_squares_qr_with_info_with_parallel(&tall_b, false)
+            .solve_least_squares_with_info_with_parallel(&tall_b, false)
             .unwrap();
         let (x_parallel, info_parallel) = pool
             .install(|| {
-                tall.solve_least_squares_qr_with_info_with_parallel(&tall_b, true)
+                tall.solve_least_squares_with_info_with_parallel(&tall_b, true)
                     .unwrap()
             });
         assert_eq!(info_serial.rank, info_parallel.rank);
@@ -173,7 +211,7 @@ fn bench_qr(c: &mut Criterion) {
             |bench, a| {
                 bench.iter(|| {
                     let (x, info) = a
-                        .solve_least_squares_qr_with_info_with_parallel(black_box(&tall_b), false)
+                        .solve_least_squares_with_info_with_parallel(black_box(&tall_b), false)
                         .unwrap();
                     black_box(x);
                     black_box(info);
@@ -187,7 +225,7 @@ fn bench_qr(c: &mut Criterion) {
                 bench.iter(|| {
                     let (x, info) = pool
                         .install(|| {
-                            a.solve_least_squares_qr_with_info_with_parallel(
+                            a.solve_least_squares_with_info_with_parallel(
                                 black_box(&tall_b),
                                 true,
                             )
@@ -202,11 +240,11 @@ fn bench_qr(c: &mut Criterion) {
         let wide = random_matrix(n, m, &mut rng);
         let wide_b = random_matrix(n, 1, &mut rng);
         let (x_serial, info_serial) = wide
-            .solve_least_squares_qr_with_info_with_parallel(&wide_b, false)
+            .solve_least_squares_with_info_with_parallel(&wide_b, false)
             .unwrap();
         let (x_parallel, info_parallel) = pool
             .install(|| {
-                wide.solve_least_squares_qr_with_info_with_parallel(&wide_b, true)
+                wide.solve_least_squares_with_info_with_parallel(&wide_b, true)
                     .unwrap()
             });
         assert_eq!(info_serial.rank, info_parallel.rank);
@@ -218,7 +256,7 @@ fn bench_qr(c: &mut Criterion) {
             |bench, a| {
                 bench.iter(|| {
                     let (x, info) = a
-                        .solve_least_squares_qr_with_info_with_parallel(black_box(&wide_b), false)
+                        .solve_least_squares_with_info_with_parallel(black_box(&wide_b), false)
                         .unwrap();
                     black_box(x);
                     black_box(info);
@@ -232,7 +270,7 @@ fn bench_qr(c: &mut Criterion) {
                 bench.iter(|| {
                     let (x, info) = pool
                         .install(|| {
-                            a.solve_least_squares_qr_with_info_with_parallel(
+                            a.solve_least_squares_with_info_with_parallel(
                                 black_box(&wide_b),
                                 true,
                             )

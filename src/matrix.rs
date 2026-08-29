@@ -56,8 +56,12 @@ impl fmt::Display for MatrixOperand {
     }
 }
 
-fn should_parallelize(rows: usize, cols: usize) -> bool {
-    rows.saturating_mul(cols) >= PARALLEL_THRESHOLD
+/// Decide whether an operation contains enough independent scalar work to
+/// amortize Rayon scheduling overhead.
+fn should_parallelize_work(estimated_scalar_work: usize) -> bool {
+    // Callers use saturating arithmetic when deriving work estimates, so an
+    // unrepresentably large operation is conservatively classified as large.
+    estimated_scalar_work >= PARALLEL_THRESHOLD
 }
 
 /// Convert the relative numerical-rank threshold into the scale of a particular
@@ -366,7 +370,8 @@ impl Matrix {
 
     pub fn transpose_with_parallel(&self, parallel: bool) -> Matrix {
         let mut result = Matrix::new(self.cols, self.rows);
-        if parallel && should_parallelize(self.rows, self.cols) {
+        let element_count = self.rows.saturating_mul(self.cols);
+        if parallel && should_parallelize_work(element_count) {
             result
                 .data
                 .par_chunks_mut(self.rows)
@@ -1196,7 +1201,8 @@ impl Matrix {
             // Apply reflector to remaining columns.
             let cols_left = n.saturating_sub(k + 1);
             if cols_left > 0 {
-                let use_parallel = parallel && should_parallelize(m - (k + 1), cols_left);
+                let reflector_work = (m - (k + 1)).saturating_mul(cols_left);
+                let use_parallel = parallel && should_parallelize_work(reflector_work);
                 let dots: Vec<f64> = if use_parallel {
                     (0..cols_left)
                         .into_par_iter()
@@ -1261,7 +1267,7 @@ impl Matrix {
             dot *= tau;
             qt_b[(k, 0)] -= dot;
 
-            let use_parallel = parallel && should_parallelize(m - (k + 1), 1);
+            let use_parallel = parallel && should_parallelize_work(m - (k + 1));
             if use_parallel {
                 let cols = r.cols;
                 let k_col = k;
@@ -1374,7 +1380,9 @@ impl Matrix {
         let m = a.rows;
         let n = a.cols;
 
-        let mut r = a.transpose(); // n x m, tall
+        // Transposition is part of the wide QR workload and must respect the
+        // same explicit parallel-mode decision as the reflector updates.
+        let mut r = a.transpose_with_parallel(parallel); // n x m, tall
         let mut taus = Vec::with_capacity(m);
 
         // Householder QR on r (n x m), producing R in the top m x m block.
@@ -1414,7 +1422,8 @@ impl Matrix {
 
             let cols_left = m.saturating_sub(k + 1);
             if cols_left > 0 {
-                let use_parallel = parallel && should_parallelize(n - (k + 1), cols_left);
+                let reflector_work = (n - (k + 1)).saturating_mul(cols_left);
+                let use_parallel = parallel && should_parallelize_work(reflector_work);
                 let dots: Vec<f64> = if use_parallel {
                     (0..cols_left)
                         .into_par_iter()
@@ -1556,7 +1565,7 @@ impl Matrix {
 
             w[k] -= dot;
 
-            let use_parallel = parallel && should_parallelize(n - (k + 1), 1);
+            let use_parallel = parallel && should_parallelize_work(n - (k + 1));
             if use_parallel {
                 let cols = r.cols;
                 let k_col = k;
@@ -1694,11 +1703,17 @@ impl Matrix {
         Ok(result)
     }
 
+    /// Multiply two shape-compatible matrices serially.
     pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
+        // Delegate validation and arithmetic to the mode-aware implementation so
+        // both public entry points retain identical error behavior.
         self.try_mul_with_parallel(rhs, false)
     }
 
+    /// Multiply two matrices while optionally parallelizing sufficiently large
+    /// row computations.
     pub fn try_mul_with_parallel(&self, rhs: &Matrix, parallel: bool) -> Result<Matrix, MatrixError> {
+        // The shared dimension must match before any row slice is constructed.
         if self.cols != rhs.rows {
             return Err(MatrixError::DimensionMismatch {
                 operation: "mul",
@@ -1708,8 +1723,18 @@ impl Matrix {
         }
 
         let mut result = Matrix::new(self.rows, rhs.cols);
-        if parallel && should_parallelize(self.rows, rhs.cols) {
+        // Each output cell performs `self.cols` multiply-adds. Including that
+        // inner dimension recognizes skinny products with few output cells but
+        // substantial arithmetic, which the former output-size test missed.
+        let scalar_work = self
+            .rows
+            .saturating_mul(rhs.cols)
+            .saturating_mul(self.cols);
+        if parallel && should_parallelize_work(scalar_work) {
             let rhs_cols = rhs.cols;
+            // Assign complete output rows to workers. Each row is disjoint, so
+            // accumulation needs no locks and retains serial summation order
+            // within every individual result cell.
             result
                 .data
                 .par_chunks_mut(rhs_cols)
@@ -2032,6 +2057,32 @@ mod tests {
         assert_eq!(c_serial[(0, 1)], 64.0);
         assert_eq!(c_serial[(1, 0)], 139.0);
         assert_eq!(c_serial[(1, 1)], 154.0);
+    }
+
+    /// Verify that a product with few outputs but a long shared dimension is
+    /// classified by its actual arithmetic and remains numerically equivalent.
+    #[test]
+    fn test_parallel_matmul_counts_inner_dimension_work() {
+        let rows = 4usize;
+        let inner = 4_096usize;
+        let cols = 4usize;
+
+        // Sixteen output cells alone fall below the scheduling threshold, while
+        // their 65,536 multiply-adds correctly qualify as substantial work.
+        let estimated_work = rows.saturating_mul(cols).saturating_mul(inner);
+        assert!(should_parallelize_work(estimated_work));
+
+        let a = Matrix::from_vec(vec![1.0; rows * inner], rows, inner).unwrap();
+        let b = Matrix::from_vec(vec![1.0; inner * cols], inner, cols).unwrap();
+        let serial = a.try_mul_with_parallel(&b, false).unwrap();
+        let parallel = a.try_mul_with_parallel(&b, true).unwrap();
+
+        assert_matrix_close(&serial, &parallel, 0.0);
+        for row in 0..rows {
+            for column in 0..cols {
+                assert_eq!(serial[(row, column)], inner as f64);
+            }
+        }
     }
 
     #[test]
