@@ -39,6 +39,36 @@ jobs:
       - name: Test all targets at the MSRV
         run: cargo test --locked --all-targets
 
+  portable-library:
+    name: Check library on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every supported host result even if one platform fails first.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      # Use the exact source revision and dependency lockfile validated on Linux.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Portability tracks the current stable toolchain; the separate Linux job
+      # above owns the lower-bound compiler contract.
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Toolchain and target metadata keep artifacts isolated across the two
+      # operating-system matrix entries.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Check only the distributable library. GUI development dependencies and
+      # the X11-based interactive example are validated in the Linux all-target
+      # job and are not part of the crate's portable runtime surface.
+      - name: Check locked library
+        run: cargo check --locked --lib
+
   validate:
     name: Format, lint, test, and package
     runs-on: ubuntu-latest
