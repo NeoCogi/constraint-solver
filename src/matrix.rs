@@ -694,8 +694,66 @@ impl Matrix {
         })
     }
 
+    /// Return the Frobenius norm without introducing avoidable intermediate
+    /// overflow or underflow.
+    ///
+    /// A direct `sqrt(sum(value * value))` calculation can overflow while the
+    /// final norm is still representable, and it can underflow small non-zero
+    /// matrices to zero. The scaled sum-of-squares algorithm used here is the
+    /// same numerical strategy traditionally used by BLAS `nrm2` routines.
+    /// Non-finite inputs remain visible to callers: a NaN element produces NaN,
+    /// while an infinite element produces infinity.
     pub fn norm(&self) -> f64 {
-        self.data.iter().map(|x| x * x).sum::<f64>().sqrt()
+        // `scale` tracks the largest finite magnitude seen so far. `scaled_sum`
+        // stores the sum of squares after every element has been divided by
+        // that scale, keeping the intermediate values close to unity.
+        let mut scale = 0.0;
+        let mut scaled_sum = 1.0;
+
+        for &value in &self.data {
+            let magnitude = value.abs();
+
+            // Preserve NaN rather than allowing comparisons below to silently
+            // ignore it. Solver-level validation can then report the numerical
+            // failure instead of mistaking the norm for a converged residual.
+            if magnitude.is_nan() {
+                return f64::NAN;
+            }
+
+            // Any infinite component makes the mathematical norm infinite.
+            // Handling it explicitly also avoids the indeterminate `inf / inf`
+            // ratios that the scaling branches would otherwise compute.
+            if magnitude.is_infinite() {
+                return f64::INFINITY;
+            }
+
+            // Zero contributes nothing and is skipped so the initial
+            // `scaled_sum` sentinel does not affect an all-zero matrix.
+            if magnitude == 0.0 {
+                continue;
+            }
+
+            if scale < magnitude {
+                // Rescale all previous contributions to the new, larger
+                // magnitude before adding the current element's unit square.
+                let ratio = scale / magnitude;
+                scaled_sum = 1.0 + scaled_sum * ratio * ratio;
+                scale = magnitude;
+            } else {
+                // The current value is no larger than `scale`, so its ratio is
+                // bounded by one and squaring it cannot overflow.
+                let ratio = magnitude / scale;
+                scaled_sum += ratio * ratio;
+            }
+        }
+
+        // `scale == 0` means every matrix element was zero (or the matrix was
+        // empty). Otherwise, restore the common scale only once at the end.
+        if scale == 0.0 {
+            0.0
+        } else {
+            scale * scaled_sum.sqrt()
+        }
     }
 
     pub fn try_add(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
@@ -894,6 +952,38 @@ mod tests {
         assert_eq!(m.rows(), 2);
         assert_eq!(m.cols(), 3);
         assert_eq!(m[(0, 0)], 0.0);
+    }
+
+    /// Verify that the norm retains finite magnitudes that a direct sum of
+    /// squares would overflow or underflow before taking the square root.
+    #[test]
+    fn test_norm_is_stable_across_extreme_finite_scales() {
+        // Squaring either large component would overflow, although the expected
+        // norm itself remains far below `f64::MAX`.
+        let large = Matrix::from_vec(vec![1e200, 1e200], 2, 1).unwrap();
+        let large_expected = 2.0_f64.sqrt() * 1e200;
+        let large_relative_error = (large.norm() - large_expected).abs() / large_expected;
+        assert!(large.norm().is_finite());
+        assert!(large_relative_error < 1e-15);
+
+        // Squaring either small component would underflow to zero. The scaled
+        // algorithm must nevertheless preserve their non-zero norm.
+        let small = Matrix::from_vec(vec![1e-200, 1e-200], 2, 1).unwrap();
+        let small_expected = 2.0_f64.sqrt() * 1e-200;
+        let small_relative_error = (small.norm() - small_expected).abs() / small_expected;
+        assert!(small.norm() > 0.0);
+        assert!(small_relative_error < 1e-15);
+    }
+
+    /// Confirm that non-finite matrix entries remain observable through the
+    /// norm API instead of being accidentally converted to a finite value.
+    #[test]
+    fn test_norm_propagates_non_finite_components() {
+        let with_nan = Matrix::from_vec(vec![1.0, f64::NAN], 2, 1).unwrap();
+        let with_infinity = Matrix::from_vec(vec![1.0, f64::INFINITY], 2, 1).unwrap();
+
+        assert!(with_nan.norm().is_nan());
+        assert_eq!(with_infinity.norm(), f64::INFINITY);
     }
 
     #[test]
