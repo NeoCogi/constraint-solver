@@ -33,7 +33,8 @@ use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
 
-/// Reusable storage for the augmented system used by regularized QR solves.
+/// Reusable storage for the augmented system used by regularized least-squares
+/// solves.
 struct LeastSquaresWorkspace {
     /// Coefficient matrix `[J; sqrt(lambda) I]` populated for each solve.
     augmented_j: Matrix,
@@ -549,7 +550,7 @@ impl NewtonRaphsonSolver {
     /// 2. Compute Jacobian J = df/dx
     /// 3. Solve linear system: J * delta = -f(x)
     ///    - Square systems: Direct LU decomposition
-    ///    - Under/over-constrained: QR least squares (with adaptive regularization if needed)
+    ///    - Under/over-constrained: QR/SVD least squares (with adaptive regularization if needed)
     /// 4. Update: x_new = x_old + damping * delta
     /// 5. Adapt damping based on error change
     fn solve_modified_internal(
@@ -1016,9 +1017,9 @@ impl NewtonRaphsonSolver {
     /// Compute the Newton correction for a wide Jacobian according to the
     /// configured underdetermined null-space policy.
     ///
-    /// Both policies use the same QR and regularization machinery; they differ
-    /// only in whether QR minimizes the correction vector or the next solution
-    /// vector of the local affine constraint.
+    /// Both policies use the same QR/SVD and regularization machinery; they
+    /// differ only in whether the rectangular solve minimizes the correction
+    /// vector or the next solution vector of the local affine constraint.
     fn solve_underdetermined_delta(
         &self,
         j_matrix: &Matrix,
@@ -1030,9 +1031,10 @@ impl NewtonRaphsonSolver {
     ) -> Result<Matrix, LeastSquaresSolveError> {
         match self.underdetermined_policy {
             UnderdeterminedPolicy::MinimumNormStep => {
-                // The wide QR solver returns the smallest correction satisfying
-                // the linearized equation J*delta=-f. Adding it to the current
-                // point preserves all existing Jacobian-null-space components.
+                // The rectangular least-squares solver returns the smallest
+                // correction satisfying the linearized equation J*delta=-f.
+                // Adding it to the current point preserves all existing
+                // Jacobian-null-space components.
                 self.solve_least_squares_system(j_matrix, negative_residuals, workspace, parallel)
             }
             UnderdeterminedPolicy::MinimumNormLinearizedSolution => {
@@ -1101,7 +1103,8 @@ impl NewtonRaphsonSolver {
 
         // Avoid consuming iterations on roundoff-sized reprojections. Scaling by
         // the current vector norm makes the threshold invariant under unit
-        // changes while the epsilon multiplier allows ordinary QR noise.
+        // changes while the epsilon multiplier allows ordinary factorization
+        // noise.
         const PROJECTION_EPSILON_MULTIPLIER: f64 = 64.0;
         let projection_threshold =
             PROJECTION_EPSILON_MULTIPLIER * f64::EPSILON * current_values.norm().max(1.0);

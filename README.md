@@ -5,26 +5,32 @@ A small, generic constraint-solving core for nonlinear systems. This crate provi
 
 - A symbolic expression tree (`Exp`) for building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
-- A dense matrix type with LU and QR-based least squares (`Matrix`).
+- A dense matrix type with checked LU and QR/SVD least squares (`Matrix`).
 - A Newton-Raphson solver with damping, regularization, and optional line search (`NewtonRaphsonSolver`).
 
 This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
 
 ## Usage
 
-Add the crate to your `Cargo.toml` (path or git dependency depending on your setup).
+Add the 0.3 release to your `Cargo.toml`:
+
+```toml
+[dependencies]
+constraint-solver = "0.3"
+```
 
 ## System Types (Square, Under-, Over-Constrained)
 
 The solver supports all three system shapes:
 
 - Square systems (equations == variables): solved via LU on the Jacobian.
-- Under-constrained systems (equations < variables): solved via QR least squares.
+- Under-constrained systems (equations < variables): solved via QR/SVD least squares.
   Callers explicitly choose between a minimum-norm Newton correction, which
   preserves null-space continuity, and the minimum-norm solution of each local
   linearization.
-- Over-constrained systems (equations > variables): solved via QR least squares,
-  minimizing the residual error.
+- Over-constrained systems (equations > variables): solved via QR/SVD least
+  squares, minimizing the residual error. Inconsistent systems can converge at
+  a nonzero residual when the least-squares gradient is stationary.
 
 ### Square system example
 
@@ -166,10 +172,11 @@ assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ### Execution mode (serial vs parallel)
 
 ```rust
-use constraint_solver::{Mode, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, Mode, NewtonRaphsonSolver};
 
-// `compiled` from any of the examples above.
-let solver = NewtonRaphsonSolver::new_with_mode(compiled, Mode::Parallel { thread_count: 8 })
+let equation = Exp::sub(Exp::var("x"), Exp::val(1.0));
+let compiled = Compiler::compile(&[equation]).expect("compile failed");
+let _solver = NewtonRaphsonSolver::new_with_mode(compiled, Mode::Parallel { thread_count: 8 })
     .expect("solver");
 ```
 
@@ -230,10 +237,10 @@ in the same benchmark group.
 
 ```bash
 # Use all available cores
-cargo bench
+cargo bench --features benchmarks
 
 # Pin the parallel thread count
-BENCH_THREADS=16 cargo bench
+BENCH_THREADS=16 cargo bench --features benchmarks
 ```
 
 The parallel path uses Rayon for matrix multiply, transpose, and QR
@@ -252,9 +259,16 @@ decisions.
   preserves the initial null-space component. Use
   `UnderdeterminedPolicy::MinimumNormLinearizedSolution` when each local
   linearization should instead choose its origin-based minimum-norm point.
-- Least squares solving uses QR to improve numerical stability.
-- Regularization is applied adaptively when the QR solve is ill-conditioned; use
-  `.with_regularization(0.0)` to disable it.
+- Least squares solving uses Householder QR for full-rank systems and a
+  one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
+  avoid forming normal equations.
+- Regularization is applied adaptively when the retained solve subspace is
+  ill-conditioned; use `.with_regularization(0.0)` to disable it. Rank loss by
+  itself does not force damping when the retained SVD subspace is well
+  conditioned.
+- Line search uses a slope-based Armijo condition for the squared-residual
+  objective and reports failure without counting rejected candidates as
+  accepted solver updates.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.
