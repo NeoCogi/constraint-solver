@@ -2255,13 +2255,21 @@ mod tests {
         assert_matrix_close(&serial.solution, &parallel.solution, 1e-7);
     }
 
+    /// Verify that LU performs a row interchange when the leading pivot is
+    /// zero and reconstructs the right-hand side in either execution mode.
     #[test]
     fn test_lu_solve() {
-        let a = Matrix::from_vec(vec![2.0, 1.0, 3.0, 4.0], 2, 2).unwrap();
-        let b = Matrix::from_vec(vec![5.0, 11.0], 2, 1).unwrap();
+        // A zero leading coefficient makes a row interchange mandatory before
+        // elimination can proceed.
+        let a = Matrix::from_vec(vec![0.0, 1.0, 1.0, 0.0], 2, 2).unwrap();
+        let b = Matrix::from_vec(vec![2.0, 1.0], 2, 1).unwrap();
 
         let x = a.solve_lu(&b).unwrap();
 
+        // Check the known coordinates before reconstructing b so compensating
+        // errors cannot satisfy only the product assertion.
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-10);
+        assert!((x[(1, 0)] - 2.0).abs() < 1e-10);
         let verify_serial = a.try_mul_with_parallel(&x, false).unwrap();
         let verify_parallel = a.try_mul_with_parallel(&x, true).unwrap();
         assert_matrix_close(&verify_serial, &verify_parallel, 0.0);
@@ -2284,6 +2292,25 @@ mod tests {
         let x_scaled = a_scaled.solve_lu(&b_scaled).unwrap();
         assert!((x_scaled[(0, 0)] - x[(0, 0)]).abs() < 1e-8);
         assert!((x_scaled[(1, 0)] - x[(1, 0)]).abs() < 1e-8);
+    }
+
+    /// Accept a non-zero final pivot when it remains above the default
+    /// matrix-relative LU threshold.
+    #[test]
+    fn test_lu_solves_nearly_singular_system_above_tolerance() {
+        // Construct b from the exact solution [1, 1]. The small determinant
+        // exercises tolerance handling without asking LU to classify the
+        // matrix as singular under its documented default.
+        let a = Matrix::from_vec(vec![1.0, 1.0, 1.0, 1.0 + 1e-12], 2, 2).unwrap();
+        let b = Matrix::from_vec(vec![2.0, 2.0 + 1e-12], 2, 1).unwrap();
+        let x = a
+            .solve_lu(&b)
+            .expect("a finite pivot above the relative threshold is solvable");
+
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-6);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-6);
+        let reconstructed = a.try_mul(&x).expect("matrix shapes are compatible");
+        assert_matrix_close(&reconstructed, &b, 1e-12);
     }
 
     /// Verify that the caller's LU tolerance applies to every pivot relative to

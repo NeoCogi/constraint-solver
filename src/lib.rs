@@ -68,9 +68,6 @@ pub mod matrix;
 pub mod mode;
 pub mod solver;
 
-#[cfg(test)]
-mod matrix_test;
-
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
 pub use matrix::{
