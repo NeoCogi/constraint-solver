@@ -1724,17 +1724,20 @@ impl NewtonRaphsonSolver {
         }
     }
 
-    /// Backtracking line search to find optimal step size
+    /// Backtrack until a trial step satisfies sufficient decrease in `||f||`.
     ///
-    /// Tries progressively smaller step sizes until one is found that reduces the error.
-    /// This helps prevent oscillation and improves convergence robustness.
+    /// The Armijo slope for the residual-norm merit function is obtained by
+    /// dividing the supplied squared-residual objective slope `f^T J delta` by
+    /// the current non-zero residual norm. Testing `||f||` directly avoids
+    /// overflowing merely because a large finite norm was squared.
     ///
     /// # Context fields
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
     /// * `current_residual_norm` - Current function error `||f(x)||`
-    /// * `objective_directional_derivative` - Value of `f^T J delta`
+    /// * `objective_directional_derivative` - Value of `f^T J delta`, converted
+    ///   internally to the residual-norm slope `(f^T J delta) / ||f||`
     /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
     /// * `candidate_residuals` - Reusable storage for each trial point

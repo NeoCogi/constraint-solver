@@ -271,9 +271,10 @@ decisions.
   retained solve subspace is ill-conditioned; use `.with_regularization(0.0)`
   to disable it. Rank loss by itself does not force damping when the retained
   SVD subspace is well conditioned.
-- Line search uses a slope-based Armijo condition for the squared-residual
-  objective and reports failure without counting rejected candidates as
-  accepted solver updates.
+- Line search applies a slope-based Armijo condition directly to the residual
+  norm `||f||`, using directional derivative `(f^T J delta) / ||f||`. This
+  avoids overflowing by squaring a large finite norm and reports failure
+  without counting rejected candidates as accepted solver updates.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.

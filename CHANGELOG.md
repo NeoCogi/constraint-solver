@@ -26,8 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   factorization-independent `solve_least_squares*`, `LeastSquaresInfo`, and
   `LeastSquaresMethod` API. Backward compatibility with the pre-0.3 API is not
   retained.
-- Changed line search to a slope-based Armijo condition for the squared-residual
-  objective and kept its configured initial trial size authoritative.
+- Changed line search to a slope-based Armijo condition for the residual norm,
+  using `(f^T J delta) / ||f||` as its directional derivative, and kept its
+  configured initial trial size authoritative.
 - Made minimum-norm-point projection a separate accepted update so damping does
   not reintroduce an initial Jacobian-null-space component.
 - Based parallel multiplication scheduling on full scalar work, including the
