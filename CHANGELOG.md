@@ -8,80 +8,111 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- One-sided Jacobi SVD fallback for rank-deficient square, tall, and wide
-  least-squares systems, including minimum-norm Moore-Penrose solutions and
-  retained-subspace rank and condition diagnostics.
-- Structured matrix errors for overflowing derived dimensions, non-finite
-  operands and results, and iterative-factorization non-convergence.
-- Explicit least-squares stationarity as a successful convergence reason for
-  inconsistent overdetermined systems.
-- Crate-level executable documentation, complete public API documentation, and
-  an enforced missing-documentation lint.
-- README Rust examples compiled and executed by the documentation-test suite so
-  published usage snippets cannot drift away from the public API.
-- Continuous integration gates for RustSec advisories, formatting, clippy,
-  unit and example tests, documentation tests, benchmark compilation, and crate
-  packaging.
+- Added a one-sided Jacobi SVD fallback for rank-deficient square, tall, and
+  wide least-squares systems, including minimum-norm Moore-Penrose solutions.
+- Added rank, condition estimate, and QR/SVD method metadata to the canonical
+  `LeastSquaresSolution` result.
+- Added `LinearSolveDiagnostic` to successful solutions and failed-run
+  diagnostics, preserving both the effective factorization and the original
+  unregularized classification when ridge regularization is selected.
+- Added `SolverOptions` and `LeastSquaresOptions` as the documented sources of
+  nonlinear iteration, line-search, regularization, and rank policy.
+- Added structured equation diagnostics and optional caller-provided equation
+  traces to make failed constraints identifiable without parsing messages.
+- Added explicit `UnderdeterminedPolicy` choices for minimum-norm corrections
+  and origin-based minimum-norm points.
+- Added structured matrix errors for invalid shapes and tolerances, overflowing
+  dimensions, allocation failure, non-finite states, and failed convergence.
+- Added executable crate documentation, compiled README examples, complete
+  public API documentation, and the `missing_docs` lint.
+- Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
+  builds, RustSec advisories, formatting, Clippy, tests, headless examples,
+  documentation tests, benchmark compilation, and package verification.
 
 ### Changed
 
-- Replaced the QR-named public least-squares methods and diagnostics with the
-  factorization-independent `solve_least_squares`, `LeastSquaresSolution`, and
-  `LeastSquaresMethod` API. Backward compatibility with the pre-0.3 API is not
-  retained.
-- Restricted the compiled-expression `Jacobian` implementation to crate scope;
-  its module, constructor inputs, and evaluation methods were already private,
-  so its nominally public declarations could not form a usable external API.
-- Removed the unreachable public `MatrixError::RankDeficient` variant. QR rank
-  loss is now an explicitly private dispatch outcome that selects the SVD
-  pseudoinverse; it was never returned by public least-squares operations.
-- Changed line search to a slope-based Armijo condition for the residual norm,
-  using `(f^T J delta) / ||f||` as its directional derivative, and kept its
-  configured initial trial size authoritative.
+- Made success strict and shape-independent: `Ok(Solution)` now certifies only
+  `residual_norm <= residual_tolerance`; every stationary non-root returns
+  `SolverError::StationaryNonRoot`, including square and underdetermined cases.
+- Replaced the overlapping QR-named least-squares entry points with one
+  `solve_least_squares` operation returning a diagnostic result. Compatibility
+  aliases from the pre-alpha API were intentionally removed.
+- Unified nonlinear Jacobian correction policy across all shapes. Full-rank
+  systems use Householder QR, rank-deficient systems use the SVD pseudoinverse,
+  and ill-conditioned retained subspaces use augmented ridge regularization.
+- Centralized numerical defaults and validation instead of scattering literal
+  tolerances, trial limits, and regularization growth rules through the solver.
+- Changed Armijo line search to operate directly on the residual norm with the
+  scale-safe directional derivative `(f / ||f||)^T (J delta)`.
 - Made minimum-norm-point projection a separate accepted update so damping does
   not reintroduce an initial Jacobian-null-space component.
-- Based parallel multiplication scheduling on full scalar work, including the
-  shared inner dimension, and allowed wide QR transposition to use the selected
-  parallel mode.
-- Made the Criterion benchmark an explicit `benchmarks` feature so ordinary
-  all-target test runs never execute performance measurements.
-- Declared Rust 1.86 as the minimum supported toolchain for Edition 2024 and
-  the locked development dependency graph.
+- Cached simplified symbolic derivatives at solver construction while keeping
+  independent reusable numerical workspaces for every solve invocation.
+- Restricted the compiled-expression Jacobian to crate scope and removed the
+  unreachable public `MatrixError::RankDeficient` variant.
+- Based parallel multiplication scheduling on complete scalar work and allowed
+  wide least-squares transposition to honor the selected execution mode.
+- Made Criterion benchmarks opt-in through the `benchmarks` feature and removed
+  machine-specific timing tables from the README.
+- Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
+  and required CI builds to use the committed dependency graph.
 
 ### Fixed
 
-- Corrected diagnostic iteration counts so rejected line-search candidates and
-  pre-update failures do not masquerade as accepted Newton updates.
-- Prevented inconsistent overdetermined problems from being reported as stalled
-  solely because their optimal residual is nonzero.
-- Prevented absolute equation scaling and zero-Jacobian non-root points from
-  being accepted as least-squares stationary solutions by using a normalized
-  first-order gradient measure.
-- Prevented damping adaptation from reacting to artificial residual-history
-  sentinels or treating deliberately damped progress as stagnation.
-- Corrected tolerance documentation to cover residual and normalized-gradient
-  termination only; deliberately damped small updates are not convergence.
-- Rejected NaN, infinity, and finite-input arithmetic overflow at matrix solve
-  boundaries instead of returning invalid successful matrices.
-- Updated locked `crossbeam-epoch` from 0.9.18 to 0.9.20 to resolve
-  RUSTSEC-2026-0204 in the repository's development and release test graph.
-- Normalized Householder reflector construction before subtracting its leading
-  value, preventing large finite full-rank systems from returning inaccurate QR
-  solutions after an intermediate sum overflowed.
-- Routed square Jacobians that fail LU through the same QR/SVD pseudoinverse and
-  augmented ridge fallback as rectangular systems, replacing the unrelated
-  direct diagonal shift and allowing consistent rank-deficient square systems
-  to solve without regularization.
-- Cached simplified symbolic Jacobian expressions when constructing a solver,
-  so repeated solve calls allocate fresh numerical workspaces without cloning
-  and differentiating the entire equation system again.
-- Checked matrix element products, including multiplication output shapes
-  derived from independently valid zero-sized operands, and augmented row sums
-  before allocation.
-- Removed redundant initial-variable and Jacobian copies, unused Householder
-  storage, and repeated quadratic clearing of immutable regularization zeros.
-- Made the GLFW inverse-kinematics example report changed solver failures,
-  announce recovery, synchronize buffer swaps, and release OpenGL objects before
-  context destruction.
+- Prevented norm, normalized-gradient, stationarity, and line-search slope
+  calculations from overflowing or underflowing at extreme finite scales.
+- Corrected Householder reflector scaling and triangular condition estimation,
+  including off-diagonal growth and uniform matrix rescaling.
+- Corrected LU pivot classification so every pivot, including the final one,
+  is compared against the complete coefficient-matrix scale.
+- Returned `MatrixError::AllocationFailed` from fallible construction instead
+  of panicking when an otherwise valid shape cannot reserve storage.
+- Stopped preallocating convergence history from an untrusted iteration limit;
+  history now grows only as accepted updates are observed.
+- Checked all derived matrix element counts and augmented-system row counts
+  before allocation, including products involving zero-sized operands.
+- Rejected NaN, infinity, and finite-input arithmetic overflow at expression,
+  Jacobian, update, and matrix-solve boundaries.
+- Corrected accepted-iteration accounting and refreshed residuals after every
+  update so returned values, errors, histories, and diagnostics describe the
+  same numerical state.
+- Prevented damping adaptation from reacting to artificial history sentinels or
+  treating deliberately damped progress as convergence.
+- Made line-search trial limits and initial step sizes authoritative and stopped
+  rejected candidates from being counted as accepted solver updates.
+- Documented exact symbolic differentiation at domain boundaries and added a
+  regression distinguishing a non-finite written derivative from a safe
+  algebraic rewrite; no hidden finite-difference fallback is performed.
+- Made every headless example assert its known numerical outcome and removed a
+  duplicated legacy matrix-test module with stale nonlinear-LU assumptions.
+- Hardened the GLFW inverse-kinematics example's failure reporting, recovery,
+  buffer synchronization, target geometry, and OpenGL resource cleanup.
+- Updated the locked `crossbeam-epoch` dependency to resolve RUSTSEC-2026-0204.
+
+## [0.1.1] - 2026-02-12
+
+### Added
+
+- Added runtime serial and Rayon-backed parallel execution modes with numerical
+  equivalence tests and Criterion matrix benchmarks.
+- Added the interactive GLFW/OpenGL two-dimensional inverse-kinematics example.
+
+### Changed
+
+- Updated the graphics, math, and benchmarking development dependencies and
+  added repository and crates.io package metadata.
+
+## [0.1.0] - 2026-02-01
+
+### Added
+
+- Introduced symbolic residual expressions, name-based compilation, cached
+  symbolic Jacobians, and checked numerical evaluation.
+- Introduced dense matrix arithmetic with LU and QR least-squares solving.
+- Introduced damped Newton-Raphson solving for square, underdetermined, and
+  overdetermined systems with optional line search and adaptive regularization.
+- Added CAD and circuit command-line examples and the initial unit-test suite.
 
 [0.3.0]: https://github.com/NeoCogi/constraint-solver/releases/tag/v0.3.0
+[0.1.1]: https://github.com/NeoCogi/constraint-solver/tree/47403f77f99ed122bc9a052f4a4a53f071bdd33e
+[0.1.0]: https://github.com/NeoCogi/constraint-solver/tree/f95a5e74d24d76a1b08464b078b91318ee2e2331
