@@ -374,6 +374,36 @@ enum QrLeastSquaresOutcome {
 }
 
 impl Matrix {
+    /// Translate one logical coordinate into its row-major storage offset.
+    ///
+    /// Keeping both axis checks here prevents an invalid column from aliasing
+    /// the next row and prevents unchecked row multiplication from wrapping to
+    /// valid storage in optimized builds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row >= self.rows` or `col >= self.cols`.
+    fn offset(&self, row: usize, col: usize) -> usize {
+        // Validate each logical axis before flattening. Checking only the final
+        // vector offset cannot distinguish an invalid column from a valid cell
+        // in the following row.
+        assert!(
+            row < self.rows,
+            "matrix row index {row} is out of bounds for {} rows",
+            self.rows
+        );
+        assert!(
+            col < self.cols,
+            "matrix column index {col} is out of bounds for {} columns",
+            self.cols
+        );
+
+        // Every constructor proves that rows * columns fits in usize. With an
+        // in-range row and column, this strictly smaller offset therefore
+        // cannot overflow and always addresses the requested logical cell.
+        row * self.cols + col
+    }
+
     /// Build one scale-safe Householder reflector in a matrix column.
     ///
     /// The active column begins at `diagonal_index` and extends to the matrix's
@@ -1795,7 +1825,10 @@ impl Matrix {
             });
         }
 
-        let mut result = Matrix::new(self.rows, self.cols);
+        // Preserve the fallible contract through result allocation. This can
+        // fail under memory pressure even though both existing operands have a
+        // valid and identical shape.
+        let mut result = Matrix::try_new(self.rows, self.cols)?;
         for i in 0..self.data.len() {
             result.data[i] = self.data[i] + rhs.data[i];
         }
@@ -1814,7 +1847,10 @@ impl Matrix {
             });
         }
 
-        let mut result = Matrix::new(self.rows, self.cols);
+        // Allocate through the checked constructor for the same reason as
+        // addition: a fallible arithmetic method must not panic while creating
+        // its output buffer.
+        let mut result = Matrix::try_new(self.rows, self.cols)?;
         for i in 0..self.data.len() {
             result.data[i] = self.data[i] - rhs.data[i];
         }
@@ -1891,14 +1927,22 @@ impl Matrix {
 impl Index<(usize, usize)> for Matrix {
     type Output = f64;
 
+    /// Borrow the element at one validated logical matrix coordinate.
     fn index(&self, (row, col): (usize, usize)) -> &Self::Output {
-        &self.data[row * self.cols + col]
+        // Use the shared axis-aware translation so immutable and mutable
+        // indexing have identical bounds and overflow behavior.
+        let offset = self.offset(row, col);
+        &self.data[offset]
     }
 }
 
 impl IndexMut<(usize, usize)> for Matrix {
+    /// Mutably borrow the element at one validated logical matrix coordinate.
     fn index_mut(&mut self, (row, col): (usize, usize)) -> &mut Self::Output {
-        &mut self.data[row * self.cols + col]
+        // Compute the checked offset before borrowing storage mutably; this
+        // guarantees a failed coordinate cannot modify an aliased valid cell.
+        let offset = self.offset(row, col);
+        &mut self.data[offset]
     }
 }
 
@@ -2833,6 +2877,34 @@ mod tests {
                 cols: 2,
             }
         );
+    }
+
+    /// Reject invalid row and column coordinates independently before their
+    /// values can alias or overflow a row-major storage offset.
+    #[test]
+    fn test_coordinate_indexing_checks_both_axes_before_flattening() {
+        let mut matrix = Matrix::from_vec(vec![1.0, 2.0, 3.0, 4.0], 2, 2)
+            .expect("the fixture has exactly four elements");
+
+        // `(0, 2)` previously flattened to offset two and silently read `(1,
+        // 0)`. The very large row also wrapped to offset zero in optimized
+        // builds even though debug builds happened to panic on multiplication.
+        let invalid_coordinates = [(0, 2), (2, 0), (usize::MAX / 2 + 1, 0)];
+        for coordinate in invalid_coordinates {
+            let result = std::panic::catch_unwind(|| matrix[coordinate]);
+            assert!(
+                result.is_err(),
+                "immutable indexing accepted invalid coordinate {coordinate:?}"
+            );
+        }
+
+        // Mutable indexing must enforce the identical invariant and leave the
+        // valid cell that used to be aliased completely unchanged.
+        let mutation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matrix[(0, 2)] = 99.0;
+        }));
+        assert!(mutation.is_err());
+        assert_eq!(matrix[(1, 0)], 3.0);
     }
 
     /// Confirm that LU shape, tolerance, and singularity failures use distinct
