@@ -62,6 +62,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   termination only; deliberately damped small updates are not convergence.
 - Rejected NaN, infinity, and finite-input arithmetic overflow at matrix solve
   boundaries instead of returning invalid successful matrices.
+- Updated locked `crossbeam-epoch` from 0.9.18 to 0.9.20 to resolve
+  RUSTSEC-2026-0204 in the repository's development and release test graph.
 - Normalized Householder reflector construction before subtracting its leading
   value, preventing large finite full-rank systems from returning inaccurate QR
   solutions after an intermediate sum overflowed.
