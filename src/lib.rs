@@ -38,5 +38,5 @@ pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 pub use mode::Mode;
 pub use solver::{
     ConvergenceReason, EquationTrace, NewtonRaphsonSolver, Solution, SolverError,
-    SolverRunDiagnostic,
+    SolverRunDiagnostic, UnderdeterminedPolicy,
 };

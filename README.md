@@ -19,8 +19,10 @@ Add the crate to your `Cargo.toml` (path or git dependency depending on your set
 The solver supports all three system shapes:
 
 - Square systems (equations == variables): solved via LU on the Jacobian.
-- Under-constrained systems (equations < variables): solved via QR least squares,
-  returning the minimum-norm solution among all valid solutions.
+- Under-constrained systems (equations < variables): solved via QR least squares.
+  Callers explicitly choose between a minimum-norm Newton correction, which
+  preserves null-space continuity, and the minimum-norm solution of each local
+  linearization.
 - Over-constrained systems (equations > variables): solved via QR least squares,
   minimizing the residual error.
 
@@ -50,25 +52,32 @@ let solution = solver.solve(initial).expect("solve failed");
 assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
-### Under-constrained example (minimum-norm)
+### Under-constrained example (minimum-norm linearized solution)
 
 ```rust
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+use constraint_solver::{
+    Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver, UnderdeterminedPolicy,
+};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
 let y = Exp::var("y");
 
-// x + y = 1 has infinitely many solutions; the solver returns x = y = 0.5.
+// x + y = 1 has infinitely many solutions. The point policy removes any
+// null-space component inherited from the initial guess.
 let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 let compiled = Compiler::compile(&[eq]).expect("compile failed");
-let solver = NewtonRaphsonSolver::new(compiled);
+let solver = NewtonRaphsonSolver::new(compiled).with_underdetermined_policy(
+    UnderdeterminedPolicy::MinimumNormLinearizedSolution,
+);
 
 let mut initial = HashMap::new();
-initial.insert("x".to_string(), 0.0);
-initial.insert("y".to_string(), 0.0);
+initial.insert("x".to_string(), 10.0);
+initial.insert("y".to_string(), -10.0);
 let solution = solver.solve(initial).expect("solve failed");
 assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+assert!((solution.values["x"] - 0.5).abs() < 1e-10);
+assert!((solution.values["y"] - 0.5).abs() < 1e-10);
 ```
 
 ### Over-constrained example (least squares)
@@ -260,6 +269,10 @@ limited.
 ## Notes
 
 - The solver supports square, under-constrained, and over-constrained systems.
+- The default underdetermined policy minimizes each Newton correction and
+  preserves the initial null-space component. Use
+  `UnderdeterminedPolicy::MinimumNormLinearizedSolution` when each local
+  linearization should instead choose its origin-based minimum-norm point.
 - Least squares solving uses QR to improve numerical stability.
 - Regularization is applied adaptively when the QR solve is ill-conditioned; use
   `.with_regularization(0.0)` to disable it.

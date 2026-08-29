@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, UnderdeterminedPolicy};
 use glfw::{Action, Context, Key, WindowEvent};
 use glow::HasContext;
 use rs_math3d::Vec2d;
@@ -393,8 +393,12 @@ fn main() {
         solve_var_names.extend(joint.variables().iter().cloned());
     }
     let solve_var_refs: Vec<&str> = solve_var_names.iter().map(|s| s.as_str()).collect();
-    let solver =
-        NewtonRaphsonSolver::new_with_variables(compiled, &solve_var_refs).expect("solver");
+    let solver = NewtonRaphsonSolver::new_with_variables(compiled, &solve_var_refs)
+        .expect("solver")
+        // Preserve the previous frame's null-space component so the
+        // underdetermined chain moves continuously instead of being projected
+        // toward the origin on every frame.
+        .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormStep);
 
     // Initial pose: straight chain along +X axis.
     let mut state = IkState {
