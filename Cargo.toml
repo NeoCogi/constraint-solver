@@ -16,6 +16,11 @@ keywords = [
 ]
 categories = ["mathematics", "science", "algorithms"]
 
+[features]
+# Keep the harnessless Criterion executable out of ordinary all-target test
+# runs; performance measurement is an explicit developer operation.
+benchmarks = []
+
 [dependencies]
 rayon = "1.8"
 
@@ -28,3 +33,4 @@ rs-math3d = "0.10"
 [[bench]]
 name = "linear_algebra"
 harness = false
+required-features = ["benchmarks"]
