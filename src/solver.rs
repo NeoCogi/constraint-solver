@@ -537,9 +537,12 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the positive, finite residual/step/stationarity tolerance.
+    /// Override the positive, finite residual and relative-stationarity
+    /// tolerance.
     ///
-    /// Configuration is validated when a solve begins.
+    /// The solver deliberately does not treat a small applied update as
+    /// convergence because damping can make a useful correction arbitrarily
+    /// small. Configuration is validated when a solve begins.
     pub fn with_tolerance(mut self, tolerance: f64) -> Self {
         // Store without clamping so NaN, infinity, zero, and negative values are
         // observable to the common configuration validator.
@@ -1427,8 +1430,9 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // The same tolerance controls residual, step, and stationarity tests;
-        // it must therefore be strictly positive and finite.
+        // The same tolerance controls the residual-root and normalized-gradient
+        // stationarity tests; it must therefore be strictly positive and
+        // finite. Applied step size is intentionally not a convergence test.
         if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
             return Err(SolverError::InvalidInput(
                 "tolerance must be finite and greater than zero".to_string(),
@@ -2548,7 +2552,7 @@ mod tests {
     /// Confirm that a tiny Newton update reports diagnostics from the returned
     /// point rather than retaining the residual from before the update.
     #[test]
-    fn test_small_step_convergence_recomputes_returned_residual() {
+    fn test_tiny_update_recomputes_returned_residual() {
         for mode in test_modes() {
             // The exact update is only 1e-20, below the default tolerance, but
             // it moves x from residual one to the exact root.

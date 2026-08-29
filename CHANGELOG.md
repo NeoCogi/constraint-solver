@@ -50,6 +50,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first-order gradient measure.
 - Prevented damping adaptation from reacting to artificial residual-history
   sentinels or treating deliberately damped progress as stagnation.
+- Corrected tolerance documentation to cover residual and normalized-gradient
+  termination only; deliberately damped small updates are not convergence.
 - Rejected NaN, infinity, and finite-input arithmetic overflow at matrix solve
   boundaries instead of returning invalid successful matrices.
 - Normalized Householder reflector construction before subtracting its leading
