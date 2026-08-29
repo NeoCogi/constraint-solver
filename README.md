@@ -243,8 +243,10 @@ decisions.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.
-- Internally, the solver caches Jacobian storage between iterations to reduce
-  allocations; this is an implementation detail and does not affect the public API.
+- Internally, the solver differentiates and simplifies its symbolic Jacobian
+  once during construction. Each solve creates independent numerical storage
+  and reuses that storage between iterations, so solver reuse avoids both
+  repeated symbolic work and per-iteration matrix allocation.
 
 ## License
 
