@@ -813,46 +813,28 @@ impl NewtonRaphsonSolver {
                 f_neg[(i, 0)] = -f_vals[(i, 0)];
             }
 
-            // Step 2: Solve linear system J * delta = -f(x)
-            let delta = {
+            // Step 2: Solve linear system J * delta = -f(x). Every shape returns
+            // the same internal result type so validation and terminal
+            // diagnostics do not diverge between square and rectangular paths.
+            let delta_result = {
                 let j_matrix = jacobian_workspace.jacobian();
                 // Handle different system types with appropriate solving methods
                 if j_matrix.rows() == j_matrix.cols() {
-                    // Square system (equations == variables)
-                    // Use standard LU decomposition: J * delta = -f
-                    match j_matrix.solve_lu(&f_neg) {
-                        Ok(d) => d,
-                        Err(_) => {
-                            // A singular square Jacobian gets one regularized
-                            // fallback. Work on a clone so the cached matrix
-                            // remains the derivative of the actual residuals;
-                            // line-search slope calculations must use J, not the
-                            // numerically modified system used only to obtain p.
-                            let mut regularized_jacobian = j_matrix.clone();
-                            let diag_size =
-                                regularized_jacobian.rows().min(regularized_jacobian.cols());
-                            for i in 0..diag_size {
-                                regularized_jacobian[(i, i)] += self.regularization * 100.0;
-                            }
-                            match regularized_jacobian.solve_lu(&f_neg) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    let diag = self.build_diagnostic(
-                                        format!("Matrix is singular even with regularization: {e}"),
-                                        iter,
-                                        &vars,
-                                        &f_vals,
-                                    );
-                                    return Err(SolverError::SingularMatrix(diag));
-                                }
-                            }
-                        }
-                    }
+                    // Preserve partial-pivoting LU as the efficient ordinary
+                    // square-system path. Any LU failure is retried through the
+                    // same QR/SVD pseudoinverse and augmented regularization
+                    // machinery used by rectangular Jacobians.
+                    self.solve_square_newton_delta(
+                        j_matrix,
+                        &f_neg,
+                        &mut least_squares_workspace,
+                        parallel,
+                    )
                 } else {
                     // Wide systems need an explicit null-space policy; tall
                     // systems always solve the ordinary least-squares Newton
                     // correction.
-                    let least_squares_result = if j_matrix.rows() < j_matrix.cols() {
+                    if j_matrix.rows() < j_matrix.cols() {
                         self.solve_underdetermined_delta(
                             j_matrix,
                             &f_vals,
@@ -868,28 +850,28 @@ impl NewtonRaphsonSolver {
                             least_squares_workspace.as_mut(),
                             parallel,
                         )
-                    };
-
-                    match least_squares_result {
-                        Ok(delta) => delta,
-                        Err(LeastSquaresSolveError::InvalidInput(err)) => {
-                            return Err(SolverError::InvalidInput(err.to_string()));
-                        }
-                        Err(LeastSquaresSolveError::Singular {
-                            unregularized_error,
-                            regularized_error,
-                        }) => {
-                            let diag = self.build_diagnostic(
-                                format!(
-                                    "Least squares system is singular (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
-                                ),
-                                iter,
-                                &vars,
-                                &f_vals,
-                            );
-                            return Err(SolverError::SingularMatrix(diag));
-                        }
                     }
+                }
+            };
+
+            let delta = match delta_result {
+                Ok(delta) => delta,
+                Err(LeastSquaresSolveError::InvalidInput(err)) => {
+                    return Err(SolverError::InvalidInput(err.to_string()));
+                }
+                Err(LeastSquaresSolveError::Singular {
+                    unregularized_error,
+                    regularized_error,
+                }) => {
+                    let diagnostic = self.build_diagnostic(
+                        format!(
+                            "Jacobian system could not produce a Newton correction (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
+                        ),
+                        iter,
+                        &vars,
+                        &f_vals,
+                    );
+                    return Err(SolverError::SingularMatrix(diagnostic));
                 }
             };
 
@@ -1105,6 +1087,65 @@ impl NewtonRaphsonSolver {
                 next_values
                     .try_sub(&current_values)
                     .map_err(LeastSquaresSolveError::InvalidInput)
+            }
+        }
+    }
+
+    /// Solve a square Newton system with LU first and the common
+    /// least-squares/pseudoinverse policy as a numerical fallback.
+    ///
+    /// LU remains preferable for ordinary nonsingular square Jacobians because
+    /// it is cheaper than QR. A failed LU factorization does not prove that the
+    /// linearized correction is unusable, however: a rank-deficient but
+    /// consistent Jacobian still has a Moore-Penrose solution, and an
+    /// ill-conditioned full-rank Jacobian can use the same augmented ridge system
+    /// as a rectangular solve.
+    fn solve_square_newton_delta(
+        &self,
+        jacobian: &Matrix,
+        negative_residuals: &Matrix,
+        workspace: &mut Option<LeastSquaresWorkspace>,
+        parallel: bool,
+    ) -> Result<Matrix, LeastSquaresSolveError> {
+        // Keep the common and fastest square path allocation-free beyond LU's
+        // own factor matrices.
+        match jacobian.solve_lu(negative_residuals) {
+            Ok(delta) => Ok(delta),
+            Err(lu_error) => {
+                // Allocate the augmented workspace lazily. Most square solves
+                // never leave LU, while a repeatedly singular nonlinear solve can
+                // reuse this storage after its first fallback.
+                if self.regularization > 0.0 && workspace.is_none() {
+                    *workspace = Some(
+                        LeastSquaresWorkspace::new(jacobian.rows(), jacobian.cols())
+                            .map_err(LeastSquaresSolveError::InvalidInput)?,
+                    );
+                }
+
+                let fallback = self.solve_least_squares_system(
+                    jacobian,
+                    negative_residuals,
+                    workspace.as_mut(),
+                    parallel,
+                );
+
+                // Preserve the LU failure in a terminal diagnostic while
+                // allowing a successful QR/SVD fallback to remain transparent to
+                // callers.
+                fallback.map_err(|error| match error {
+                    LeastSquaresSolveError::InvalidInput(error) => {
+                        LeastSquaresSolveError::InvalidInput(error)
+                    }
+                    LeastSquaresSolveError::Singular {
+                        unregularized_error,
+                        regularized_error,
+                    } => LeastSquaresSolveError::Singular {
+                        unregularized_error: format!(
+                            "LU failed ({lu_error}); least-squares fallback failed ({unregularized_error})"
+                        ),
+                        regularized_error,
+                    },
+                })
             }
         }
     }
@@ -2905,6 +2946,49 @@ mod tests {
             assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values["x"] - 1.0).abs() < 1e-10);
             assert!(solution.values["y"].abs() < 1e-10);
+        }
+    }
+
+    /// Confirm that a dependent square system uses the SVD fallback after LU
+    /// detects singularity, even when augmented regularization is disabled.
+    #[test]
+    fn test_rank_deficient_square_system_converges_without_regularization() {
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+
+            // Both equations describe the same line. Their 2-by-2 Jacobian is
+            // exactly rank one, so LU must reject it while the Moore-Penrose
+            // correction selects x = y = 1/2 from the zero initial point.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+            let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
+            let solver = solver_for_mode(vec![first_equation, second_equation], mode)
+                .with_regularization(0.0)
+                .with_tolerance(1e-12)
+                .with_max_iterations(10);
+
+            // A symmetric initial point makes the pseudoinverse's minimum-norm
+            // choice deterministic and easy to distinguish from an arbitrary
+            // diagonal perturbation of the singular Jacobian.
+            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+            let solution = solver
+                .solve(initial)
+                .expect("the square SVD fallback should solve dependent equations");
+
+            // Both execution modes must select the same pseudoinverse solution
+            // and terminate by satisfying the actual residual equations.
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert!(solution.error < 1e-12);
+            assert!((solution.values["x"] - 0.5).abs() < 1e-10);
+            assert!((solution.values["y"] - 0.5).abs() < 1e-10);
         }
     }
 

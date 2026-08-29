@@ -23,7 +23,9 @@ constraint-solver = "0.3"
 
 The solver supports all three system shapes:
 
-- Square systems (equations == variables): solved via LU on the Jacobian.
+- Square systems (equations == variables): solved via LU on the Jacobian, with
+  QR/SVD pseudoinverse and augmented regularization fallback when LU cannot
+  produce a stable correction.
 - Under-constrained systems (equations < variables): solved via QR/SVD least squares.
   Callers explicitly choose between a minimum-norm Newton correction, which
   preserves null-space continuity, and the minimum-norm solution of each local
@@ -264,10 +266,11 @@ decisions.
 - Least squares solving uses Householder QR for full-rank systems and a
   one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
   avoid forming normal equations.
-- Regularization is applied adaptively when the retained solve subspace is
-  ill-conditioned; use `.with_regularization(0.0)` to disable it. Rank loss by
-  itself does not force damping when the retained SVD subspace is well
-  conditioned.
+- Regularization uses the augmented ridge system
+  `[J; sqrt(lambda) I] * delta ~= [-f; 0]` and is applied adaptively when the
+  retained solve subspace is ill-conditioned; use `.with_regularization(0.0)`
+  to disable it. Rank loss by itself does not force damping when the retained
+  SVD subspace is well conditioned.
 - Line search uses a slope-based Armijo condition for the squared-residual
   objective and reports failure without counting rejected candidates as
   accepted solver updates.

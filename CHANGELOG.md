@@ -53,6 +53,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Normalized Householder reflector construction before subtracting its leading
   value, preventing large finite full-rank systems from returning inaccurate QR
   solutions after an intermediate sum overflowed.
+- Routed square Jacobians that fail LU through the same QR/SVD pseudoinverse and
+  augmented ridge fallback as rectangular systems, replacing the unrelated
+  direct diagonal shift and allowing consistent rank-deficient square systems
+  to solve without regularization.
 - Checked matrix element products, including multiplication output shapes
   derived from independently valid zero-sized operands, and augmented row sums
   before allocation.
