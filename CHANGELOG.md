@@ -59,6 +59,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved structured `MatrixError` values through `SolverError` and retained
+  already-computed gradient measures in every `NoConvergence` diagnostic.
 - Prevented norm, column-scaled stationarity, and line-search slope calculations
   from overflowing or underflowing at extreme finite scales.
 - Corrected Householder reflector scaling and triangular condition estimation,

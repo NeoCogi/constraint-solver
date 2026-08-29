@@ -85,6 +85,8 @@ struct LineSearchContext<'a> {
     accepted_updates: usize,
     /// Residual vector at the current accepted point.
     current_residuals: &'a Matrix,
+    /// Gradient measures already evaluated at the current accepted point.
+    gradient: ResidualGradientMeasure,
     /// Reusable output storage for candidate residual evaluations.
     candidate_residuals: &'a mut Matrix,
 }
@@ -160,7 +162,7 @@ impl LeastSquaresWorkspace {
 enum LeastSquaresSolveError {
     /// A shape or matrix-operation precondition failed before a numerical solve
     /// could be attempted.
-    InvalidInput(MatrixError),
+    Matrix(MatrixError),
     /// Neither the unregularized solve nor any fixed augmented fallback
     /// strength produced an acceptable solution.
     Singular {
@@ -369,6 +371,11 @@ pub enum SolverError {
     /// systems. It does not claim the state is a local minimum; stationary
     /// maxima and saddles use the same non-success result.
     StationaryNonRoot(Box<SolverRunDiagnostic>),
+    /// Structured failure from matrix construction or linear algebra.
+    ///
+    /// The original variant and its machine-readable dimensions, operand, or
+    /// operation metadata are retained instead of being flattened into text.
+    Matrix(MatrixError),
     /// Invalid input parameters or system setup.
     InvalidInput(String),
 }
@@ -394,12 +401,27 @@ impl fmt::Display for SolverError {
                     diagnostic.message
                 )
             }
+            SolverError::Matrix(error) => write!(f, "Matrix operation failed: {error}"),
             SolverError::InvalidInput(message) => write!(f, "Invalid solver input: {message}"),
         }
     }
 }
 
-impl std::error::Error for SolverError {}
+impl std::error::Error for SolverError {
+    /// Expose nested structured causes through the standard error chain.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Run diagnostics and input messages originate at this solver layer.
+        // Only a retained matrix failure has a lower-level source object.
+        match self {
+            SolverError::Matrix(error) => Some(error),
+            SolverError::SingularMatrix(_)
+            | SolverError::NoConvergence(_)
+            | SolverError::NonFiniteEvaluation(_)
+            | SolverError::StationaryNonRoot(_)
+            | SolverError::InvalidInput(_) => None,
+        }
+    }
+}
 
 impl From<EvaluationError> for SolverError {
     /// Convert an impossible-after-validation evaluation mismatch into an
@@ -413,10 +435,11 @@ impl From<EvaluationError> for SolverError {
 }
 
 impl From<MatrixError> for SolverError {
-    /// Preserve matrix validation context in the solver's public input-error
-    /// channel.
+    /// Retain a matrix failure as structured data at the public solver boundary.
     fn from(value: MatrixError) -> Self {
-        SolverError::InvalidInput(value.to_string())
+        // Do not force callers to parse Display text to recover dimensions,
+        // operands, or the operation that failed.
+        SolverError::Matrix(value)
     }
 }
 
@@ -842,22 +865,23 @@ impl NewtonRaphsonSolver {
 
             let linear_solve = match delta_result {
                 Ok(linear_solve) => linear_solve,
-                Err(LeastSquaresSolveError::InvalidInput(err)) => {
-                    return Err(SolverError::InvalidInput(err.to_string()));
+                Err(LeastSquaresSolveError::Matrix(err)) => {
+                    return Err(err.into());
                 }
                 Err(LeastSquaresSolveError::Singular {
                     unregularized_error,
                     regularized_error,
                 }) => {
-                    let mut diagnostic = self.build_diagnostic(
+                    let diagnostic = self.build_diagnostic(
                         format!(
                             "Jacobian system could not produce a Newton correction (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
                         ),
                         iter,
                         &vars,
                         &f_vals,
+                        Some(gradient),
+                        last_linear_solve,
                     );
-                    diagnostic.last_linear_solve = last_linear_solve;
                     return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
                 }
             };
@@ -900,6 +924,7 @@ impl NewtonRaphsonSolver {
                     residual_norm_directional_derivative,
                     accepted_updates: iter,
                     current_residuals: &f_vals,
+                    gradient,
                     candidate_residuals: &mut line_search_f_vals,
                 })
                 .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?
@@ -1022,7 +1047,7 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        let mut diag = self.build_diagnostic(
+        let diagnostic = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
                 self.options.max_iterations, final_error
@@ -1030,9 +1055,10 @@ impl NewtonRaphsonSolver {
             self.options.max_iterations,
             &vars,
             &residuals,
+            Some(gradient),
+            last_linear_solve,
         );
-        diag.last_linear_solve = last_linear_solve;
-        Err(SolverError::NoConvergence(Box::new(diag)))
+        Err(SolverError::NoConvergence(Box::new(diagnostic)))
     }
 
     /// Solve a possibly rectangular linear system against one right-hand side,
@@ -1126,7 +1152,7 @@ impl NewtonRaphsonSolver {
                     if workspace.num_equations != j_matrix.rows()
                         || workspace.num_variables != j_matrix.cols()
                     {
-                        return Err(LeastSquaresSolveError::InvalidInput(
+                        return Err(LeastSquaresSolveError::Matrix(
                             MatrixError::DimensionMismatch {
                                 operation: "least_squares",
                                 left: (workspace.augmented_j.rows(), workspace.augmented_j.cols()),
@@ -1161,16 +1187,16 @@ impl NewtonRaphsonSolver {
                     // reusable workspace, but it remains independently safe for
                     // future callers that do not provide one.
                     let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
-                        LeastSquaresSolveError::InvalidInput(MatrixError::DimensionSumOverflow {
+                        LeastSquaresSolveError::Matrix(MatrixError::DimensionSumOverflow {
                             operation: "regularized least-squares allocation",
                             left: j_matrix.rows(),
                             right: j_matrix.cols(),
                         }),
                     )?;
                     let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())
-                        .map_err(LeastSquaresSolveError::InvalidInput)?;
+                        .map_err(LeastSquaresSolveError::Matrix)?;
                     let mut augmented_b = Matrix::try_new(augmented_rows, 1)
-                        .map_err(LeastSquaresSolveError::InvalidInput)?;
+                        .map_err(LeastSquaresSolveError::Matrix)?;
                     for i in 0..j_matrix.rows() {
                         for j in 0..j_matrix.cols() {
                             augmented_j[(i, j)] = j_matrix[(i, j)];
@@ -1457,10 +1483,10 @@ impl NewtonRaphsonSolver {
         gradient: ResidualGradientMeasure,
         last_linear_solve: Option<LinearSolveDiagnostic>,
     ) -> SolverError {
-        // Start with the same values and per-equation trace data as every other
-        // run failure, then attach the already-computed gradient measures so no
-        // second numerical evaluation can disagree with the terminating test.
-        let mut diagnostic = self.build_diagnostic(
+        // Pass the already-computed gradient and linear solve into the common
+        // constructor so no second evaluation or later field mutation can
+        // disagree with the terminating state.
+        let diagnostic = self.build_diagnostic(
             format!(
                 "Residual norm {:.2e} exceeds tolerance {:.2e}, while the normalized residual gradient satisfies stationarity tolerance {:.2e}",
                 residuals.norm(),
@@ -1470,10 +1496,9 @@ impl NewtonRaphsonSolver {
             iterations,
             vars,
             residuals,
+            Some(gradient),
+            last_linear_solve,
         );
-        diagnostic.gradient_norm = Some(gradient.absolute_norm);
-        diagnostic.relative_gradient_norm = gradient.relative_norm;
-        diagnostic.last_linear_solve = last_linear_solve;
         SolverError::StationaryNonRoot(Box::new(diagnostic))
     }
 
@@ -1491,7 +1516,7 @@ impl NewtonRaphsonSolver {
             | SolverError::NoConvergence(diagnostic)
             | SolverError::NonFiniteEvaluation(diagnostic)
             | SolverError::StationaryNonRoot(diagnostic) => Some(diagnostic),
-            SolverError::InvalidInput(_) => None,
+            SolverError::Matrix(_) | SolverError::InvalidInput(_) => None,
         };
         if let Some(diagnostic) = diagnostic {
             diagnostic.last_linear_solve = last_linear_solve;
@@ -1683,17 +1708,25 @@ impl NewtonRaphsonSolver {
             iterations,
             vars,
             residuals,
+            None,
+            None,
         )))
     }
 
     /// Capture a failure message together with the exact variable and
     /// per-equation residual state at which it occurred.
+    ///
+    /// Optional measures and linear provenance must already describe this same
+    /// state. Accepting them here prevents terminal branches from constructing
+    /// a partial diagnostic and forgetting to attach data they computed.
     fn build_diagnostic(
         &self,
         message: String,
         iterations: usize,
         vars: &HashMap<VarId, f64>,
         residuals_matrix: &Matrix,
+        gradient: Option<ResidualGradientMeasure>,
+        last_linear_solve: Option<LinearSolveDiagnostic>,
     ) -> SolverRunDiagnostic {
         // Residual row order matches compiled equation order. Clone optional
         // trace metadata into the owned diagnostic so it remains useful after
@@ -1711,9 +1744,9 @@ impl NewtonRaphsonSolver {
             message,
             iterations,
             error: residuals_matrix.norm(),
-            gradient_norm: None,
-            relative_gradient_norm: None,
-            last_linear_solve: None,
+            gradient_norm: gradient.map(|measure| measure.absolute_norm),
+            relative_gradient_norm: gradient.and_then(|measure| measure.relative_norm),
+            last_linear_solve,
             values: self.values_by_name(vars),
             equations,
         }
@@ -1734,6 +1767,7 @@ impl NewtonRaphsonSolver {
     ///   `(f / ||f||)^T J delta`
     /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
+    /// * `gradient` - Gradient measures at that same current point
     /// * `candidate_residuals` - Reusable storage for each trial point
     ///
     /// # Returns
@@ -1752,6 +1786,7 @@ impl NewtonRaphsonSolver {
             residual_norm_directional_derivative,
             accepted_updates,
             current_residuals,
+            gradient,
             candidate_residuals,
         } = context;
 
@@ -1767,6 +1802,8 @@ impl NewtonRaphsonSolver {
                 accepted_updates,
                 vars,
                 current_residuals,
+                Some(gradient),
+                None,
             );
             return Err(SolverError::NoConvergence(Box::new(diagnostic)));
         }
@@ -1830,6 +1867,8 @@ impl NewtonRaphsonSolver {
             accepted_updates,
             vars,
             current_residuals,
+            Some(gradient),
+            None,
         );
         Err(SolverError::NoConvergence(Box::new(diagnostic)))
     }
@@ -1913,8 +1952,16 @@ mod tests {
             std::mem::discriminant(serial),
             std::mem::discriminant(parallel)
         );
-        if let (SolverError::InvalidInput(a), SolverError::InvalidInput(b)) = (serial, parallel) {
-            assert_eq!(a, b);
+        match (serial, parallel) {
+            // Compare the structured payloads for variants whose data is not a
+            // floating-point run diagnostic covered by their focused tests.
+            (SolverError::Matrix(left), SolverError::Matrix(right)) => {
+                assert_eq!(left, right);
+            }
+            (SolverError::InvalidInput(left), SolverError::InvalidInput(right)) => {
+                assert_eq!(left, right);
+            }
+            _ => {}
         }
     }
 
@@ -1956,6 +2003,31 @@ mod tests {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new_with_variables_and_mode(compiled, variables, mode)
             .expect("failed to select solve variables or set mode")
+    }
+
+    /// Preserve every machine-readable matrix error field across the public
+    /// solver conversion and standard error-source chain.
+    #[test]
+    fn test_solver_error_retains_structured_matrix_cause() {
+        let matrix_error = MatrixError::DimensionMismatch {
+            operation: "test operation",
+            left: (2, 3),
+            right: (4, 5),
+        };
+        let solver_error = SolverError::from(matrix_error.clone());
+
+        // Pattern matching must recover the original variant without parsing
+        // its human-readable Display representation.
+        match &solver_error {
+            SolverError::Matrix(retained) => assert_eq!(retained, &matrix_error),
+            other => panic!("expected structured Matrix error, got {other:?}"),
+        }
+
+        // Generic error-reporting integrations should observe the identical
+        // typed value as the lower-level source.
+        let source = std::error::Error::source(&solver_error)
+            .expect("a structured matrix failure must remain in the error chain");
+        assert_eq!(source.downcast_ref::<MatrixError>(), Some(&matrix_error));
     }
 
     #[test]
@@ -2531,7 +2603,8 @@ mod tests {
         let residuals = Matrix::from_vec(vec![-1.0, -2.0], 2, 1)
             .expect("residual vector shape should be valid");
 
-        let diagnostic = solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals);
+        let diagnostic =
+            solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals, None, None);
 
         assert_eq!(diagnostic.equations.len(), 2);
         assert_eq!(
@@ -2636,6 +2709,8 @@ mod tests {
                     assert_eq!(diagnostic.iterations, 0);
                     assert!(diagnostic.message.contains("after 1 rejected trial steps"));
                     assert_eq!(diagnostic.values["x"], -20.0);
+                    assert!(diagnostic.gradient_norm.is_some());
+                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
@@ -2714,6 +2789,8 @@ mod tests {
                 SolverError::NoConvergence(diagnostic) => {
                     assert!((diagnostic.values["x"] - 0.5).abs() < 1e-12);
                     assert!((diagnostic.error - 0.5).abs() < 1e-12);
+                    assert_eq!(diagnostic.gradient_norm, Some(0.5));
+                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
@@ -2742,6 +2819,8 @@ mod tests {
                 SolverError::NoConvergence(diagnostic) => {
                     assert!((diagnostic.values["x"] - 0.25).abs() < 1e-12);
                     assert!((diagnostic.error - 0.75).abs() < 1e-12);
+                    assert_eq!(diagnostic.gradient_norm, Some(0.75));
+                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
