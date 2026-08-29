@@ -29,12 +29,12 @@ use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 16_384;
 
-/// Relative diagonal threshold used to classify numerical rank after QR.
+/// Relative factor threshold used to classify numerical rank after QR or SVD.
 ///
-/// The threshold is intentionally relative to the largest diagonal magnitude
-/// in `R`. Introducing an absolute floor would make rank depend on the units or
+/// The threshold is intentionally relative to the largest QR diagonal or
+/// singular value. An absolute floor would make rank depend on the units or
 /// scalar normalization chosen by the caller.
-const QR_RANK_RELATIVE_EPSILON: f64 = 1e-12;
+const NUMERICAL_RANK_RELATIVE_EPSILON: f64 = 1e-12;
 
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked linear solve began.
@@ -60,16 +60,16 @@ fn should_parallelize(rows: usize, cols: usize) -> bool {
     rows.saturating_mul(cols) >= PARALLEL_THRESHOLD
 }
 
-/// Convert the relative QR rank threshold into the scale of a particular
-/// triangular factor.
+/// Convert the relative numerical-rank threshold into the scale of a particular
+/// QR diagonal or singular-value spectrum.
 ///
 /// A zero factor produces a zero tolerance and therefore rank zero because all
-/// diagonal comparisons use strict inequality. Non-finite factors are rejected
-/// later by the triangular solve, where a more specific error can be returned.
-fn qr_rank_tolerance(max_diagonal: f64) -> f64 {
-    // Multiplication, rather than `max_diagonal.max(1.0)`, preserves rank under
-    // uniform scaling of the input matrix.
-    QR_RANK_RELATIVE_EPSILON * max_diagonal
+/// comparisons use strict inequality. Non-finite factors are rejected by the
+/// factorization before this helper's result is consumed.
+fn numerical_rank_tolerance(max_factor_value: f64) -> f64 {
+    // Multiplication, rather than `max_factor_value.max(1.0)`, preserves rank
+    // under uniform scaling of the input matrix.
+    NUMERICAL_RANK_RELATIVE_EPSILON * max_factor_value
 }
 
 /// Structured failure returned by all fallible matrix construction and linear
@@ -162,18 +162,42 @@ pub enum MatrixError {
         /// Stable name of the QR operation that detected rank loss.
         operation: &'static str,
     },
+    /// An iterative factorization exhausted its bounded iteration budget before
+    /// reaching the requested numerical orthogonality.
+    FactorizationDidNotConverge {
+        /// Stable name of the iterative factorization.
+        operation: &'static str,
+        /// Number of complete sweeps attempted before returning the error.
+        sweeps: usize,
+    },
 }
 
-/// Numerical diagnostics produced alongside a Householder QR solution.
-#[derive(Debug, Clone, Copy)]
-pub struct LeastSquaresQrInfo {
-    /// Estimated numerical rank of the triangular factor using a threshold
-    /// relative to its largest diagonal element.
+/// Factorization method that produced a checked least-squares solution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeastSquaresMethod {
+    /// Householder QR solved a full-rank rectangular system directly.
+    HouseholderQr,
+    /// One-sided Jacobi SVD produced a pseudoinverse solution after QR detected
+    /// numerical rank loss.
+    JacobiSvd,
+    /// No factorization was required because one matrix dimension was zero.
+    Empty,
+}
+
+/// Numerical diagnostics produced alongside a rectangular least-squares
+/// solution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeastSquaresInfo {
+    /// Estimated numerical rank using a threshold relative to the largest QR
+    /// diagonal or singular value, depending on [`LeastSquaresInfo::method`].
     pub rank: usize,
-    /// Estimated one-norm condition number of the independent triangular
-    /// factor. Infinity indicates rank deficiency, non-finite arithmetic, or a
-    /// condition number larger than the floating-point range.
+    /// Condition estimate of the retained independent subspace. QR reports an
+    /// estimated one-norm condition number; SVD reports the ratio of the largest
+    /// to smallest retained singular value. Infinity means no non-zero singular
+    /// subspace or unavailable finite arithmetic.
     pub cond_est: f64,
+    /// Numerical method that produced the returned solution and diagnostics.
+    pub method: LeastSquaresMethod,
 }
 
 impl fmt::Display for MatrixError {
@@ -232,6 +256,10 @@ impl fmt::Display for MatrixError {
             MatrixError::RankDeficient { operation } => {
                 write!(f, "Matrix is rank deficient during {operation}")
             }
+            MatrixError::FactorizationDidNotConverge { operation, sweeps } => write!(
+                f,
+                "Factorization {operation} did not converge after {sweeps} sweeps"
+            ),
         }
     }
 }
@@ -247,6 +275,22 @@ pub struct Matrix {
     rows: usize,
     /// Number of logical columns represented by `data`.
     cols: usize,
+}
+
+/// Internal one-sided Jacobi SVD representation for a matrix with at least as
+/// many rows as columns.
+///
+/// If the input is `A`, the fields satisfy `A * right_vectors =
+/// orthogonal_columns`. Each non-zero orthogonal column is a left singular
+/// vector scaled by the corresponding singular value. Keeping this compact
+/// representation avoids allocating a separate dense left-singular matrix.
+struct JacobiSvd {
+    /// Rotated columns whose pairwise inner products are numerically zero.
+    orthogonal_columns: Matrix,
+    /// Accumulated orthogonal right-singular-vector matrix.
+    right_vectors: Matrix,
+    /// Euclidean norm of each rotated column.
+    singular_values: Vec<f64>,
 }
 
 impl Matrix {
@@ -500,66 +544,75 @@ impl Matrix {
         Ok(x)
     }
 
-    /// Solve a (possibly non-square) least squares problem using Householder QR.
+    /// Solve a possibly rectangular least-squares problem with automatic
+    /// rank-deficient minimum-norm handling.
     ///
-    /// Solves `min_x ||A x - b||_2`, where `A` is `self`.
-    /// - If `rows >= cols`, returns the standard least-squares solution.
-    /// - If `rows < cols`, returns the minimum-norm solution among all minimizers.
-    pub fn solve_least_squares_qr(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
-        self.solve_least_squares_qr_with_info(b)
+    /// Full-rank systems use Householder QR. If QR detects numerical rank loss,
+    /// a one-sided Jacobi SVD computes the Moore-Penrose pseudoinverse solution.
+    pub fn solve_least_squares(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
+        self.solve_least_squares_with_info(b)
             .map(|(solution, _)| solution)
     }
 
-    /// Solve a possibly rectangular least-squares system while optionally
-    /// parallelizing sufficiently large Householder updates.
-    pub fn solve_least_squares_qr_with_parallel(
+    /// Solve a rectangular least-squares problem while optionally parallelizing
+    /// the full-rank QR fast path.
+    ///
+    /// The SVD fallback currently runs serially because cyclic Jacobi rotations
+    /// update shared column pairs; the public result is identical in both modes.
+    pub fn solve_least_squares_with_parallel(
         &self,
         b: &Matrix,
         parallel: bool,
     ) -> Result<Matrix, MatrixError> {
-        self.solve_least_squares_qr_with_info_with_parallel(b, parallel)
+        self.solve_least_squares_with_info_with_parallel(b, parallel)
             .map(|(solution, _)| solution)
     }
 
-    /// Solve a (possibly non-square) least squares problem using Householder QR,
-    /// returning diagnostic information about rank and conditioning.
-    pub fn solve_least_squares_qr_with_info(
+    /// Solve a rectangular least-squares problem and return rank, conditioning,
+    /// and factorization-method diagnostics.
+    pub fn solve_least_squares_with_info(
         &self,
         b: &Matrix,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
-        self.solve_least_squares_qr_with_info_with_parallel(b, false)
+    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+        self.solve_least_squares_with_info_with_parallel(b, false)
     }
 
-    /// Solve a possibly rectangular least-squares system and return rank and
-    /// condition diagnostics, with optional parallel Householder updates.
-    pub fn solve_least_squares_qr_with_info_with_parallel(
+    /// Solve a rectangular least-squares problem with optional QR parallelism
+    /// and return complete numerical diagnostics.
+    pub fn solve_least_squares_with_info_with_parallel(
         &self,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
+    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+        // Validate the vector shape before either factorization reads it. The
+        // solve API intentionally accepts one right-hand side so its
+        // minimum-norm and diagnostic contract remains unambiguous.
         if b.cols != 1 {
             return Err(MatrixError::DimensionMismatch {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 left: (self.rows, 1),
                 right: (b.rows, b.cols),
             });
         }
         if b.rows != self.rows {
             return Err(MatrixError::DimensionMismatch {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 left: (self.rows, 1),
                 right: (b.rows, b.cols),
             });
         }
+
+        // Reject invalid floating-point inputs before QR or SVD can turn them
+        // into misleading rank or convergence diagnostics.
         if !self.all_finite() {
             return Err(MatrixError::NonFiniteInput {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 operand: MatrixOperand::CoefficientMatrix,
             });
         }
         if !b.all_finite() {
             return Err(MatrixError::NonFiniteInput {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 operand: MatrixOperand::RightHandSide,
             });
         }
@@ -567,31 +620,380 @@ impl Matrix {
         let m = self.rows;
         let n = self.cols;
 
-        // Trivial cases.
-        if n == 0 {
+        // Trivial cases have a unique zero-length or minimum-norm zero solution
+        // and require no numerical factorization.
+        if n == 0 || m == 0 {
             return Ok((
-                Matrix::new(0, 1),
-                LeastSquaresQrInfo {
+                Matrix::new(n, 1),
+                LeastSquaresInfo {
                     rank: 0,
                     cond_est: f64::INFINITY,
+                    method: LeastSquaresMethod::Empty,
                 },
             ));
         }
 
-        let result = if m >= n {
+        let qr_result = if m >= n {
             Self::solve_least_squares_qr_tall_with_info(self, b, parallel)
         } else {
             Self::solve_least_squares_qr_wide_with_info(self, b, parallel)
-        }?;
+        };
+
+        // QR remains the efficient full-rank path. Numerical rank loss is not a
+        // failure of the least-squares problem itself, so route only that case to
+        // the SVD pseudoinverse while preserving unrelated validation and
+        // arithmetic errors unchanged.
+        let full_rank = m.min(n);
+        let result = match qr_result {
+            Ok((solution, info)) if info.rank == full_rank => (solution, info),
+            Ok(_) | Err(MatrixError::RankDeficient { .. }) => {
+                Self::solve_least_squares_svd_with_info(self, b)?
+            }
+            Err(error) => return Err(error),
+        };
 
         // A successful checked solve must never smuggle NaN or infinity through
         // its `Ok` channel, even when finite inputs overflow during substitution.
         if !result.0.all_finite() {
             return Err(MatrixError::NonFiniteResult {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
             });
         }
         Ok(result)
+    }
+
+    /// Compute a Moore-Penrose pseudoinverse solution with a one-sided Jacobi
+    /// singular-value decomposition.
+    ///
+    /// The Jacobi kernel operates on a matrix with at least as many rows as
+    /// columns. Tall inputs are decomposed directly; wide inputs decompose the
+    /// transpose and apply the transposed SVD identities. In both orientations,
+    /// singular directions below the relative rank tolerance are omitted,
+    /// which selects the unique minimum-Euclidean-norm least-squares solution.
+    fn solve_least_squares_svd_with_info(
+        a: &Matrix,
+        b: &Matrix,
+    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+        let rows = a.rows;
+        let cols = a.cols;
+        let tall_orientation = rows >= cols;
+
+        // Decomposing A^T for a wide system keeps the Jacobi kernel compact and
+        // avoids manufacturing zero singular columns merely to make A tall.
+        let factor_input = if tall_orientation {
+            a.clone()
+        } else {
+            a.transpose()
+        };
+        let decomposition = Self::one_sided_jacobi_svd_columns(&factor_input)?;
+
+        // A relative threshold preserves the numerical rank under uniform unit
+        // changes. The strict comparison deliberately classifies an all-zero
+        // factor as rank zero when both the maximum and tolerance are zero.
+        let max_singular_value = decomposition
+            .singular_values
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        let rank_tolerance = numerical_rank_tolerance(max_singular_value);
+        let mut rank = 0usize;
+        let mut min_retained_singular_value = f64::INFINITY;
+        for &singular_value in &decomposition.singular_values {
+            if singular_value > rank_tolerance {
+                rank += 1;
+                min_retained_singular_value =
+                    min_retained_singular_value.min(singular_value);
+            }
+        }
+
+        // Report conditioning only on the retained image of A. Discarded null
+        // directions do not make the pseudoinverse solution itself ambiguous.
+        let cond_est = if rank == 0 {
+            f64::INFINITY
+        } else {
+            max_singular_value / min_retained_singular_value
+        };
+        let mut solution = Matrix::new(cols, 1);
+
+        for component in 0..decomposition.singular_values.len() {
+            let singular_value = decomposition.singular_values[component];
+            if singular_value <= rank_tolerance {
+                // Omitting this singular direction is exactly the pseudoinverse
+                // rule that removes unsupported null-space components.
+                continue;
+            }
+
+            if tall_orientation {
+                // A*V=B=U*Sigma, so this coefficient is
+                // (U_component^T*b)/sigma. Normalizing B before the dot product
+                // prevents squaring a large or tiny singular value explicitly.
+                let projection = Self::compensated_scaled_column_dot(
+                    &decomposition.orthogonal_columns,
+                    component,
+                    singular_value,
+                    b,
+                    "solve_least_squares_svd",
+                )?;
+                let coefficient = projection / singular_value;
+                if !coefficient.is_finite() {
+                    return Err(MatrixError::NonFiniteResult {
+                        operation: "solve_least_squares_svd",
+                    });
+                }
+
+                // V maps each retained singular-coordinate coefficient back to
+                // the original variable space.
+                for row in 0..cols {
+                    let contribution =
+                        decomposition.right_vectors[(row, component)] * coefficient;
+                    solution[(row, 0)] += contribution;
+                    if !solution[(row, 0)].is_finite() {
+                        return Err(MatrixError::NonFiniteResult {
+                            operation: "solve_least_squares_svd",
+                        });
+                    }
+                }
+            } else {
+                // A^T*V=B=U*Sigma implies A=V*Sigma*U^T. Project the right-hand
+                // side onto V, then map the scaled coefficient into U to obtain
+                // the minimum-norm variable vector.
+                let projection = Self::compensated_scaled_column_dot(
+                    &decomposition.right_vectors,
+                    component,
+                    1.0,
+                    b,
+                    "solve_least_squares_svd",
+                )?;
+                let coefficient = projection / singular_value;
+                if !coefficient.is_finite() {
+                    return Err(MatrixError::NonFiniteResult {
+                        operation: "solve_least_squares_svd",
+                    });
+                }
+
+                // A column of B divided by sigma is the corresponding left
+                // singular vector U in the original variable space.
+                for row in 0..cols {
+                    let variable_direction =
+                        decomposition.orthogonal_columns[(row, component)] / singular_value;
+                    let contribution = variable_direction * coefficient;
+                    solution[(row, 0)] += contribution;
+                    if !solution[(row, 0)].is_finite() {
+                        return Err(MatrixError::NonFiniteResult {
+                            operation: "solve_least_squares_svd",
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok((
+            solution,
+            LeastSquaresInfo {
+                rank,
+                cond_est,
+                method: LeastSquaresMethod::JacobiSvd,
+            },
+        ))
+    }
+
+    /// Orthogonalize the columns of a tall-or-square matrix with cyclic Jacobi
+    /// rotations while accumulating its right singular vectors.
+    ///
+    /// Pairwise Gram entries are evaluated after scaling both columns by their
+    /// largest magnitude. That scaling prevents the convergence test and
+    /// rotation angle from overflowing for otherwise finite input matrices.
+    fn one_sided_jacobi_svd_columns(source: &Matrix) -> Result<JacobiSvd, MatrixError> {
+        debug_assert!(source.rows >= source.cols);
+
+        let mut orthogonal_columns = source.clone();
+        let mut right_vectors = Matrix::identity(source.cols);
+        let column_count = source.cols;
+
+        // Cyclic Jacobi converges rapidly for the small dense systems targeted
+        // by this crate. The dimension-aware cap is finite so pathological
+        // arithmetic returns a structured error instead of looping forever.
+        let max_sweeps = 30usize.saturating_add(column_count.saturating_mul(2));
+        let mut converged = false;
+
+        for _sweep in 0..max_sweeps {
+            let mut rotated_any_pair = false;
+
+            for left_column in 0..column_count {
+                for right_column in (left_column + 1)..column_count {
+                    // Find a shared scale for the two columns. A pair of zero
+                    // columns is already orthogonal and requires no rotation.
+                    let mut pair_scale = 0.0_f64;
+                    for row in 0..source.rows {
+                        pair_scale = pair_scale
+                            .max(orthogonal_columns[(row, left_column)].abs())
+                            .max(orthogonal_columns[(row, right_column)].abs());
+                    }
+                    if pair_scale == 0.0 {
+                        continue;
+                    }
+
+                    // Form the two-by-two Gram matrix in scaled coordinates.
+                    // Each summand is bounded, keeping the angle computation
+                    // finite whenever the number of rows is representable.
+                    let mut left_norm_squared = 0.0;
+                    let mut right_norm_squared = 0.0;
+                    let mut cross_product = 0.0;
+                    for row in 0..source.rows {
+                        let left = orthogonal_columns[(row, left_column)] / pair_scale;
+                        let right = orthogonal_columns[(row, right_column)] / pair_scale;
+                        left_norm_squared += left * left;
+                        right_norm_squared += right * right;
+                        cross_product += left * right;
+                    }
+
+                    if !left_norm_squared.is_finite()
+                        || !right_norm_squared.is_finite()
+                        || !cross_product.is_finite()
+                    {
+                        return Err(MatrixError::NonFiniteFactor {
+                            operation: "one_sided_jacobi_svd",
+                        });
+                    }
+
+                    // Skip pairs whose correlation is at floating-point noise
+                    // level. The product is non-negative, so its square root is
+                    // a scale-aware bound for the cross term.
+                    let orthogonality_threshold = 8.0
+                        * f64::EPSILON
+                        * (left_norm_squared * right_norm_squared).sqrt();
+                    if cross_product.abs() <= orthogonality_threshold {
+                        continue;
+                    }
+
+                    // Choose the stable root of the Jacobi tangent equation.
+                    // This form avoids cancellation when the two column norms
+                    // differ substantially and bounds |tangent| by one.
+                    let zeta =
+                        (right_norm_squared - left_norm_squared) / (2.0 * cross_product);
+                    let tangent = if zeta >= 0.0 {
+                        1.0 / (zeta + zeta.hypot(1.0))
+                    } else {
+                        -1.0 / (-zeta + zeta.hypot(1.0))
+                    };
+                    let cosine = 1.0 / (1.0 + tangent * tangent).sqrt();
+                    let sine = cosine * tangent;
+
+                    // Apply the rotation to A's working columns. Saving both old
+                    // entries before either write preserves the exact paired
+                    // transformation at every row.
+                    for row in 0..source.rows {
+                        let old_left = orthogonal_columns[(row, left_column)];
+                        let old_right = orthogonal_columns[(row, right_column)];
+                        orthogonal_columns[(row, left_column)] =
+                            cosine * old_left - sine * old_right;
+                        orthogonal_columns[(row, right_column)] =
+                            sine * old_left + cosine * old_right;
+                    }
+
+                    // Accumulate the same rotation in V so the invariant
+                    // source*V=orthogonal_columns remains true.
+                    for row in 0..column_count {
+                        let old_left = right_vectors[(row, left_column)];
+                        let old_right = right_vectors[(row, right_column)];
+                        right_vectors[(row, left_column)] =
+                            cosine * old_left - sine * old_right;
+                        right_vectors[(row, right_column)] =
+                            sine * old_left + cosine * old_right;
+                    }
+
+                    rotated_any_pair = true;
+                }
+            }
+
+            // A full sweep without a material rotation means every column pair
+            // met the relative orthogonality criterion.
+            if !rotated_any_pair {
+                converged = true;
+                break;
+            }
+        }
+
+        if !converged {
+            return Err(MatrixError::FactorizationDidNotConverge {
+                operation: "one_sided_jacobi_svd",
+                sweeps: max_sweeps,
+            });
+        }
+        if !orthogonal_columns.all_finite() || !right_vectors.all_finite() {
+            return Err(MatrixError::NonFiniteFactor {
+                operation: "one_sided_jacobi_svd",
+            });
+        }
+
+        // Column norms are the singular values after orthogonalization. Repeated
+        // `hypot` calls avoid overflow and underflow in the sum of squares.
+        let mut singular_values = Vec::with_capacity(column_count);
+        for column in 0..column_count {
+            let mut singular_value = 0.0_f64;
+            for row in 0..source.rows {
+                singular_value = singular_value.hypot(orthogonal_columns[(row, column)]);
+            }
+            if !singular_value.is_finite() {
+                return Err(MatrixError::NonFiniteFactor {
+                    operation: "one_sided_jacobi_svd",
+                });
+            }
+            singular_values.push(singular_value);
+        }
+
+        Ok(JacobiSvd {
+            orthogonal_columns,
+            right_vectors,
+            singular_values,
+        })
+    }
+
+    /// Compute a compensated dot product between one normalized matrix column
+    /// and a single-column right-hand side.
+    ///
+    /// `column_scale` is normally the column's singular value, producing a unit
+    /// left singular vector without allocating it. Passing one computes an
+    /// ordinary column dot product for an already normalized orthogonal matrix.
+    fn compensated_scaled_column_dot(
+        left: &Matrix,
+        left_column: usize,
+        column_scale: f64,
+        right: &Matrix,
+        operation: &'static str,
+    ) -> Result<f64, MatrixError> {
+        debug_assert_eq!(left.rows, right.rows);
+        debug_assert_eq!(right.cols, 1);
+        debug_assert!(column_scale > 0.0 && column_scale.is_finite());
+
+        let mut sum = 0.0;
+        let mut correction = 0.0;
+        for row in 0..left.rows {
+            let product = (left[(row, left_column)] / column_scale) * right[(row, 0)];
+            if !product.is_finite() {
+                return Err(MatrixError::NonFiniteResult { operation });
+            }
+
+            // Neumaier compensation retains low-order terms even when the next
+            // product is much larger than the running sum.
+            let next_sum = sum + product;
+            if sum.abs() >= product.abs() {
+                correction += (sum - next_sum) + product;
+            } else {
+                correction += (product - next_sum) + sum;
+            }
+            sum = next_sum;
+            if !sum.is_finite() || !correction.is_finite() {
+                return Err(MatrixError::NonFiniteResult { operation });
+            }
+        }
+
+        let result = sum + correction;
+        if result.is_finite() {
+            Ok(result)
+        } else {
+            Err(MatrixError::NonFiniteResult { operation })
+        }
     }
 
     /// Estimate the one-norm condition number of an upper-triangular leading
@@ -741,11 +1143,16 @@ impl Matrix {
         Some(solution)
     }
 
+    /// Solve a tall or square full-column-rank system by thin Householder QR.
+    ///
+    /// Rank loss is returned to the public dispatcher as an internal structured
+    /// signal so it can retry with SVD. Reflectors are stored below R's diagonal
+    /// in place, minimizing allocation while preserving the upper factor.
     fn solve_least_squares_qr_tall_with_info(
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
+    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
         let m = a.rows;
         let n = a.cols;
 
@@ -762,7 +1169,7 @@ impl Matrix {
 
             if !col_norm.is_finite() {
                 return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
@@ -884,12 +1291,12 @@ impl Matrix {
         // rank classification so overflow is not mislabeled as rank loss.
         if !r.all_finite() {
             return Err(MatrixError::NonFiniteFactor {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
             });
         }
         if !qt_b.all_finite() {
             return Err(MatrixError::NonFiniteResult {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
             });
         }
 
@@ -899,7 +1306,7 @@ impl Matrix {
         }
         // Base numerical rank only on the scale of `R`; an absolute floor here
         // would incorrectly classify small, full-rank systems as rank zero.
-        let tol = qr_rank_tolerance(max_diag);
+        let tol = numerical_rank_tolerance(max_diag);
         let mut rank = 0;
         for i in 0..n {
             let diag = r[(i, i)].abs();
@@ -924,7 +1331,7 @@ impl Matrix {
             let diag = r[(i, i)];
             if !diag.is_finite() {
                 return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
@@ -935,7 +1342,7 @@ impl Matrix {
 
             if diag.abs() <= 1e-12 * row_norm {
                 return Err(MatrixError::RankDeficient {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
@@ -944,18 +1351,24 @@ impl Matrix {
 
         Ok((
             x,
-            LeastSquaresQrInfo {
+            LeastSquaresInfo {
                 rank,
                 cond_est,
+                method: LeastSquaresMethod::HouseholderQr,
             },
         ))
     }
 
+    /// Solve a wide full-row-rank system by Householder QR of its transpose.
+    ///
+    /// Factoring `A^T=Q*R` and solving `R^T*y=b`, followed by `x=Q*y`, produces
+    /// the minimum-norm solution without forming a normal equation. Numerical
+    /// rank loss is delegated to the public dispatcher's SVD fallback.
     fn solve_least_squares_qr_wide_with_info(
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
+    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
         // Use QR on A^T to compute the minimum-norm least squares solution.
         //
         // Let A be m x n with m < n. Compute QR of A^T (n x m):
@@ -976,7 +1389,7 @@ impl Matrix {
 
             if !col_norm.is_finite() {
                 return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
@@ -1068,7 +1481,7 @@ impl Matrix {
         // a rank-deficient matrix during the diagonal threshold checks below.
         if !r.all_finite() {
             return Err(MatrixError::NonFiniteFactor {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
             });
         }
 
@@ -1078,7 +1491,7 @@ impl Matrix {
         }
         // Use the same scale-relative criterion as the tall QR path so wide and
         // tall systems report rank consistently under unit changes.
-        let tol = qr_rank_tolerance(max_diag);
+        let tol = numerical_rank_tolerance(max_diag);
         let mut rank = 0;
         for i in 0..m {
             let diag = r[(i, i)].abs();
@@ -1103,7 +1516,7 @@ impl Matrix {
             let diag = r[(i, i)];
             if !diag.is_finite() {
                 return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
@@ -1114,14 +1527,14 @@ impl Matrix {
 
             if diag.abs() <= 1e-12 * col_norm {
                 return Err(MatrixError::RankDeficient {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
 
             y[i] = sum / diag;
             if !y[i].is_finite() {
                 return Err(MatrixError::NonFiniteResult {
-                    operation: "solve_least_squares_qr",
+                    operation: "solve_least_squares",
                 });
             }
         }
@@ -1169,9 +1582,10 @@ impl Matrix {
         Matrix::from_vec(w, n, 1).map(|solution| {
             (
                 solution,
-                LeastSquaresQrInfo {
+                LeastSquaresInfo {
                     rank,
                     cond_est,
+                    method: LeastSquaresMethod::HouseholderQr,
                 },
             )
         })
@@ -1511,9 +1925,9 @@ mod tests {
             }
         );
         assert_eq!(
-            identity.solve_least_squares_qr(&nan_rhs).unwrap_err(),
+            identity.solve_least_squares(&nan_rhs).unwrap_err(),
             MatrixError::NonFiniteInput {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 operand: MatrixOperand::RightHandSide,
             }
         );
@@ -1530,10 +1944,10 @@ mod tests {
         );
         assert_eq!(
             nan_coefficient
-                .solve_least_squares_qr(&finite_rhs)
+                .solve_least_squares(&finite_rhs)
                 .unwrap_err(),
             MatrixError::NonFiniteInput {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
                 operand: MatrixOperand::CoefficientMatrix,
             }
         );
@@ -1556,10 +1970,10 @@ mod tests {
         );
         assert_eq!(
             tiny_coefficient
-                .solve_least_squares_qr(&huge_rhs)
+                .solve_least_squares(&huge_rhs)
                 .unwrap_err(),
             MatrixError::NonFiniteResult {
-                operation: "solve_least_squares_qr",
+                operation: "solve_least_squares",
             }
         );
     }
@@ -1644,10 +2058,10 @@ mod tests {
         let tall = random_matrix(m, n, &mut rng);
         let tall_b = random_matrix(m, 1, &mut rng);
         let (x_serial, info_serial) =
-            tall.solve_least_squares_qr_with_info_with_parallel(&tall_b, false)
+            tall.solve_least_squares_with_info_with_parallel(&tall_b, false)
                 .unwrap();
         let (x_parallel, info_parallel) =
-            tall.solve_least_squares_qr_with_info_with_parallel(&tall_b, true)
+            tall.solve_least_squares_with_info_with_parallel(&tall_b, true)
                 .unwrap();
         assert_eq!(info_serial.rank, info_parallel.rank);
         assert!(info_serial.cond_est.is_finite());
@@ -1657,10 +2071,10 @@ mod tests {
         let wide = random_matrix(n, m, &mut rng);
         let wide_b = random_matrix(n, 1, &mut rng);
         let (x_serial, info_serial) =
-            wide.solve_least_squares_qr_with_info_with_parallel(&wide_b, false)
+            wide.solve_least_squares_with_info_with_parallel(&wide_b, false)
                 .unwrap();
         let (x_parallel, info_parallel) =
-            wide.solve_least_squares_qr_with_info_with_parallel(&wide_b, true)
+            wide.solve_least_squares_with_info_with_parallel(&wide_b, true)
                 .unwrap();
         assert_eq!(info_serial.rank, info_parallel.rank);
         assert!(info_serial.cond_est.is_finite());
@@ -1754,26 +2168,26 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_overdetermined_exact() {
+    fn test_solve_least_squares_overdetermined_exact() {
         // A is 3x2, consistent system with exact solution x=[1,2].
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
-        let x_serial = a.solve_least_squares_qr_with_parallel(&b, false).unwrap();
-        let x_parallel = a.solve_least_squares_qr_with_parallel(&b, true).unwrap();
+        let x_serial = a.solve_least_squares_with_parallel(&b, false).unwrap();
+        let x_parallel = a.solve_least_squares_with_parallel(&b, true).unwrap();
         assert_matrix_close(&x_serial, &x_parallel, 1e-12);
         assert!((x_serial[(0, 0)] - 1.0).abs() < 1e-12);
         assert!((x_serial[(1, 0)] - 2.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_solve_least_squares_qr_underdetermined_min_norm() {
+    fn test_solve_least_squares_underdetermined_min_norm() {
         // A is 1x2: x0 + x1 = 1. The minimum-norm solution is [0.5, 0.5].
         let a = Matrix::from_vec(vec![1.0, 1.0], 1, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
 
-        let x_serial = a.solve_least_squares_qr_with_parallel(&b, false).unwrap();
-        let x_parallel = a.solve_least_squares_qr_with_parallel(&b, true).unwrap();
+        let x_serial = a.solve_least_squares_with_parallel(&b, false).unwrap();
+        let x_parallel = a.solve_least_squares_with_parallel(&b, true).unwrap();
         assert_matrix_close(&x_serial, &x_parallel, 1e-12);
         assert!((x_serial[(0, 0)] - 0.5).abs() < 1e-12);
         assert!((x_serial[(1, 0)] - 0.5).abs() < 1e-12);
@@ -1782,16 +2196,16 @@ mod tests {
     /// Ensure that uniformly scaling a tall matrix does not change its
     /// numerical rank or condition estimate.
     #[test]
-    fn test_solve_least_squares_qr_tall_rank_is_scale_invariant() {
+    fn test_solve_least_squares_tall_rank_is_scale_invariant() {
         // This matrix is exactly the small-scale case that the former absolute
         // tolerance floor misreported as rank zero.
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
         let tiny_b = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
-        let (tiny_solution, tiny_info) = tiny.solve_least_squares_qr_with_info(&tiny_b).unwrap();
+        let (tiny_solution, tiny_info) = tiny.solve_least_squares_with_info(&tiny_b).unwrap();
 
         let unit = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
         let unit_b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
-        let (_, unit_info) = unit.solve_least_squares_qr_with_info(&unit_b).unwrap();
+        let (_, unit_info) = unit.solve_least_squares_with_info(&unit_b).unwrap();
 
         assert_eq!(tiny_info.rank, 1);
         assert_eq!(tiny_info.rank, unit_info.rank);
@@ -1802,12 +2216,12 @@ mod tests {
     /// Ensure that the transpose-based wide QR path applies the same
     /// scale-relative rank rule as the tall path.
     #[test]
-    fn test_solve_least_squares_qr_wide_rank_is_scale_invariant() {
+    fn test_solve_least_squares_wide_rank_is_scale_invariant() {
         // The equation 1e-15*x0 + 2e-15*x1 = 1e-15 is full row rank and has
         // minimum-norm solution [0.2, 0.4].
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 1, 2).unwrap();
         let tiny_b = Matrix::from_vec(vec![1e-15], 1, 1).unwrap();
-        let (solution, info) = tiny.solve_least_squares_qr_with_info(&tiny_b).unwrap();
+        let (solution, info) = tiny.solve_least_squares_with_info(&tiny_b).unwrap();
 
         assert_eq!(info.rank, 1);
         assert!(info.cond_est.is_finite());
@@ -1816,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_with_info_random_tall_full_rank() {
+    fn test_solve_least_squares_with_info_random_tall_full_rank() {
         let mut rng = TestRng::new(0x5eed_1234_5678_9abc);
         for _ in 0..5 {
             let mut a = random_matrix(6, 3, &mut rng);
@@ -1828,10 +2242,10 @@ mod tests {
             let b = &a * &x_mat;
 
             let (x_serial, info_serial) =
-                a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                a.solve_least_squares_with_info_with_parallel(&b, false)
                     .unwrap();
             let (x_parallel, info_parallel) =
-                a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                a.solve_least_squares_with_info_with_parallel(&b, true)
                     .unwrap();
             assert_eq!(info_serial.rank, 3);
             assert_eq!(info_parallel.rank, 3);
@@ -1863,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_with_info_random_wide_min_norm() {
+    fn test_solve_least_squares_with_info_random_wide_min_norm() {
         let mut rng = TestRng::new(0x1234_5678_9abc_def0);
         let mut a = Matrix::new(2, 4);
         a[(0, 0)] = 1.0;
@@ -1875,10 +2289,10 @@ mod tests {
             let b = Matrix::from_vec(vec![b0, b1], 2, 1).unwrap();
 
             let (x_serial, info_serial) =
-                a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+                a.solve_least_squares_with_info_with_parallel(&b, false)
                     .unwrap();
             let (x_parallel, info_parallel) =
-                a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+                a.solve_least_squares_with_info_with_parallel(&b, true)
                     .unwrap();
             assert_eq!(info_serial.rank, 2);
             assert_eq!(info_parallel.rank, 2);
@@ -1897,7 +2311,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_with_info_detects_ill_conditioning() {
+    fn test_solve_least_squares_with_info_detects_ill_conditioning() {
         let mut a = Matrix::identity(3);
         for i in 0..3 {
             a[(i, 2)] *= 1e-8;
@@ -1905,10 +2319,10 @@ mod tests {
         let b = Matrix::from_vec(vec![0.0, 0.0, 0.0], 3, 1).unwrap();
 
         let (_x_serial, info_serial) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+            a.solve_least_squares_with_info_with_parallel(&b, false)
                 .unwrap();
         let (_x_parallel, info_parallel) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+            a.solve_least_squares_with_info_with_parallel(&b, true)
                 .unwrap();
         assert_eq!(info_serial.rank, 3);
         assert_eq!(info_parallel.rank, 3);
@@ -1919,13 +2333,13 @@ mod tests {
     /// Verify that condition diagnostics account for amplification caused by
     /// off-diagonal entries, not only disparities between diagonal elements.
     #[test]
-    fn test_solve_least_squares_qr_condition_detects_off_diagonal_growth() {
+    fn test_solve_least_squares_condition_detects_off_diagonal_growth() {
         // Both diagonal entries are one, so the former max-diagonal/min-diagonal
         // heuristic reported condition one. The actual one-norm condition of
         // this triangular matrix is approximately 1e16.
         let a = Matrix::from_vec(vec![1.0, 1e8, 0.0, 1.0], 2, 2).unwrap();
         let b = Matrix::from_vec(vec![0.0, 0.0], 2, 1).unwrap();
-        let (_, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+        let (_, info) = a.solve_least_squares_with_info(&b).unwrap();
 
         assert_eq!(info.rank, 2);
         assert!(
@@ -1936,18 +2350,20 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_with_info_tall_full_rank() {
+    fn test_solve_least_squares_with_info_tall_full_rank() {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
 
         let (x_serial, info_serial) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+            a.solve_least_squares_with_info_with_parallel(&b, false)
                 .unwrap();
         let (x_parallel, info_parallel) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+            a.solve_least_squares_with_info_with_parallel(&b, true)
                 .unwrap();
         assert_eq!(info_serial.rank, 2);
         assert_eq!(info_parallel.rank, 2);
+        assert_eq!(info_serial.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(info_parallel.method, LeastSquaresMethod::HouseholderQr);
         assert!(info_serial.cond_est.is_finite());
         assert!(info_parallel.cond_est.is_finite());
         assert_matrix_close(&x_serial, &x_parallel, 1e-12);
@@ -1956,18 +2372,20 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_least_squares_qr_with_info_wide_full_rank() {
+    fn test_solve_least_squares_with_info_wide_full_rank() {
         let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 2, 3).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
         let (x_serial, info_serial) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, false)
+            a.solve_least_squares_with_info_with_parallel(&b, false)
                 .unwrap();
         let (x_parallel, info_parallel) =
-            a.solve_least_squares_qr_with_info_with_parallel(&b, true)
+            a.solve_least_squares_with_info_with_parallel(&b, true)
                 .unwrap();
         assert_eq!(info_serial.rank, 2);
         assert_eq!(info_parallel.rank, 2);
+        assert_eq!(info_serial.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(info_parallel.method, LeastSquaresMethod::HouseholderQr);
         assert!(info_serial.cond_est.is_finite());
         assert!(info_parallel.cond_est.is_finite());
         assert_matrix_close(&x_serial, &x_parallel, 1e-12);
@@ -1976,24 +2394,94 @@ mod tests {
         assert!((x_serial[(2, 0)] - 0.0).abs() < 1e-12);
     }
 
+    /// Verify that a square rank-deficient system returns its unique
+    /// minimum-norm pseudoinverse solution through the SVD fallback.
     #[test]
-    fn test_solve_least_squares_qr_with_info_rank_deficient() {
+    fn test_solve_least_squares_with_info_square_rank_deficient() {
         let a = Matrix::from_vec(vec![1.0, 1.0, 2.0, 2.0], 2, 2).unwrap();
         let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
 
-        let err_serial = a
-            .solve_least_squares_qr_with_info_with_parallel(&b, false)
-            .expect_err("expected rank-deficient QR solve to fail");
-        let err_parallel = a
-            .solve_least_squares_qr_with_info_with_parallel(&b, true)
-            .expect_err("expected rank-deficient QR solve to fail");
-        assert_eq!(
-            err_serial,
-            MatrixError::RankDeficient {
-                operation: "solve_least_squares_qr"
-            }
-        );
-        assert_eq!(err_parallel, err_serial);
+        // Both parallel flags share the serial Jacobi fallback and must expose
+        // identical numerical and method diagnostics.
+        let (serial_solution, serial_info) = a
+            .solve_least_squares_with_info_with_parallel(&b, false)
+            .unwrap();
+        let (parallel_solution, parallel_info) = a
+            .solve_least_squares_with_info_with_parallel(&b, true)
+            .unwrap();
+
+        assert_matrix_close(&serial_solution, &parallel_solution, 1e-12);
+        assert!((serial_solution[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!((serial_solution[(1, 0)] - 0.5).abs() < 1e-12);
+        assert_eq!(serial_info.rank, 1);
+        assert_eq!(serial_info.method, LeastSquaresMethod::JacobiSvd);
+        assert_eq!(parallel_info, serial_info);
+        assert!((serial_info.cond_est - 1.0).abs() < 1e-12);
+    }
+
+    /// Ensure SVD rank classification and its pseudoinverse solution remain
+    /// invariant across very small and very large finite unit scales.
+    #[test]
+    fn test_solve_least_squares_rank_deficient_scale_invariance() {
+        for scale in [1e-200_f64, 1.0, 1e200] {
+            let a = Matrix::from_vec(
+                vec![scale, scale, 2.0 * scale, 2.0 * scale],
+                2,
+                2,
+            )
+            .unwrap();
+            let b = Matrix::from_vec(vec![scale, 2.0 * scale], 2, 1).unwrap();
+
+            let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+
+            // Uniformly scaling both operands leaves the Moore-Penrose answer
+            // unchanged, including at magnitudes where naïve squared norms
+            // would underflow or overflow.
+            assert!((solution[(0, 0)] - 0.5).abs() < 1e-12);
+            assert!((solution[(1, 0)] - 0.5).abs() < 1e-12);
+            assert_eq!(info.rank, 1);
+            assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
+            assert!((info.cond_est - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// Verify that SVD minimizes residual norm for an inconsistent tall system
+    /// and then selects the minimum-norm point among its minimizers.
+    #[test]
+    fn test_solve_least_squares_tall_rank_deficient_inconsistent() {
+        let a = Matrix::from_vec(vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
+        let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
+
+        let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+
+        // The best fitted shared row value is mean(b)=2. Splitting that value
+        // equally across duplicate columns minimizes the variable norm.
+        assert!((solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((solution[(1, 0)] - 1.0).abs() < 1e-12);
+        assert_eq!(info.rank, 1);
+        assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
+        let residual = &(&a * &solution) - &b;
+        assert!((residual.norm() - 2.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// Verify the transpose-oriented Jacobi SVD for a wide matrix whose rows
+    /// are themselves linearly dependent.
+    #[test]
+    fn test_solve_least_squares_wide_rank_deficient_minimum_norm() {
+        let a = Matrix::from_vec(vec![1.0, 0.0, 1.0, 2.0, 0.0, 2.0], 2, 3).unwrap();
+        let b = Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap();
+
+        let (solution, info) = a.solve_least_squares_with_info(&b).unwrap();
+
+        // The constrained sum x0+x2=1 is divided equally; the unconstrained x1
+        // component is zero in the Moore-Penrose solution.
+        assert!((solution[(0, 0)] - 0.5).abs() < 1e-12);
+        assert!(solution[(1, 0)].abs() < 1e-12);
+        assert!((solution[(2, 0)] - 0.5).abs() < 1e-12);
+        assert_eq!(info.rank, 1);
+        assert_eq!(info.method, LeastSquaresMethod::JacobiSvd);
+        let reconstructed = &a * &solution;
+        assert!((&reconstructed - &b).norm() < 1e-12);
     }
 
     /// Verify that fallible construction reports both ordinary length mismatch

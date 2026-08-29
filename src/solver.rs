@@ -24,7 +24,7 @@ SOFTWARE.
 
 use crate::compiler::{CompiledExp, CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
-use crate::matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
+use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
 use crate::mode::{build_thread_pool, Mode};
 use rayon::ThreadPool;
 use std::collections::HashMap;
@@ -111,19 +111,19 @@ impl LeastSquaresWorkspace {
 }
 
 /// Internal distinction between invalid linear-algebra inputs and exhaustion of
-/// both the direct and regularized QR paths.
+/// both the direct and regularized least-squares paths.
 enum LeastSquaresSolveError {
     /// A shape or matrix-operation precondition failed before a numerical solve
     /// could be attempted.
     InvalidInput(MatrixError),
-    /// Neither unregularized QR nor any configured augmented QR attempt
+    /// Neither the unregularized solve nor any configured augmented attempt
     /// produced an acceptable solution.
     Singular {
-        /// Explanation from the direct, unregularized QR path or its condition
+        /// Explanation from the direct, unregularized path or its condition
         /// diagnostics.
-        unregularized_qr_error: String,
-        /// Explanation from the augmented regularized QR fallback.
-        regularized_qr_error: String,
+        unregularized_error: String,
+        /// Explanation from the augmented regularized fallback.
+        regularized_error: String,
     },
 }
 
@@ -647,12 +647,12 @@ impl NewtonRaphsonSolver {
                         return Err(SolverError::InvalidInput(err.to_string()));
                     }
                     Err(LeastSquaresSolveError::Singular {
-                        unregularized_qr_error,
-                        regularized_qr_error,
+                        unregularized_error,
+                        regularized_error,
                     }) => {
                         let diagnostic = self.build_diagnostic(
                             format!(
-                                "Could not project the current point out of the Jacobian null space (unregularized_qr_error: {unregularized_qr_error}; regularized_qr_error: {regularized_qr_error})"
+                                "Could not project the current point out of the Jacobian null space (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
                             ),
                             iter,
                             &vars,
@@ -841,12 +841,12 @@ impl NewtonRaphsonSolver {
                             return Err(SolverError::InvalidInput(err.to_string()));
                         }
                         Err(LeastSquaresSolveError::Singular {
-                            unregularized_qr_error,
-                            regularized_qr_error,
+                            unregularized_error,
+                            regularized_error,
                         }) => {
                             let diag = self.build_diagnostic(
                                 format!(
-                                    "Least squares system is singular (unregularized_qr_error: {unregularized_qr_error}; regularized_qr_error: {regularized_qr_error})"
+                                    "Least squares system is singular (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
                                 ),
                                 iter,
                                 &vars,
@@ -1138,8 +1138,8 @@ impl NewtonRaphsonSolver {
     }
 
     /// Solve a possibly rectangular linear system against one right-hand side,
-    /// applying adaptive regularization when QR diagnostics indicate numerical
-    /// rank loss or excessive conditioning.
+    /// applying adaptive regularization when factorization diagnostics indicate
+    /// excessive conditioning.
     ///
     /// The returned vector is intentionally named generically: callers use this
     /// routine for both Newton corrections and projected next-point values.
@@ -1151,24 +1151,25 @@ impl NewtonRaphsonSolver {
         parallel: bool,
     ) -> Result<Matrix, LeastSquaresSolveError> {
         let mut workspace = workspace;
-        // Prefer QR-based least squares to avoid forming normal equations
-        // (J^T J), which can severely amplify conditioning issues. If the QR
-        // solve is rank deficient or ill-conditioned, fall back to the generic
+        // Prefer direct least squares to avoid forming normal equations (J^T J),
+        // which can severely amplify conditioning issues. Full-rank systems use
+        // QR, while rank-deficient systems use an SVD pseudoinverse. If the
+        // retained singular subspace is still ill-conditioned, fall back to the
         // regularized augmented system [J; sqrt(lambda) I] * x ~= [rhs; 0].
         const COND_LIMIT: f64 = 1e12;
 
-        let full_rank = j_matrix.rows().min(j_matrix.cols());
-        let is_ill_conditioned = |info: &LeastSquaresQrInfo| -> bool {
-            info.rank < full_rank
-                || !info.cond_est.is_finite()
-                || info.cond_est > COND_LIMIT
+        // Numerical rank loss alone is valid for a Moore-Penrose solve. The SVD
+        // condition estimate describes only its retained image, so finite,
+        // well-conditioned rank-deficient systems need no artificial damping.
+        let is_ill_conditioned = |info: &LeastSquaresInfo| -> bool {
+            !info.cond_est.is_finite() || info.cond_est > COND_LIMIT
         };
 
-        let mut unregularized_qr_error: Option<String> = None;
+        let mut unregularized_error: Option<String> = None;
         let mut unreg_delta: Option<Matrix> = None;
-        let mut unreg_info: Option<LeastSquaresQrInfo> = None;
+        let mut unreg_info: Option<LeastSquaresInfo> = None;
 
-        match j_matrix.solve_least_squares_qr_with_info_with_parallel(rhs, parallel) {
+        match j_matrix.solve_least_squares_with_info_with_parallel(rhs, parallel) {
             Ok((delta, info)) => {
                 if !is_ill_conditioned(&info) {
                     return Ok(delta);
@@ -1177,7 +1178,7 @@ impl NewtonRaphsonSolver {
                 unreg_info = Some(info);
             }
             Err(err) => {
-                unregularized_qr_error = Some(err.to_string());
+                unregularized_error = Some(err.to_string());
             }
         }
 
@@ -1186,9 +1187,9 @@ impl NewtonRaphsonSolver {
                 return Ok(delta);
             }
             return Err(LeastSquaresSolveError::Singular {
-                unregularized_qr_error: unregularized_qr_error
-                    .unwrap_or_else(|| "QR least squares failed".to_string()),
-                regularized_qr_error: "Regularization disabled".to_string(),
+                unregularized_error: unregularized_error
+                    .unwrap_or_else(|| "Unregularized least squares failed".to_string()),
+                regularized_error: "Regularization disabled".to_string(),
             });
         }
 
@@ -1233,7 +1234,7 @@ impl NewtonRaphsonSolver {
 
                     workspace
                         .augmented_j
-                        .solve_least_squares_qr_with_info_with_parallel(
+                        .solve_least_squares_with_info_with_parallel(
                             &workspace.augmented_b,
                             parallel,
                         )
@@ -1265,7 +1266,7 @@ impl NewtonRaphsonSolver {
                         augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
                         augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
                     }
-                    augmented_j.solve_least_squares_qr_with_info_with_parallel(
+                    augmented_j.solve_least_squares_with_info_with_parallel(
                         &augmented_b,
                         parallel,
                     )
@@ -1290,14 +1291,14 @@ impl NewtonRaphsonSolver {
         }
 
         Err(LeastSquaresSolveError::Singular {
-            unregularized_qr_error: unregularized_qr_error
+            unregularized_error: unregularized_error
                 .or_else(|| {
                     unreg_info
-                        .map(|info| format!("QR ill-conditioned (rank {}, cond {:.2e})", info.rank, info.cond_est))
+                        .map(|info| format!("Least squares ill-conditioned (rank {}, cond {:.2e})", info.rank, info.cond_est))
                 })
-                .unwrap_or_else(|| "QR least squares failed".to_string()),
-            regularized_qr_error: last_err
-                .unwrap_or_else(|| "Regularized QR failed".to_string()),
+                .unwrap_or_else(|| "Unregularized least squares failed".to_string()),
+            regularized_error: last_err
+                .unwrap_or_else(|| "Regularized least squares failed".to_string()),
         })
     }
 
@@ -2660,8 +2661,10 @@ mod tests {
         }
     }
 
+    /// Confirm that default solver settings accept a well-conditioned retained
+    /// SVD subspace instead of damping merely because a variable is unused.
     #[test]
-    fn test_rank_deficient_overconstrained_recovers_with_regularization() {
+    fn test_rank_deficient_overconstrained_converges_with_default_settings() {
         let mut serial_solution: Option<Solution> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
@@ -2701,11 +2704,15 @@ mod tests {
         }
     }
 
+    /// Confirm that a rank-deficient Jacobian is directly solvable without
+    /// regularization when its Moore-Penrose correction is well conditioned.
     #[test]
-    fn test_rank_deficient_overconstrained_fails_without_regularization() {
-        let mut serial_error: Option<SolverError> = None;
+    fn test_rank_deficient_overconstrained_converges_without_regularization() {
+        let mut serial_solution: Option<Solution> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
+            // Every equation constrains x while multiplication by zero keeps y
+            // present in the compiled variable table but absent from J's image.
             let x = Exp::var("x");
             let y = Exp::var("y");
             let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
@@ -2729,21 +2736,18 @@ mod tests {
             initial.insert("x".to_string(), 0.0);
             initial.insert("y".to_string(), 0.0);
 
-            let err = solver.solve(initial).expect_err("expected singular matrix error");
+            let solution = solver
+                .solve(initial)
+                .expect("the SVD pseudoinverse should solve without damping");
             if is_serial {
-                serial_error = Some(err.clone());
+                serial_solution = Some(solution.clone());
             } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
             }
-            match err {
-                SolverError::SingularMatrix(diagnostic) => {
-                    // QR failed before any candidate values were applied. The
-                    // diagnostic therefore represents zero accepted updates.
-                    assert_eq!(diagnostic.iterations, 0);
-                }
-                other => panic!("expected singular matrix error, got {other:?}"),
-            }
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert!((solution.values["x"] - 1.0).abs() < 1e-10);
+            assert!(solution.values["y"].abs() < 1e-10);
         }
     }
 
