@@ -61,12 +61,13 @@ struct LineSearchContext<'a> {
     delta: &'a Matrix,
     /// Residual norm at the current accepted point.
     current_residual_norm: f64,
-    /// Directional derivative of `0.5 * ||f||^2` along `delta`.
+    /// Directional derivative of `||f||_2` along `delta`.
     ///
-    /// For residual vector `f`, Jacobian `J`, and candidate direction `p`, this
-    /// value is `f^T J p`. A negative value proves that sufficiently small
-    /// positive steps descend the least-squares objective.
-    objective_directional_derivative: f64,
+    /// For non-zero residual vector `f`, Jacobian `J`, and candidate direction
+    /// `p`, this value is `(f / ||f||_2)^T J p`. Computing this normalized form
+    /// directly avoids overflowing the equivalent expression
+    /// `(f^T J p) / ||f||_2` before the division can reduce its scale.
+    residual_norm_directional_derivative: f64,
     /// Number of Newton updates accepted before this line search began.
     ///
     /// Keeping this as an accepted-update count, rather than a one-based attempt
@@ -759,7 +760,6 @@ impl NewtonRaphsonSolver {
                 let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
-                    parallel,
                     &vars,
                     iter,
                 )?;
@@ -782,7 +782,6 @@ impl NewtonRaphsonSolver {
                 let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
-                    parallel,
                     &vars,
                     iter,
                 )?;
@@ -903,20 +902,21 @@ impl NewtonRaphsonSolver {
                 // demonstrated sufficient residual reduction. Passing the
                 // current residuals lets an exhausted search report the state
                 // at which it failed rather than the final rejected candidate.
-                let objective_directional_derivative = self.least_squares_directional_derivative(
-                    jacobian_workspace.jacobian(),
-                    &f_vals,
-                    &delta,
-                    parallel,
-                    &vars,
-                    iter,
-                )?;
+                let residual_norm_directional_derivative = self
+                    .residual_norm_directional_derivative(
+                        jacobian_workspace.jacobian(),
+                        &f_vals,
+                        &delta,
+                        parallel,
+                        &vars,
+                        iter,
+                    )?;
                 self.line_search(LineSearchContext {
                     jacobian,
                     vars: &vars,
                     delta: &delta,
                     current_residual_norm: error,
-                    objective_directional_derivative,
+                    residual_norm_directional_derivative,
                     accepted_updates: iter,
                     current_residuals: &f_vals,
                     candidate_residuals: &mut line_search_f_vals,
@@ -961,7 +961,6 @@ impl NewtonRaphsonSolver {
                 let gradient = self.residual_gradient_measure(
                     jacobian_workspace.jacobian(),
                     &f_vals,
-                    parallel,
                     &vars,
                     iter + 1,
                 )?;
@@ -1001,7 +1000,6 @@ impl NewtonRaphsonSolver {
             let gradient = self.residual_gradient_measure(
                 jacobian_workspace.jacobian(),
                 &residuals,
-                parallel,
                 &vars,
                 self.max_iterations,
             )?;
@@ -1023,7 +1021,6 @@ impl NewtonRaphsonSolver {
             let gradient = self.residual_gradient_measure(
                 jacobian_workspace.jacobian(),
                 &residuals,
-                parallel,
                 &vars,
                 self.max_iterations,
             )?;
@@ -1529,39 +1526,16 @@ impl NewtonRaphsonSolver {
         &self,
         jacobian: &Matrix,
         residuals: &Matrix,
-        parallel: bool,
         vars: &HashMap<VarId, f64>,
         iterations: usize,
     ) -> Result<ResidualGradientMeasure, SolverError> {
-        // Form J^T using the same execution policy as the surrounding solve,
-        // then multiply it by the current residual column vector.
-        let jacobian_transpose = jacobian.transpose_with_parallel(parallel);
-        let gradient = jacobian_transpose.try_mul_with_parallel(residuals, parallel)?;
-        if !gradient.all_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Residual-gradient evaluation produced NaN or infinity",
-                iterations,
-                vars,
-                residuals,
-            ));
-        }
-        let absolute_norm = gradient.norm();
-        if !absolute_norm.is_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Residual-gradient norm produced infinity",
-                iterations,
-                vars,
-                residuals,
-            ));
-        }
-
-        // Normalize individual entries before forming dot products. Computing
-        // `absolute_norm / (||J|| * ||f||)` after the raw multiplication would
-        // still permit intermediate overflow and underflow to corrupt the
-        // scale-independent convergence test.
+        // Normalize individual entries before forming any dot products.
+        // Computing raw `J^T f` first can overflow even when opposing equation
+        // contributions cancel to a small, perfectly representable normalized
+        // gradient.
         let jacobian_norm = jacobian.norm();
         let residual_norm = residuals.norm();
-        let relative_norm = if jacobian_norm > 0.0
+        let (absolute_norm, relative_norm) = if jacobian_norm > 0.0
             && jacobian_norm.is_finite()
             && residual_norm > 0.0
             && residual_norm.is_finite()
@@ -1598,12 +1572,17 @@ impl NewtonRaphsonSolver {
                     residuals,
                 ));
             }
-            Some(norm)
+            // Recover the raw diagnostic norm only after the normalized
+            // decision quantity is known. An infinite result here means the
+            // mathematical raw magnitude exceeds `f64`; it does not invalidate
+            // the finite scale-independent stationarity measure.
+            let absolute_norm = (norm * jacobian_norm) * residual_norm;
+            (absolute_norm, Some(norm))
         } else {
             // A root has already terminated before this helper is used for
             // stationarity. For a non-root, a zero Jacobian supplies no evidence
             // that the current point is a least-squares minimum.
-            None
+            (0.0, None)
         };
 
         Ok(ResidualGradientMeasure {
@@ -1612,14 +1591,14 @@ impl NewtonRaphsonSolver {
         })
     }
 
-    /// Compute the directional derivative of the nonlinear least-squares
-    /// objective `0.5 * ||f||^2` along a proposed solver direction.
+    /// Compute the directional derivative of the residual norm along a proposed
+    /// solver direction.
     ///
-    /// The derivative is `f^T J p`, where `p` is the Newton or Gauss-Newton
-    /// correction. Keeping this calculation in one checked helper ensures the
-    /// line search never applies an Armijo test to a non-finite or mismatched
-    /// numerical state.
-    fn least_squares_directional_derivative(
+    /// Away from a root the derivative is `(f / ||f||_2)^T J p`, where `p` is
+    /// the Newton or Gauss-Newton correction. Normalizing `f` before the dot
+    /// product prevents large finite residuals and velocities from overflowing
+    /// the mathematically equivalent `f^T J p / ||f||_2` expression.
+    fn residual_norm_directional_derivative(
         &self,
         jacobian: &Matrix,
         residuals: &Matrix,
@@ -1641,16 +1620,30 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // Accumulate the dot product with Neumaier compensation. Compensation
-        // reduces cancellation error when signed residual contributions differ
-        // greatly in magnitude, which is common near a least-squares optimum.
+        // The caller invokes line search only for non-roots, so a positive
+        // finite norm must exist. Rejecting an unexpected zero or non-finite
+        // norm here keeps this private helper safe if future call sites change.
+        let residual_norm = residuals.norm();
+        if !residual_norm.is_finite() || residual_norm <= 0.0 {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search residual norm was zero or non-finite",
+                accepted_updates,
+                vars,
+                residuals,
+            ));
+        }
+
+        // Accumulate the normalized dot product with Neumaier compensation.
+        // Dividing each residual first keeps every product representable in
+        // cases where the old raw residual-times-velocity product overflowed.
         let mut sum = 0.0;
         let mut compensation = 0.0;
         for row in 0..residuals.rows() {
-            let product = residuals[(row, 0)] * residual_velocity[(row, 0)];
+            let normalized_residual = residuals[(row, 0)] / residual_norm;
+            let product = normalized_residual * residual_velocity[(row, 0)];
             if !product.is_finite() {
                 return Err(self.non_finite_evaluation_error(
-                    "Line-search directional derivative overflowed",
+                    "Line-search residual-norm slope overflowed",
                     accepted_updates,
                     vars,
                     residuals,
@@ -1666,16 +1659,16 @@ impl NewtonRaphsonSolver {
             sum = next;
         }
 
-        let derivative = sum + compensation;
-        if !derivative.is_finite() {
+        let residual_norm_derivative = sum + compensation;
+        if !residual_norm_derivative.is_finite() {
             return Err(self.non_finite_evaluation_error(
-                "Line-search directional derivative accumulation overflowed",
+                "Line-search residual-norm slope accumulation overflowed",
                 accepted_updates,
                 vars,
                 residuals,
             ));
         }
-        Ok(derivative)
+        Ok(residual_norm_derivative)
     }
 
     /// Build the dedicated error variant for non-finite numerical states while
@@ -1730,18 +1723,17 @@ impl NewtonRaphsonSolver {
 
     /// Backtrack until a trial step satisfies sufficient decrease in `||f||`.
     ///
-    /// The Armijo slope for the residual-norm merit function is obtained by
-    /// dividing the supplied squared-residual objective slope `f^T J delta` by
-    /// the current non-zero residual norm. Testing `||f||` directly avoids
-    /// overflowing merely because a large finite norm was squared.
+    /// The Armijo slope is supplied directly for the residual-norm merit
+    /// function. Testing `||f||` directly avoids overflow from squaring a large
+    /// but finite norm or forming the unnormalized product `f^T J delta`.
     ///
     /// # Context fields
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
     /// * `current_residual_norm` - Current function error `||f(x)||`
-    /// * `objective_directional_derivative` - Value of `f^T J delta`, converted
-    ///   internally to the residual-norm slope `(f^T J delta) / ||f||`
+    /// * `residual_norm_directional_derivative` - Scale-safe value of
+    ///   `(f / ||f||)^T J delta`
     /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
     /// * `candidate_residuals` - Reusable storage for each trial point
@@ -1759,7 +1751,7 @@ impl NewtonRaphsonSolver {
             vars,
             delta,
             current_residual_norm,
-            objective_directional_derivative,
+            residual_norm_directional_derivative,
             accepted_updates,
             current_residuals,
             candidate_residuals,
@@ -1779,10 +1771,10 @@ impl NewtonRaphsonSolver {
         // descent direction for the least-squares objective. Backtracking cannot
         // repair such a direction, so preserve the current state and explain the
         // numerical cause without evaluating misleading trial points.
-        if objective_directional_derivative >= 0.0 {
+        if residual_norm_directional_derivative >= 0.0 {
             let diagnostic = self.build_diagnostic(
                 format!(
-                    "Line search cannot proceed because the proposed correction is not a descent direction (f^T J delta = {objective_directional_derivative:.2e})"
+                    "Line search cannot proceed because the proposed correction is not a descent direction (d||f||/d alpha = {residual_norm_directional_derivative:.2e})"
                 ),
                 accepted_updates,
                 vars,
@@ -1791,11 +1783,8 @@ impl NewtonRaphsonSolver {
             return Err(SolverError::NoConvergence(diagnostic));
         }
 
-        // Applying Armijo to the residual norm avoids squaring very large but
-        // finite norms. The derivative of `||f||` is `(f^T J p) / ||f||` away
-        // from a root; roots have already terminated before line search begins.
-        let residual_norm_directional_derivative =
-            objective_directional_derivative / current_residual_norm;
+        // Roots terminate before line search begins, and the helper has already
+        // verified that the supplied residual-norm slope is finite.
         if !residual_norm_directional_derivative.is_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Line-search residual-norm slope produced NaN or infinity",
@@ -2428,6 +2417,30 @@ mod tests {
         }
     }
 
+    /// Ensure Armijo line search normalizes the residual before forming its
+    /// directional derivative.
+    #[test]
+    fn test_line_search_avoids_raw_directional_derivative_overflow() {
+        for mode in test_modes() {
+            // The raw objective derivative at x=0 is -1e400, but the derivative
+            // of the residual norm is the representable value -1e200. The full
+            // Newton step reaches the exact root and must not fail merely because
+            // the unused squared-residual objective has an unrepresentable slope.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::mul(Exp::val(1e200), x), Exp::val(1e200));
+            let solver = solver_for_mode(vec![equation], mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("scale-safe residual-norm slope should permit the Newton step");
+
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert_eq!(solution.values["x"], 1.0);
+            assert_eq!(solution.error, 0.0);
+        }
+    }
+
     /// Verify that exhaustion preserves the current state and reports failure
     /// instead of applying an untested minimum-damping fallback.
     #[test]
@@ -2601,6 +2614,35 @@ mod tests {
                     .relative_gradient_norm
                     .is_some_and(|norm| norm < 1e-10)
             );
+        }
+    }
+
+    /// Ensure normalized stationarity remains observable when the raw gradient
+    /// products exceed the finite `f64` range before cancellation.
+    #[test]
+    fn test_scaled_stationary_system_avoids_raw_gradient_overflow() {
+        for mode in test_modes() {
+            // At x=0 the two residual-gradient contributions are -1e400 and
+            // +1e400. Their normalized equivalents are exactly -0.5 and +0.5,
+            // so the finite cancellation must be evaluated before reconstructing
+            // the raw diagnostic magnitude.
+            let x = Exp::var("x");
+            let scaled_x = Exp::mul(Exp::val(1e200), x);
+            let equations = vec![
+                Exp::sub(scaled_x.clone(), Exp::val(1e200)),
+                Exp::add(scaled_x, Exp::val(1e200)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("normalized stationarity should survive raw-product overflow");
+
+            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
+            assert_eq!(solution.gradient_norm, 0.0);
+            assert_eq!(solution.relative_gradient_norm, Some(0.0));
+            assert!((solution.error / 1e200 - 2.0_f64.sqrt()).abs() < 1e-12);
         }
     }
 
