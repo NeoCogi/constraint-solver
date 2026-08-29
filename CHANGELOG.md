@@ -35,7 +35,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   parallel mode.
 - Made the Criterion benchmark an explicit `benchmarks` feature so ordinary
   all-target test runs never execute performance measurements.
-- Declared Rust 1.85 as the minimum supported toolchain for Edition 2024.
+- Declared Rust 1.86 as the minimum supported toolchain for Edition 2024 and
+  the locked development dependency graph.
 
 ### Fixed
 

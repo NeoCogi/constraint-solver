@@ -12,6 +12,33 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Minimum supported Rust 1.86
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the same locked dependency graph consumed by the release
+      # validation job below.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Pin this job to the manifest's declared minimum so an accidental use of
+      # a newer language or standard-library feature fails independently of the
+      # moving stable toolchain.
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
+
+      # Cache entries are keyed by toolchain, so MSRV artifacts cannot mask or
+      # overwrite results produced by the stable validation job.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Compile and run every ordinary target against the locked dependency
+      # versions. The Criterion executable remains excluded by its required
+      # opt-in feature, matching the stable correctness suite.
+      - name: Test all targets at the MSRV
+        run: cargo test --locked --all-targets
+
   validate:
     name: Format, lint, test, and package
     runs-on: ubuntu-latest
