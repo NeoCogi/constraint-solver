@@ -70,3 +70,13 @@ pub use solver::{
     ConvergenceReason, EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution,
     SolverError, SolverRunDiagnostic, UnderdeterminedPolicy,
 };
+
+/// Documentation-only container that makes every Rust block in the repository
+/// README part of `cargo test --doc`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {
+    // The included Markdown supplies this module's doctests. Keeping the module
+    // empty avoids shipping duplicate documentation or executable code in
+    // ordinary library builds.
+}
