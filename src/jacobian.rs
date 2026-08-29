@@ -44,21 +44,25 @@ pub struct Jacobian {
 }
 
 pub(crate) struct JacobianWorkspace {
+    /// Dense derivative values reused across successive solver iterations.
     jacobian: Matrix,
 }
 
 impl JacobianWorkspace {
+    /// Allocate a zero-filled workspace with the derivative matrix's expected
+    /// equation-by-variable shape.
     pub(crate) fn new(num_equations: usize, num_variables: usize) -> Self {
+        // Constructing the correct shape once lets ordinary evaluations replace
+        // only element values rather than reallocating the matrix buffer.
         Self {
             jacobian: Matrix::new(num_equations, num_variables),
         }
     }
 
-    pub(crate) fn replace_jacobian(&mut self, jacobian: Matrix) {
-        self.jacobian = jacobian;
-    }
-
+    /// Borrow the reusable derivative matrix for checked numerical solves.
     pub(crate) fn jacobian(&mut self) -> &mut Matrix {
+        // The workspace retains ownership so the same allocation remains
+        // available after the caller's temporary mutable borrow ends.
         &mut self.jacobian
     }
 }
@@ -98,18 +102,7 @@ impl Jacobian {
         JacobianWorkspace::new(self.expressions.len(), self.variables.len())
     }
 
-    pub(crate) fn evaluate_checked(
-        &self,
-        vars: &HashMap<VarId, f64>,
-    ) -> Result<Matrix, EvaluationError> {
-        let rows = self.expressions.len();
-        let cols = self.variables.len();
-        let mut result = Matrix::new(rows, cols);
-        self.evaluate_checked_into(vars, &mut result)?;
-
-        Ok(result)
-    }
-
+    /// Evaluate every symbolic derivative into caller-owned reusable storage.
     pub(crate) fn evaluate_checked_in_workspace<'a>(
         &self,
         vars: &HashMap<VarId, f64>,
@@ -242,7 +235,10 @@ mod tests {
         vars.insert(x_id, 0.5); // x = 0.5
         vars.insert(y_id, 0.5); // y = 0.5
 
-        let j_matrix = jacobian.evaluate_checked(&vars).expect("jacobian evaluate failed");
+        let mut workspace = jacobian.workspace();
+        let j_matrix = jacobian
+            .evaluate_checked_in_workspace(&vars, &mut workspace)
+            .expect("jacobian evaluate failed");
         assert_eq!(j_matrix.rows(), 2);
         assert_eq!(j_matrix.cols(), 2);
 
@@ -285,7 +281,10 @@ mod tests {
         vars.insert(x_id, 0.0); // x = 0
         vars.insert(y_id, 0.0); // y = 0
 
-        let j_matrix = jacobian.evaluate_checked(&vars).expect("jacobian evaluate failed");
+        let mut workspace = jacobian.workspace();
+        let j_matrix = jacobian
+            .evaluate_checked_in_workspace(&vars, &mut workspace)
+            .expect("jacobian evaluate failed");
 
         // Expected values at (0, 0):
         // df1/dx = cos(0) = 1.0
@@ -305,22 +304,8 @@ mod tests {
         assert_eq!(workspace.jacobian.cols(), 3);
     }
 
-    #[test]
-    fn test_workspace_replace_jacobian() {
-        let mut workspace = JacobianWorkspace::new(2, 2);
-        let mut matrix = Matrix::new(2, 2);
-        matrix[(0, 0)] = 1.0;
-        matrix[(0, 1)] = 2.0;
-        matrix[(1, 0)] = -3.0;
-        matrix[(1, 1)] = 4.5;
-        workspace.replace_jacobian(matrix);
-
-        assert!((workspace.jacobian[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((workspace.jacobian[(0, 1)] - 2.0).abs() < 1e-12);
-        assert!((workspace.jacobian[(1, 0)] + 3.0).abs() < 1e-12);
-        assert!((workspace.jacobian[(1, 1)] - 4.5).abs() < 1e-12);
-    }
-
+    /// Verify that workspace evaluation repairs an unexpected matrix shape and
+    /// continues reusing the repaired allocation on later evaluations.
     #[test]
     fn test_evaluate_checked_in_workspace_updates_and_resizes() {
         let x = Exp::var("x");
@@ -334,7 +319,9 @@ mod tests {
             compiled.var_table.all_var_ids(),
         );
         let mut workspace = jacobian.workspace();
-        workspace.replace_jacobian(Matrix::new(1, 1)); // force resize on first evaluate
+        // Tests are descendants of this module and can deliberately corrupt the
+        // private shape without retaining a production-only replacement API.
+        workspace.jacobian = Matrix::new(1, 1);
 
         let mut vars = HashMap::new();
         let x_id = compiled.var_table.get_id("x").unwrap();
@@ -366,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_matches_allocating_random_nonlinear() {
+    fn test_reused_workspace_matches_fresh_random_nonlinear() {
         let mut rng = TestRng::new(0x9e37_79b9_7f4a_7c15);
         let vars: Vec<Exp> = (0..3).map(|i| Exp::var(format!("x{i}"))).collect();
         let mut equations = Vec::new();
@@ -398,18 +385,21 @@ mod tests {
                 values.insert(id, rng.next_f64());
             }
 
-            let alloc = jacobian
-                .evaluate_checked(&values)
-                .expect("jacobian evaluate failed");
+            // A newly allocated workspace provides an independent baseline for
+            // detecting stale elements left in the long-lived workspace.
+            let mut fresh_workspace = jacobian.workspace();
+            let fresh = jacobian
+                .evaluate_checked_in_workspace(&values, &mut fresh_workspace)
+                .expect("fresh jacobian evaluate failed");
             let in_ws = jacobian
                 .evaluate_checked_in_workspace(&values, &mut workspace)
                 .expect("jacobian workspace evaluate failed");
 
-            assert_eq!(alloc.rows(), in_ws.rows());
-            assert_eq!(alloc.cols(), in_ws.cols());
-            for i in 0..alloc.rows() {
-                for j in 0..alloc.cols() {
-                    assert!((alloc[(i, j)] - in_ws[(i, j)]).abs() < 1e-12);
+            assert_eq!(fresh.rows(), in_ws.rows());
+            assert_eq!(fresh.cols(), in_ws.cols());
+            for i in 0..fresh.rows() {
+                for j in 0..fresh.cols() {
+                    assert!((fresh[(i, j)] - in_ws[(i, j)]).abs() < 1e-12);
                 }
             }
         }

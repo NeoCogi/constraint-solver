@@ -1158,7 +1158,6 @@ impl Matrix {
 
         let mut r = a.clone();
         let mut qt_b = b.clone();
-        let mut taus = Vec::with_capacity(n);
 
         // Householder QR factorization (thin): apply reflectors to `r` and `qt_b`.
         for k in 0..n {
@@ -1174,7 +1173,6 @@ impl Matrix {
             }
 
             if col_norm == 0.0 {
-                taus.push(0.0);
                 continue;
             }
 
@@ -1194,7 +1192,6 @@ impl Matrix {
                 v_sq += vi * vi;
             }
             let tau = 2.0 / v_sq;
-            taus.push(tau);
 
             // Apply reflector to remaining columns.
             let cols_left = n.saturating_sub(k + 1);

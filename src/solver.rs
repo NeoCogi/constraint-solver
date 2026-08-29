@@ -76,12 +76,10 @@ struct LineSearchContext<'a> {
 }
 
 impl LeastSquaresWorkspace {
-    /// Allocate reusable augmented matrices and initialize the diagonal for the
-    /// caller's first regularization strength.
+    /// Allocate zero-filled augmented matrices for repeated regularized solves.
     fn new(
         num_equations: usize,
         num_variables: usize,
-        sqrt_reg: f64,
     ) -> Result<Self, MatrixError> {
         // The augmented row count is caller-derived dimension arithmetic and
         // must be checked before allocation so release builds cannot wrap to a
@@ -94,15 +92,11 @@ impl LeastSquaresWorkspace {
             },
         )?;
 
-        // Regularization rows are diagonal; residual rows are overwritten by
-        // each solve before this workspace is consumed.
-        let mut augmented_j = Matrix::try_new(augmented_rows, num_variables)?;
-        for i in 0..num_variables {
-            augmented_j[(num_equations + i, i)] = sqrt_reg;
-        }
-
+        // Both augmented matrices start at zero. Each solve overwrites the
+        // residual block and regularization diagonal; every lower off-diagonal
+        // coefficient and lower right-hand-side value remains zero forever.
         Ok(LeastSquaresWorkspace {
-            augmented_j,
+            augmented_j: Matrix::try_new(augmented_rows, num_variables)?,
             augmented_b: Matrix::try_new(augmented_rows, 1)?,
             num_equations,
             num_variables,
@@ -568,7 +562,9 @@ impl NewtonRaphsonSolver {
         self.validate_configuration()?;
         self.validate_initial_guess(&initial_guess)?;
 
-        let mut vars = initial_guess.clone();
+        // This internal entry point owns the validated map, so move it directly
+        // into mutable solver state instead of cloning every variable entry.
+        let mut vars = initial_guess;
         let jacobian = Jacobian::new(self.equations.clone(), self.variables.clone());
         // Cache Jacobian storage to avoid per-iteration allocations.
         let mut jacobian_workspace = jacobian.workspace();
@@ -587,7 +583,10 @@ impl NewtonRaphsonSolver {
 
         let mut f_vals = Matrix::new(num_equations, 1);
         let mut f_neg = Matrix::new(num_equations, 1);
-        jacobian_workspace.replace_jacobian(jacobian.evaluate_checked(&vars)?);
+        // Populate the workspace in place. Allocating an independent Jacobian
+        // and immediately replacing this correctly sized buffer would double
+        // initial derivative storage for no benefit.
+        jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
 
         let mut line_search_f_vals = Matrix::new(num_equations, 1);
 
@@ -596,7 +595,6 @@ impl NewtonRaphsonSolver {
                 Some(LeastSquaresWorkspace::new(
                     num_equations,
                     num_variables,
-                    self.regularization.sqrt(),
                 )?)
             } else {
                 None
@@ -1224,12 +1222,13 @@ impl NewtonRaphsonSolver {
                         }
                         workspace.augmented_b[(i, 0)] = rhs[(i, 0)];
                     }
+
+                    // Construction permanently zeroes every lower
+                    // off-diagonal coefficient and lower RHS value. Only the
+                    // diagonal changes with each adaptive regularization retry,
+                    // so rewriting the entire square block would be dead work.
                     for i in 0..workspace.num_variables {
-                        for j in 0..workspace.num_variables {
-                            workspace.augmented_j[(workspace.num_equations + i, j)] = 0.0;
-                        }
                         workspace.augmented_j[(workspace.num_equations + i, i)] = sqrt_reg;
-                        workspace.augmented_b[(workspace.num_equations + i, 0)] = 0.0;
                     }
 
                     workspace
