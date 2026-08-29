@@ -1769,7 +1769,13 @@ impl Matrix {
             });
         }
 
-        let mut result = Matrix::new(self.rows, rhs.cols);
+        // The output combines dimensions from two independently valid inputs.
+        // Zero-sized storage permits shapes such as `usize::MAX x 0`, so input
+        // construction alone cannot prove that `self.rows * rhs.cols` fits.
+        // Preserve this method's fallible contract by validating the derived
+        // shape instead of routing it through the panicking convenience
+        // constructor.
+        let mut result = Matrix::try_new(self.rows, rhs.cols)?;
         // Each output cell performs `self.cols` multiply-adds. Including that
         // inner dimension recognizes skinny products with few output cells but
         // substantial arithmetic, which the former output-size test missed.
@@ -2251,6 +2257,30 @@ mod tests {
             }
         );
         assert_eq!(err_serial, err_parallel);
+    }
+
+    /// Ensure fallible multiplication reports overflow in its derived output
+    /// shape rather than panicking after both zero-storage inputs were accepted.
+    #[test]
+    fn test_try_mul_reports_derived_element_count_overflow() {
+        // Each input has zero elements and is independently representable. Their
+        // compatible shared zero dimension nevertheless produces an impossible
+        // `usize::MAX x usize::MAX` output shape.
+        let left = Matrix::from_vec(Vec::new(), usize::MAX, 0).unwrap();
+        let right = Matrix::from_vec(Vec::new(), 0, usize::MAX).unwrap();
+
+        for parallel in [false, true] {
+            let error = left
+                .try_mul_with_parallel(&right, parallel)
+                .expect_err("derived output overflow must remain fallible");
+            assert_eq!(
+                error,
+                MatrixError::ElementCountOverflow {
+                    rows: usize::MAX,
+                    cols: usize::MAX,
+                }
+            );
+        }
     }
 
     #[test]

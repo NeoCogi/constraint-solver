@@ -53,7 +53,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Normalized Householder reflector construction before subtracting its leading
   value, preventing large finite full-rank systems from returning inaccurate QR
   solutions after an intermediate sum overflowed.
-- Checked matrix element products and augmented row sums before allocation.
+- Checked matrix element products, including multiplication output shapes
+  derived from independently valid zero-sized operands, and augmented row sums
+  before allocation.
 - Removed redundant initial-variable and Jacobian copies, unused Householder
   storage, and repeated quadratic clearing of immutable regularization zeros.
 - Made the GLFW inverse-kinematics example report changed solver failures,
