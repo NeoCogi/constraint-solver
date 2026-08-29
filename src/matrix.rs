@@ -62,8 +62,14 @@ pub enum MatrixError {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Numerical diagnostics produced alongside a Householder QR solution.
 pub struct LeastSquaresQrInfo {
+    /// Estimated numerical rank of the triangular factor using a threshold
+    /// relative to its largest diagonal element.
     pub rank: usize,
+    /// Estimated one-norm condition number of the independent triangular
+    /// factor. Infinity indicates rank deficiency, non-finite arithmetic, or a
+    /// condition number larger than the floating-point range.
     pub cond_est: f64,
 }
 
@@ -320,6 +326,153 @@ impl Matrix {
         }
     }
 
+    /// Estimate the one-norm condition number of an upper-triangular leading
+    /// block without explicitly forming its inverse.
+    ///
+    /// The previous diagonal-ratio heuristic missed ill-conditioning caused by
+    /// large off-diagonal entries. This routine uses a bounded Hager-style
+    /// iteration to estimate `||R^-1||_1`, then multiplies it by the exact
+    /// `||R||_1`. Each iteration requires triangular solves rather than an
+    /// expensive and less stable explicit inverse.
+    fn estimate_upper_triangular_condition(r: &Matrix, size: usize) -> f64 {
+        // The empty factor has no meaningful inverse condition. This case is
+        // represented as infinity consistently with the public zero-column QR
+        // result.
+        if size == 0 {
+            return f64::INFINITY;
+        }
+
+        // Compute the exact matrix one-norm: the largest absolute column sum of
+        // the independent upper-triangular block.
+        let mut r_one_norm: f64 = 0.0;
+        for column in 0..size {
+            let mut column_sum = 0.0;
+            for row in 0..=column {
+                column_sum += r[(row, column)].abs();
+            }
+            r_one_norm = r_one_norm.max(column_sum);
+        }
+
+        // A zero or non-finite factor cannot have a useful finite condition
+        // estimate. The subsequent solve will provide the detailed failure.
+        if r_one_norm == 0.0 || !r_one_norm.is_finite() {
+            return f64::INFINITY;
+        }
+
+        // Hager's estimator starts with a normalized positive vector. Limiting
+        // the iteration count keeps diagnostics O(n^2) with a small constant,
+        // preserving QR's overall complexity for tall systems.
+        const MAX_CONDITION_ESTIMATE_ITERATIONS: usize = 8;
+        let mut probe = vec![1.0 / size as f64; size];
+        let mut inverse_one_norm_estimate: f64 = 0.0;
+        let mut previous_index = None;
+
+        for _ in 0..MAX_CONDITION_ESTIMATE_ITERATIONS {
+            // Applying R^-1 to the probe exposes a direction amplified by the
+            // inverse. Failure means the factor is singular or non-finite.
+            let Some(inverse_times_probe) =
+                Self::solve_upper_triangular_vector(r, size, &probe, false)
+            else {
+                return f64::INFINITY;
+            };
+
+            let candidate_estimate: f64 = inverse_times_probe.iter().map(|v| v.abs()).sum();
+            if !candidate_estimate.is_finite() {
+                return f64::INFINITY;
+            }
+            inverse_one_norm_estimate = inverse_one_norm_estimate.max(candidate_estimate);
+
+            // The sign vector is a subgradient of the one-norm. Applying
+            // R^-T identifies the coordinate direction that can most improve
+            // the current inverse-norm estimate.
+            let sign_vector: Vec<f64> = inverse_times_probe
+                .iter()
+                .map(|&value| if value < 0.0 { -1.0 } else { 1.0 })
+                .collect();
+            let Some(transpose_inverse_times_sign) =
+                Self::solve_upper_triangular_vector(r, size, &sign_vector, true)
+            else {
+                return f64::INFINITY;
+            };
+
+            let next_index = transpose_inverse_times_sign
+                .iter()
+                .enumerate()
+                .max_by(|(_, lhs), (_, rhs)| lhs.abs().total_cmp(&rhs.abs()))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+
+            // Repeating the same maximizing coordinate means the estimator has
+            // reached a fixed point. Otherwise, probe that basis direction on
+            // the next iteration.
+            if previous_index == Some(next_index) {
+                break;
+            }
+            probe.fill(0.0);
+            probe[next_index] = 1.0;
+            previous_index = Some(next_index);
+        }
+
+        r_one_norm * inverse_one_norm_estimate
+    }
+
+    /// Solve either `R*x=rhs` or `R^T*x=rhs` for the leading upper-triangular
+    /// block used by the condition estimator.
+    ///
+    /// Returning `None` keeps non-finite or singular diagnostic arithmetic out
+    /// of the main QR solution while allowing the caller to report an infinite
+    /// condition estimate.
+    fn solve_upper_triangular_vector(
+        r: &Matrix,
+        size: usize,
+        rhs: &[f64],
+        transpose: bool,
+    ) -> Option<Vec<f64>> {
+        // A mismatched internal vector would indicate a programming error. It
+        // is treated as an unavailable estimate rather than indexing unsafely.
+        if rhs.len() != size {
+            return None;
+        }
+
+        let mut solution = vec![0.0; size];
+        if transpose {
+            // R^T is lower triangular, so solve from the first row downward.
+            for row in 0..size {
+                let mut value = rhs[row];
+                for column in 0..row {
+                    value -= r[(column, row)] * solution[column];
+                }
+                let diagonal = r[(row, row)];
+                if diagonal == 0.0 || !diagonal.is_finite() {
+                    return None;
+                }
+                solution[row] = value / diagonal;
+                if !solution[row].is_finite() {
+                    return None;
+                }
+            }
+        } else {
+            // R is upper triangular, so ordinary back-substitution proceeds
+            // from the final row upward.
+            for row in (0..size).rev() {
+                let mut value = rhs[row];
+                for column in (row + 1)..size {
+                    value -= r[(row, column)] * solution[column];
+                }
+                let diagonal = r[(row, row)];
+                if diagonal == 0.0 || !diagonal.is_finite() {
+                    return None;
+                }
+                solution[row] = value / diagonal;
+                if !solution[row].is_finite() {
+                    return None;
+                }
+            }
+        }
+
+        Some(solution)
+    }
+
     fn solve_least_squares_qr_tall_with_info(
         a: &Matrix,
         b: &Matrix,
@@ -460,20 +613,16 @@ impl Matrix {
         // would incorrectly classify small, full-rank systems as rank zero.
         let tol = qr_rank_tolerance(max_diag);
         let mut rank = 0;
-        let mut min_diag = f64::INFINITY;
         for i in 0..n {
             let diag = r[(i, i)].abs();
             if diag > tol {
                 rank += 1;
-                if diag < min_diag {
-                    min_diag = diag;
-                }
             }
         }
-        let cond_est = if rank == 0 || !min_diag.is_finite() {
+        let cond_est = if rank < n {
             f64::INFINITY
         } else {
-            max_diag / min_diag
+            Self::estimate_upper_triangular_condition(&r, n)
         };
 
         // Back-substitute R x = Q^T b, using the top n entries.
@@ -625,20 +774,16 @@ impl Matrix {
         // tall systems report rank consistently under unit changes.
         let tol = qr_rank_tolerance(max_diag);
         let mut rank = 0;
-        let mut min_diag = f64::INFINITY;
         for i in 0..m {
             let diag = r[(i, i)].abs();
             if diag > tol {
                 rank += 1;
-                if diag < min_diag {
-                    min_diag = diag;
-                }
             }
         }
-        let cond_est = if rank == 0 || !min_diag.is_finite() {
+        let cond_est = if rank < m {
             f64::INFINITY
         } else {
-            max_diag / min_diag
+            Self::estimate_upper_triangular_condition(&r, m)
         };
 
         // Solve R^T y = b (R is m x m upper triangular, so R^T is lower triangular).
@@ -1342,6 +1487,25 @@ mod tests {
         assert_eq!(info_parallel.rank, 3);
         assert!(info_serial.cond_est > 1e6, "cond_est was {}", info_serial.cond_est);
         assert!(info_parallel.cond_est > 1e6, "cond_est was {}", info_parallel.cond_est);
+    }
+
+    /// Verify that condition diagnostics account for amplification caused by
+    /// off-diagonal entries, not only disparities between diagonal elements.
+    #[test]
+    fn test_solve_least_squares_qr_condition_detects_off_diagonal_growth() {
+        // Both diagonal entries are one, so the former max-diagonal/min-diagonal
+        // heuristic reported condition one. The actual one-norm condition of
+        // this triangular matrix is approximately 1e16.
+        let a = Matrix::from_vec(vec![1.0, 1e8, 0.0, 1.0], 2, 2).unwrap();
+        let b = Matrix::from_vec(vec![0.0, 0.0], 2, 1).unwrap();
+        let (_, info) = a.solve_least_squares_qr_with_info(&b).unwrap();
+
+        assert_eq!(info.rank, 2);
+        assert!(
+            info.cond_est > 1e15,
+            "off-diagonal condition estimate was {}",
+            info.cond_est
+        );
     }
 
     #[test]
