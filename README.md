@@ -19,6 +19,13 @@ Add the 0.3 release to your `Cargo.toml`:
 constraint-solver = "0.3"
 ```
 
+## Toolchain support
+
+`constraint-solver` requires Rust 1.86 or newer. Rust 1.86 is the crate's
+minimum supported Rust version (MSRV) because the crate uses Rust 2024 edition
+semantics. CI compiles and tests every ordinary target with that exact compiler
+in addition to validating the repository with the current stable toolchain.
+
 ## System Types (Square, Under-, Over-Constrained)
 
 The solver supports all three system shapes:
