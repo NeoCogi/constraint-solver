@@ -43,6 +43,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # Linux builds GLFW from its bundled source because the crate's
+      # `prebuilt-libs` feature only supplies binaries on Windows and macOS.
+      # Install every X11 development header required by GLFW's CMake checks so
+      # all-target validation can compile the interactive IK example.
+      - name: Install GLFW X11 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev
+
       # Pin this job to the manifest's declared minimum so an accidental use of
       # a newer language or standard-library feature fails independently of the
       # moving stable toolchain.
@@ -98,6 +113,20 @@ jobs:
       # Check out the exact revision whose source and manifest are being tested.
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # Clippy and all-target tests compile the GLFW example on Linux. The
+      # runner image does not include the X11 development headers needed when
+      # glfw-sys falls back to its bundled source build.
+      - name: Install GLFW X11 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev
 
       # Install the stable compiler plus the two components used as hard gates.
       - name: Install Rust toolchain
