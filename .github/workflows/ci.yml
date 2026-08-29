@@ -1,0 +1,57 @@
+# Validate every distributable and developer-facing target on pushes and pull
+# requests. Benchmark execution remains manual; CI compiles its harness instead.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The workflow only reads repository contents and does not publish artifacts or
+# mutate pull requests.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Format, lint, test, and package
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the exact revision whose source and manifest are being tested.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Install the stable compiler plus the two components used as hard gates.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Reuse registry and target artifacts without treating cache availability
+      # as part of build correctness.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Compile every feature and target, including examples and the opt-in
+      # Criterion harness, while promoting all warnings to failures.
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The benchmark feature is intentionally absent so Criterion is not
+      # executed as part of the correctness suite.
+      - name: Run unit and example tests
+        run: cargo test --all-targets
+
+      - name: Run documentation tests
+        run: cargo test --doc
+
+      - name: Compile benchmark harness
+        run: cargo check --bench linear_algebra --features benchmarks
+
+      # Package verification catches missing files and manifest metadata errors
+      # using the same locked dependency graph as the preceding checks.
+      - name: Verify crate package
+        run: cargo package --locked
