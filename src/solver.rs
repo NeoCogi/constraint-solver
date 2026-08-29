@@ -191,8 +191,8 @@ pub enum UnderdeterminedPolicy {
 ///
 /// Fields are public so pre-alpha callers can start from [`SolverOptions::default`]
 /// or from [`NewtonRaphsonSolver::options`], change only the relevant values,
-/// and install the result with [`NewtonRaphsonSolver::with_options`]. Every field
-/// is validated when a solve begins.
+/// and install the result with [`NewtonRaphsonSolver::with_options`]. Fields used
+/// by the selected solve path are validated when that solve begins.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SolverOptions {
     /// Maximum number of accepted Newton updates before `NoConvergence`.
@@ -203,28 +203,28 @@ pub struct SolverOptions {
     pub stationarity_tolerance: f64,
     /// Initial standard-solver damping and maximum line-search trial step.
     pub damping_factor: f64,
-    /// Smallest damping retained after adaptive reductions.
+    /// Smallest damping retained by ordinary solves after adaptive reductions.
     pub min_damping: f64,
     /// Base ridge parameter for ill-conditioned augmented least squares.
     pub regularization: f64,
-    /// Condition estimate above which augmented regularization is attempted.
+    /// Condition estimate above which enabled regularization is attempted.
     pub condition_limit: f64,
-    /// Number of augmented regularization strengths attempted.
+    /// Number of augmented strengths attempted when regularization is enabled.
     pub regularization_attempts: usize,
-    /// Multiplicative increase between regularization attempts.
+    /// Multiplicative increase between enabled regularization attempts.
     pub regularization_growth_factor: f64,
     /// QR/SVD numerical-rank policy used by every Jacobian shape.
     pub least_squares: LeastSquaresOptions,
     /// Policy for choosing among underdetermined linearized solutions.
     pub underdetermined_policy: UnderdeterminedPolicy,
-    /// Armijo sufficient-decrease coefficient for residual-norm line search.
+    /// Armijo sufficient-decrease coefficient used only by line search.
     pub armijo_coefficient: f64,
     /// Maximum number of candidate steps evaluated by one line search.
     pub line_search_max_trials: usize,
-    /// Smallest positive candidate step evaluated by line search.
+    /// Smallest positive candidate step evaluated only by line search.
     pub line_search_min_step: f64,
     /// Multiplier on machine epsilon used to ignore roundoff-sized null-space
-    /// reprojections for the minimum-norm point policy.
+    /// reprojections for the minimum-norm point policy on wide systems.
     pub projection_tolerance_multiplier: f64,
 }
 
@@ -271,8 +271,7 @@ pub struct NewtonRaphsonSolver {
     variables: Vec<VarId>,
     /// Registry of all variables referenced by the compiled system
     var_table: VarTable,
-    /// Validated numerical policy shared by iteration, line search, and linear
-    /// least-squares dispatch.
+    /// Numerical policy validated for the selected path at each solve boundary.
     options: SolverOptions,
     /// Optional metadata describing the source of each equation in the system
     equation_traces: Vec<Option<EquationTrace>>,
@@ -576,8 +575,8 @@ impl NewtonRaphsonSolver {
 
     /// Replace the complete numerical policy used by subsequent solves.
     pub fn with_options(mut self, options: SolverOptions) -> Self {
-        // Preserve caller values verbatim. The common solve boundary validates
-        // the entire structure and returns one deterministic input error.
+        // Preserve caller values verbatim. The solve boundary validates the
+        // fields that can affect its selected numerical path.
         self.options = options;
         self
     }
@@ -663,7 +662,7 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the positive, finite normalized-gradient threshold used to
+    /// Override the positive, finite column-scaled threshold used to
     /// identify stationary non-roots.
     ///
     /// This value does not permit a successful least-squares result. It controls
@@ -715,7 +714,7 @@ impl NewtonRaphsonSolver {
     pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
         // Reject invalid reusable settings before translating or validating the
         // caller's variable map.
-        self.validate_configuration()?;
+        self.validate_configuration(false)?;
         let vars = self.map_initial_guess(initial_guess)?;
         self.run_in_mode(|| self.solve_modified_internal(vars, false))
     }
@@ -738,13 +737,8 @@ impl NewtonRaphsonSolver {
         initial_guess: HashMap<VarId, f64>,
         use_line_search: bool,
     ) -> Result<Solution, SolverError> {
-        // Defensively repeat validation at the internal boundary so future
-        // private entry points cannot bypass the public checks.
-        self.validate_configuration()?;
-        self.validate_initial_guess(&initial_guess)?;
-
-        // This internal entry point owns the validated map, so move it directly
-        // into mutable solver state instead of cloning every variable entry.
+        // The public entry point has validated both the selected policy and this
+        // owned internal map, so move it directly into mutable solver state.
         let mut vars = initial_guess;
         // Borrow the construction-time symbolic cache and allocate only the
         // mutable numerical derivative storage owned by this solve invocation.
@@ -1365,8 +1359,15 @@ impl NewtonRaphsonSolver {
 
         for attempt in 0..self.options.regularization_attempts {
             let lambda = self.options.regularization * regularization_factor;
-            if lambda <= 0.0 {
-                continue;
+            if !lambda.is_finite() {
+                // Retry count is caller-controlled, so validate derived schedule
+                // values only when reached. Stop at the first overflow instead
+                // of scanning or repeatedly attempting the unusable remainder.
+                last_err = Some(format!(
+                    "Regularization strength overflowed before attempt {}",
+                    attempt + 1
+                ));
+                break;
             }
             let sqrt_reg = lambda.sqrt();
 
@@ -1459,8 +1460,8 @@ impl NewtonRaphsonSolver {
             }
 
             // Advance the geometric retry schedule only after the current
-            // strength has been attempted. Configuration validation guarantees
-            // every factor and resulting lambda remains finite.
+            // finite strength has actually been attempted. The next iteration
+            // performs the derived-value overflow check above.
             if attempt + 1 < self.options.regularization_attempts {
                 regularization_factor *= self.options.regularization_growth_factor;
             }
@@ -1528,144 +1529,110 @@ impl NewtonRaphsonSolver {
         Ok(vars)
     }
 
-    /// Validate solver settings that must be finite and meaningful before
+    /// Convert one option predicate into the solver's consistent configuration
+    /// error representation.
+    fn require_valid_option(valid: bool, message: &'static str) -> Result<(), SolverError> {
+        // Allocate the caller-facing message only on the invalid path; successful
+        // validation remains a branch with no heap work.
+        valid
+            .then_some(())
+            .ok_or_else(|| SolverError::InvalidInput(message.to_string()))
+    }
+
+    /// Validate every setting that the selected solve path can execute before
     /// expression evaluation or iteration begins.
-    fn validate_configuration(&self) -> Result<(), SolverError> {
-        // A zero update budget cannot even test an accepted Newton step and used
-        // to turn exact roots into misleading no-convergence diagnostics.
-        if self.options.max_iterations == 0 {
-            return Err(SolverError::InvalidInput(
-                "max_iterations must be greater than zero".to_string(),
-            ));
+    fn validate_configuration(&self, use_line_search: bool) -> Result<(), SolverError> {
+        // These controls participate in every solve mode.
+        Self::require_valid_option(
+            self.options.max_iterations > 0,
+            "max_iterations must be greater than zero",
+        )?;
+        Self::require_valid_option(
+            self.options.residual_tolerance.is_finite() && self.options.residual_tolerance > 0.0,
+            "residual_tolerance must be finite and greater than zero",
+        )?;
+        Self::require_valid_option(
+            self.options.stationarity_tolerance.is_finite()
+                && self.options.stationarity_tolerance > 0.0,
+            "stationarity_tolerance must be finite and greater than zero",
+        )?;
+        Self::require_valid_option(
+            self.options.damping_factor.is_finite()
+                && self.options.damping_factor > 0.0
+                && self.options.damping_factor <= 1.0,
+            "damping_factor must be finite and in the interval (0, 1]",
+        )?;
+        Self::require_valid_option(
+            self.options.regularization.is_finite() && self.options.regularization >= 0.0,
+            "regularization must be finite and non-negative",
+        )?;
+        Self::require_valid_option(
+            self.options
+                .least_squares
+                .relative_rank_tolerance
+                .is_finite()
+                && self.options.least_squares.relative_rank_tolerance >= 0.0,
+            "least_squares.relative_rank_tolerance must be finite and non-negative",
+        )?;
+
+        // Ordinary adaptive damping and backtracking line search have disjoint
+        // secondary policies, so validate only the selected branch.
+        if use_line_search {
+            Self::require_valid_option(
+                self.options.armijo_coefficient.is_finite()
+                    && self.options.armijo_coefficient > 0.0
+                    && self.options.armijo_coefficient < 1.0,
+                "armijo_coefficient must be finite and in the interval (0, 1)",
+            )?;
+            Self::require_valid_option(
+                self.options.line_search_max_trials > 0,
+                "line_search_max_trials must be greater than zero",
+            )?;
+            Self::require_valid_option(
+                self.options.line_search_min_step.is_finite()
+                    && self.options.line_search_min_step > 0.0
+                    && self.options.line_search_min_step <= self.options.damping_factor,
+                "line_search_min_step must be finite, positive, and no greater than damping_factor",
+            )?;
+        } else {
+            Self::require_valid_option(
+                self.options.min_damping.is_finite()
+                    && self.options.min_damping > 0.0
+                    && self.options.min_damping <= self.options.damping_factor,
+                "min_damping must be finite, positive, and no greater than damping_factor",
+            )?;
         }
 
-        // Residual tolerance is the sole success threshold, so reject values
-        // that could make every state succeed or no finite state succeed.
-        if !self.options.residual_tolerance.is_finite() || self.options.residual_tolerance <= 0.0 {
-            return Err(SolverError::InvalidInput(
-                "residual_tolerance must be finite and greater than zero".to_string(),
-            ));
+        // Retry controls are inactive when regularization is disabled. Validate
+        // only their constant-time preconditions; derived strengths are checked
+        // lazily if an ill-conditioned linear solve reaches them.
+        if self.options.regularization > 0.0 {
+            Self::require_valid_option(
+                self.options.condition_limit.is_finite() && self.options.condition_limit > 0.0,
+                "condition_limit must be finite and greater than zero",
+            )?;
+            Self::require_valid_option(
+                self.options.regularization_attempts > 0,
+                "regularization_attempts must be greater than zero",
+            )?;
+            Self::require_valid_option(
+                self.options.regularization_growth_factor.is_finite()
+                    && self.options.regularization_growth_factor >= 1.0,
+                "regularization_growth_factor must be finite and at least one",
+            )?;
         }
 
-        // Stationarity has a separate scale-independent threshold because it
-        // controls an error classification, not acceptance of a constraint root.
-        if !self.options.stationarity_tolerance.is_finite()
-            || self.options.stationarity_tolerance <= 0.0
+        // Projection tolerance matters only when a wide solve uses the
+        // origin-based policy that can actually project the current point.
+        if self.jacobian.equation_count() < self.variables.len()
+            && self.options.underdetermined_policy
+                == UnderdeterminedPolicy::MinimumNormLinearizedSolution
         {
-            return Err(SolverError::InvalidInput(
-                "stationarity_tolerance must be finite and greater than zero".to_string(),
-            ));
-        }
-
-        // Damping represents a fraction of a Newton correction. Values outside
-        // `(0, 1]` either reverse/amplify the step or eliminate it entirely.
-        if !self.options.damping_factor.is_finite()
-            || self.options.damping_factor <= 0.0
-            || self.options.damping_factor > 1.0
-        {
-            return Err(SolverError::InvalidInput(
-                "damping_factor must be finite and in the interval (0, 1]".to_string(),
-            ));
-        }
-
-        // Adaptive damping may only reduce the configured initial fraction; a
-        // larger or non-positive floor would reverse that relationship.
-        if !self.options.min_damping.is_finite()
-            || self.options.min_damping <= 0.0
-            || self.options.min_damping > self.options.damping_factor
-        {
-            return Err(SolverError::InvalidInput(
-                "min_damping must be finite, positive, and no greater than damping_factor"
-                    .to_string(),
-            ));
-        }
-
-        // Regularization is later square-rooted for augmented QR, so negative or
-        // non-finite values must not reach workspace construction.
-        if !self.options.regularization.is_finite() || self.options.regularization < 0.0 {
-            return Err(SolverError::InvalidInput(
-                "regularization must be finite and non-negative".to_string(),
-            ));
-        }
-
-        // A finite positive condition cutoff gives the regularization dispatcher
-        // an ordered comparison for every successful factorization diagnostic.
-        if !self.options.condition_limit.is_finite() || self.options.condition_limit <= 0.0 {
-            return Err(SolverError::InvalidInput(
-                "condition_limit must be finite and greater than zero".to_string(),
-            ));
-        }
-
-        // The geometric retry schedule must contain at least one finite attempt
-        // and must not weaken regularization on later attempts.
-        if self.options.regularization_attempts == 0 {
-            return Err(SolverError::InvalidInput(
-                "regularization_attempts must be greater than zero".to_string(),
-            ));
-        }
-        if !self.options.regularization_growth_factor.is_finite()
-            || self.options.regularization_growth_factor < 1.0
-        {
-            return Err(SolverError::InvalidInput(
-                "regularization_growth_factor must be finite and at least one".to_string(),
-            ));
-        }
-        let mut scheduled_regularization = self.options.regularization;
-        for _ in 1..self.options.regularization_attempts {
-            scheduled_regularization *= self.options.regularization_growth_factor;
-            if !scheduled_regularization.is_finite() {
-                return Err(SolverError::InvalidInput(
-                    "regularization retry schedule must remain finite".to_string(),
-                ));
-            }
-        }
-
-        // QR and SVD share this relative threshold, including zero as an exact
-        // rank policy. Negative and non-finite values have no ordered meaning.
-        if !self
-            .options
-            .least_squares
-            .relative_rank_tolerance
-            .is_finite()
-            || self.options.least_squares.relative_rank_tolerance < 0.0
-        {
-            return Err(SolverError::InvalidInput(
-                "least_squares.relative_rank_tolerance must be finite and non-negative".to_string(),
-            ));
-        }
-
-        // Armijo's coefficient is a fraction of the predicted local decrease.
-        if !self.options.armijo_coefficient.is_finite()
-            || self.options.armijo_coefficient <= 0.0
-            || self.options.armijo_coefficient >= 1.0
-        {
-            return Err(SolverError::InvalidInput(
-                "armijo_coefficient must be finite and in the interval (0, 1)".to_string(),
-            ));
-        }
-        if self.options.line_search_max_trials == 0 {
-            return Err(SolverError::InvalidInput(
-                "line_search_max_trials must be greater than zero".to_string(),
-            ));
-        }
-        if !self.options.line_search_min_step.is_finite()
-            || self.options.line_search_min_step <= 0.0
-            || self.options.line_search_min_step > self.options.damping_factor
-        {
-            return Err(SolverError::InvalidInput(
-                "line_search_min_step must be finite, positive, and no greater than damping_factor"
-                    .to_string(),
-            ));
-        }
-
-        // Projection tolerance is a non-negative multiplier on machine epsilon;
-        // zero requests exact comparison without disabling projection itself.
-        if !self.options.projection_tolerance_multiplier.is_finite()
-            || self.options.projection_tolerance_multiplier < 0.0
-        {
-            return Err(SolverError::InvalidInput(
-                "projection_tolerance_multiplier must be finite and non-negative".to_string(),
-            ));
+            Self::require_valid_option(
+                self.options.projection_tolerance_multiplier.is_finite()
+                    && self.options.projection_tolerance_multiplier >= 0.0,
+                "projection_tolerance_multiplier must be finite and non-negative",
+            )?;
         }
 
         Ok(())
@@ -2153,9 +2120,9 @@ impl NewtonRaphsonSolver {
         &self,
         initial_guess: HashMap<String, f64>,
     ) -> Result<Solution, SolverError> {
-        // Apply exactly the same configuration contract as the standard solve
-        // before mapping caller-visible variable names to internal IDs.
-        self.validate_configuration()?;
+        // Validate shared and line-search-specific policy before mapping
+        // caller-visible variable names to internal IDs.
+        self.validate_configuration(true)?;
         let vars = self.map_initial_guess(initial_guess)?;
         self.run_in_mode(|| self.solve_modified_internal(vars, true))
     }
@@ -2544,14 +2511,6 @@ mod tests {
                     configure_options(solver, |options| options.line_search_min_step = 0.0)
                 }),
             ),
-            (
-                "projection_tolerance_multiplier",
-                Box::new(|solver| {
-                    configure_options(solver, |options| {
-                        options.projection_tolerance_multiplier = f64::NAN
-                    })
-                }),
-            ),
         ];
 
         for (expected_parameter, configure) in invalid_cases {
@@ -2561,15 +2520,108 @@ mod tests {
             let solver = configure(NewtonRaphsonSolver::new(compiled));
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve(initial)
-                .expect_err("invalid configuration must be rejected");
+            // Only the three line-search fields require the line-search entry
+            // point. Every other table entry is active in an ordinary solve.
+            let uses_line_search = matches!(
+                expected_parameter,
+                "armijo_coefficient" | "line_search_max_trials" | "line_search_min_step"
+            );
+            let error = if uses_line_search {
+                solver.solve_with_line_search(initial)
+            } else {
+                solver.solve(initial)
+            }
+            .expect_err("invalid active configuration must be rejected");
             match error {
                 SolverError::InvalidInput(message) => {
                     assert!(message.contains(expected_parameter), "{message}");
                 }
                 other => panic!("expected InvalidInput, got {other:?}"),
             }
+        }
+
+        // Projection tolerance becomes active only for an underdetermined solve
+        // using the origin-based minimum-norm point policy.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let compiled = Compiler::compile(&[equation]).expect("compile failed");
+        let solver = configure_options(
+            NewtonRaphsonSolver::new(compiled)
+                .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormLinearizedSolution),
+            |options| options.projection_tolerance_multiplier = f64::NAN,
+        );
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        let error = solver
+            .solve(initial)
+            .expect_err("invalid active projection policy must be rejected");
+        match error {
+            SolverError::InvalidInput(message) => {
+                assert!(message.contains("projection_tolerance_multiplier"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// Keep configuration validation constant-time and ignore numerical policy
+    /// that the selected solve path cannot execute.
+    #[test]
+    fn test_configuration_validation_is_constant_time_and_policy_aware() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let initial = HashMap::from([("x".to_string(), 1.0)]);
+
+            // Retry count is an execution budget, not validation work. An exact
+            // root never performs regularization, so even the largest possible
+            // active budget must reach root certification immediately.
+            let solver = configure_options(
+                solver_for_mode(vec![equation.clone()], mode.clone()),
+                |options| {
+                    options.regularization_attempts = usize::MAX;
+                    options.regularization_growth_factor = 1.0;
+                },
+            );
+            let solution = solver
+                .solve(initial.clone())
+                .expect("validation must not enumerate the retry schedule");
+            assert_eq!(solution.iterations, 0);
+
+            // Ordinary Newton does not read line-search settings, and disabled
+            // regularization does not read its retry or condition controls. The
+            // default minimum-step policy also never reads projection tolerance.
+            let solver = configure_options(
+                solver_for_mode(vec![equation.clone()], mode.clone()),
+                |options| {
+                    options.regularization = 0.0;
+                    options.condition_limit = f64::NAN;
+                    options.regularization_attempts = usize::MAX;
+                    options.regularization_growth_factor = f64::NAN;
+                    options.armijo_coefficient = f64::NAN;
+                    options.line_search_max_trials = 0;
+                    options.line_search_min_step = f64::NAN;
+                    options.projection_tolerance_multiplier = f64::NAN;
+                },
+            );
+            let solution = solver
+                .solve(initial.clone())
+                .expect("inactive ordinary-solve policy must be ignored");
+            assert_eq!(solution.iterations, 0);
+
+            // Conversely, line search does not read ordinary adaptive damping's
+            // floor. Regularization and projection remain inactive as above.
+            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
+                options.min_damping = f64::NAN;
+                options.regularization = 0.0;
+                options.condition_limit = f64::NAN;
+                options.regularization_attempts = usize::MAX;
+                options.regularization_growth_factor = f64::NAN;
+                options.projection_tolerance_multiplier = f64::NAN;
+            });
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("inactive line-search policy must be ignored");
+            assert_eq!(solution.iterations, 0);
         }
     }
 
