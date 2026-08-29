@@ -102,18 +102,9 @@ struct ResidualGradientMeasure {
 /// Internal correction vector paired with the public diagnostic that describes
 /// how its linearized system was solved.
 struct LinearSolveResult {
-    /// Newton correction or projected variable vector produced by the solve.
+    /// Minimum-norm Newton correction produced by the solve.
     solution: Matrix,
     /// Factorization and regularization details for caller-facing results.
-    diagnostic: LinearSolveDiagnostic,
-}
-
-/// Internal result of testing an underdetermined current-point projection.
-struct ProjectionResult {
-    /// Replacement point when the current null-space component is significant,
-    /// or `None` when the point is already projected within tolerance.
-    projected_values: Option<Matrix>,
-    /// Linear solve used to compute the row-space representative.
     diagnostic: LinearSolveDiagnostic,
 }
 
@@ -172,21 +163,6 @@ enum LeastSquaresSolveError {
     },
 }
 
-/// Selects how an underdetermined Newton iteration resolves its null-space
-/// freedom.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnderdeterminedPolicy {
-    /// Solve `J * delta = -f` for the minimum-norm correction. This preserves
-    /// the current point's null-space component and is usually the smoothest
-    /// policy for interactive CAD and inverse-kinematics updates.
-    MinimumNormStep,
-    /// Solve `J * x_next = J * x_current - f` for the minimum-norm next point.
-    /// For a consistent linear system this returns the global minimum-norm
-    /// solution independently of the initial guess. For nonlinear systems the
-    /// guarantee applies to each local linearization, not the global manifold.
-    MinimumNormLinearizedSolution,
-}
-
 /// Complete numerical policy for one reusable nonlinear solver.
 ///
 /// Fields are public so pre-alpha callers can start from [`SolverOptions::default`]
@@ -215,17 +191,12 @@ pub struct SolverOptions {
     pub regularization_growth_factor: f64,
     /// QR/SVD numerical-rank policy used by every Jacobian shape.
     pub least_squares: LeastSquaresOptions,
-    /// Policy for choosing among underdetermined linearized solutions.
-    pub underdetermined_policy: UnderdeterminedPolicy,
     /// Armijo sufficient-decrease coefficient used only by line search.
     pub armijo_coefficient: f64,
     /// Maximum number of candidate steps evaluated by one line search.
     pub line_search_max_trials: usize,
     /// Smallest positive candidate step evaluated only by line search.
     pub line_search_min_step: f64,
-    /// Multiplier on machine epsilon used to ignore roundoff-sized null-space
-    /// reprojections for the minimum-norm point policy on wide systems.
-    pub projection_tolerance_multiplier: f64,
 }
 
 impl Default for SolverOptions {
@@ -244,11 +215,9 @@ impl Default for SolverOptions {
             regularization_attempts: 3,
             regularization_growth_factor: 10.0,
             least_squares: LeastSquaresOptions::default(),
-            underdetermined_policy: UnderdeterminedPolicy::MinimumNormStep,
             armijo_coefficient: 1e-4,
             line_search_max_trials: 64,
             line_search_min_step: 1e-12,
-            projection_tolerance_multiplier: 64.0,
         }
     }
 }
@@ -334,8 +303,7 @@ pub struct EquationDiagnostic {
     pub trace: Option<EquationTrace>,
 }
 
-/// Numerical provenance for one accepted nonlinear correction or point
-/// projection.
+/// Numerical provenance for one accepted nonlinear correction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
     /// Rank and condition classification of the original Jacobian solve when it
@@ -700,16 +668,6 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Select how underdetermined iterations resolve their Jacobian null space.
-    ///
-    /// This setting has no effect on square or overdetermined systems.
-    pub fn with_underdetermined_policy(mut self, policy: UnderdeterminedPolicy) -> Self {
-        // Store the policy on the reusable solver so every solve invocation has
-        // deterministic null-space behavior.
-        self.options.underdetermined_policy = policy;
-        self
-    }
-
     /// Solve the system using standard Newton-Raphson method
     pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
         // Reject invalid reusable settings before translating or validating the
@@ -753,8 +711,8 @@ impl NewtonRaphsonSolver {
         // it observed an improvement from an artificial infinity sentinel.
         let mut damping = self.options.damping_factor;
         let mut last_error: Option<f64> = None;
-        // Retain only the most recent accepted projection or correction solve;
-        // this is the factorization provenance relevant to the current state.
+        // Retain only the most recent accepted correction solve; this is the
+        // factorization provenance relevant to the current state.
         let mut last_linear_solve: Option<LinearSolveDiagnostic> = None;
 
         let num_equations = jacobian.equation_count();
@@ -804,91 +762,10 @@ impl NewtonRaphsonSolver {
             let error = f_vals.norm();
             convergence_history.push(error);
 
-            // The origin-based point policy cannot damp a vector directly from
-            // an arbitrary current point to the projected Newton point: doing so
-            // retains the same fraction of the current Jacobian-null-space
-            // component. Remove that component as its own accepted update first.
-            // Subsequent damped corrections then remain entirely in the row
-            // space and are minimum-norm solutions of their damped linearization.
-            if num_equations < num_variables
-                && self.options.underdetermined_policy
-                    == UnderdeterminedPolicy::MinimumNormLinearizedSolution
-            {
-                let projection_result = self.project_underdetermined_current_point(
-                    jacobian_workspace.jacobian(),
-                    &vars,
-                    least_squares_workspace.as_mut(),
-                    parallel,
-                );
-                let projection = match projection_result {
-                    Ok(projection) => projection,
-                    Err(LeastSquaresSolveError::InvalidInput(err)) => {
-                        return Err(SolverError::InvalidInput(err.to_string()));
-                    }
-                    Err(LeastSquaresSolveError::Singular {
-                        unregularized_error,
-                        regularized_error,
-                    }) => {
-                        let mut diagnostic = self.build_diagnostic(
-                            format!(
-                                "Could not project the current point out of the Jacobian null space (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
-                            ),
-                            iter,
-                            &vars,
-                            &f_vals,
-                        );
-                        diagnostic.last_linear_solve = last_linear_solve;
-                        return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
-                    }
-                };
-                last_linear_solve = Some(projection.diagnostic);
-
-                if let Some(projected_values) = projection.projected_values {
-                    // Apply the full null-space projection. Partial application
-                    // would preserve null-space content and violate the selected
-                    // point policy; damping is reserved for the residual-space
-                    // Newton correction on the following iteration.
-                    for (index, &var_id) in self.variables.iter().enumerate() {
-                        vars.insert(var_id, projected_values[(index, 0)]);
-                    }
-
-                    // A projection is an accepted variable update and receives
-                    // the same finite-state validation as an ordinary Newton
-                    // update before the next linearization is constructed.
-                    jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
-                    if !f_vals.all_finite() {
-                        return Err(Self::attach_linear_solve(
-                            self.non_finite_evaluation_error(
-                                "Minimum-norm point projection produced non-finite residuals",
-                                iter + 1,
-                                &vars,
-                                &f_vals,
-                            ),
-                            last_linear_solve,
-                        ));
-                    }
-                    jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
-                    if !jacobian_workspace.jacobian().all_finite() {
-                        return Err(Self::attach_linear_solve(
-                            self.non_finite_evaluation_error(
-                                "Minimum-norm point projection produced a non-finite Jacobian",
-                                iter + 1,
-                                &vars,
-                                &f_vals,
-                            ),
-                            last_linear_solve,
-                        ));
-                    }
-
-                    // Restart from the projected state so convergence, line
-                    // search, and damping all use residuals and derivatives from
-                    // exactly the same accepted point.
-                    continue;
-                }
-            }
-
             // A successful result requires the actual constraints to satisfy
-            // the residual threshold, independently of system shape.
+            // the residual threshold before any mutation is attempted. Every
+            // accepted iteration below is therefore one residual correction;
+            // no secondary point-selection policy can move or starve a root.
             if error <= self.options.residual_tolerance {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
@@ -948,32 +825,17 @@ impl NewtonRaphsonSolver {
                 f_neg[(i, 0)] = -f_vals[(i, 0)];
             }
 
-            // Step 2: Solve linear system J * delta = -f(x). Every shape returns
-            // the same internal result type so validation and terminal
-            // diagnostics do not diverge between square and rectangular paths.
-            let delta_result = {
-                let j_matrix = jacobian_workspace.jacobian();
-                // Wide systems need an explicit null-space policy. Square and
-                // tall systems share the same condition-aware QR/SVD dispatch,
-                // eliminating shape-dependent numerical classifications.
-                if j_matrix.rows() < j_matrix.cols() {
-                    self.solve_underdetermined_delta(
-                        j_matrix,
-                        &f_vals,
-                        &f_neg,
-                        &vars,
-                        least_squares_workspace.as_mut(),
-                        parallel,
-                    )
-                } else {
-                    self.solve_least_squares_system(
-                        j_matrix,
-                        &f_neg,
-                        least_squares_workspace.as_mut(),
-                        parallel,
-                    )
-                }
-            };
+            // Step 2: Solve J * delta = -f(x) through one shape-independent
+            // least-squares path. A wide Jacobian naturally yields the
+            // Moore-Penrose minimum-norm correction, which preserves the
+            // current null-space component without introducing a second point
+            // objective into nonlinear root finding.
+            let delta_result = self.solve_least_squares_system(
+                jacobian_workspace.jacobian(),
+                &f_neg,
+                least_squares_workspace.as_mut(),
+                parallel,
+            );
 
             let linear_solve = match delta_result {
                 Ok(linear_solve) => linear_solve,
@@ -1126,10 +988,9 @@ impl NewtonRaphsonSolver {
         }
         let final_error = residuals.norm();
         if final_error <= self.options.residual_tolerance {
-            // A minimum-norm null-space projection can consume the final allowed
-            // update and land directly on a root. There is no following loop
-            // iteration to run the ordinary residual check, so accept that final
-            // state here with diagnostics evaluated at the returned values.
+            // The final allowed correction can land directly on a root. There is
+            // no following loop iteration to run the ordinary residual check, so
+            // accept that state with diagnostics evaluated at returned values.
             let gradient =
                 Self::residual_gradient_measure(jacobian_workspace.jacobian(), &residuals);
             convergence_history.push(final_error);
@@ -1171,126 +1032,14 @@ impl NewtonRaphsonSolver {
         Err(SolverError::NoConvergence(Box::new(diag)))
     }
 
-    /// Compute the Newton correction for a wide Jacobian according to the
-    /// configured underdetermined null-space policy.
-    ///
-    /// Both policies use the same QR/SVD and regularization machinery; they
-    /// differ only in whether the rectangular solve minimizes the correction
-    /// vector or the next solution vector of the local affine constraint.
-    fn solve_underdetermined_delta(
-        &self,
-        j_matrix: &Matrix,
-        residuals: &Matrix,
-        negative_residuals: &Matrix,
-        vars: &HashMap<VarId, f64>,
-        workspace: Option<&mut LeastSquaresWorkspace>,
-        parallel: bool,
-    ) -> Result<LinearSolveResult, LeastSquaresSolveError> {
-        match self.options.underdetermined_policy {
-            UnderdeterminedPolicy::MinimumNormStep => {
-                // The rectangular least-squares solver returns the smallest
-                // correction satisfying the linearized equation J*delta=-f.
-                // Adding it to the current point preserves all existing
-                // Jacobian-null-space components.
-                self.solve_least_squares_system(j_matrix, negative_residuals, workspace, parallel)
-            }
-            UnderdeterminedPolicy::MinimumNormLinearizedSolution => {
-                // Assemble the current solve-variable vector in exactly the
-                // column order used by the Jacobian.
-                let mut current_values = Matrix::new(self.variables.len(), 1);
-                for (index, &var_id) in self.variables.iter().enumerate() {
-                    current_values[(index, 0)] = vars[&var_id];
-                }
-
-                // Linearizing f(x_next)=0 about x_current gives
-                // J*x_next = J*x_current - f. Solving this wide system directly
-                // removes arbitrary null-space content from the next point.
-                let jacobian_times_current = j_matrix
-                    .try_mul_with_parallel(&current_values, parallel)
-                    .map_err(LeastSquaresSolveError::InvalidInput)?;
-                let projected_rhs = jacobian_times_current
-                    .try_sub(residuals)
-                    .map_err(LeastSquaresSolveError::InvalidInput)?;
-                let next_result =
-                    self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
-
-                // The surrounding update loop consumes a correction, so convert
-                // the projected next point back into delta form while preserving
-                // the factorization diagnostic from that point solve.
-                let solution = next_result
-                    .solution
-                    .try_sub(&current_values)
-                    .map_err(LeastSquaresSolveError::InvalidInput)?;
-                Ok(LinearSolveResult {
-                    solution,
-                    diagnostic: next_result.diagnostic,
-                })
-            }
-        }
-    }
-
-    /// Project the current solve-variable vector onto the row space of a wide
-    /// Jacobian when origin-based minimum-norm point semantics are requested.
-    ///
-    /// Solving `J * x_projected = J * x_current` for its minimum-norm solution
-    /// removes exactly the component of `x_current` in the null space of `J`.
-    /// The returned projection contains `None` when the current point is already
-    /// projected to floating-point accuracy or `Some` with a full replacement
-    /// vector whose application must not be damped. Both cases retain the
-    /// factorization diagnostic used for the comparison.
-    fn project_underdetermined_current_point(
-        &self,
-        j_matrix: &Matrix,
-        vars: &HashMap<VarId, f64>,
-        workspace: Option<&mut LeastSquaresWorkspace>,
-        parallel: bool,
-    ) -> Result<ProjectionResult, LeastSquaresSolveError> {
-        // Assemble solve variables in Jacobian-column order. Fixed parameters do
-        // not appear in this vector and remain untouched by the projection.
-        let mut current_values = Matrix::new(self.variables.len(), 1);
-        for (index, &var_id) in self.variables.iter().enumerate() {
-            current_values[(index, 0)] = vars[&var_id];
-        }
-
-        // J*x is invariant under removal of any Jacobian-null-space component.
-        // Re-solving this right-hand side with the wide minimum-norm solver
-        // therefore produces the row-space representative of the same local
-        // linearized state.
-        let projected_rhs = j_matrix
-            .try_mul_with_parallel(&current_values, parallel)
-            .map_err(LeastSquaresSolveError::InvalidInput)?;
-        let projected_result =
-            self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
-        let projection_delta = projected_result
-            .solution
-            .try_sub(&current_values)
-            .map_err(LeastSquaresSolveError::InvalidInput)?;
-
-        // Avoid consuming iterations on roundoff-sized reprojections. Scaling by
-        // the current vector norm makes the threshold invariant under unit
-        // changes while the epsilon multiplier allows ordinary factorization
-        // noise.
-        let projection_threshold = self.options.projection_tolerance_multiplier
-            * f64::EPSILON
-            * current_values.norm().max(1.0);
-        let projected_values = if projection_delta.norm() <= projection_threshold {
-            None
-        } else {
-            Some(projected_result.solution)
-        };
-        Ok(ProjectionResult {
-            projected_values,
-            diagnostic: projected_result.diagnostic,
-        })
-    }
-
     /// Solve a possibly rectangular linear system against one right-hand side,
     /// applying adaptive regularization when factorization diagnostics indicate
     /// excessive conditioning.
     ///
-    /// The returned vector is intentionally named generically: callers use this
-    /// routine for both Newton corrections and projected next-point values. Its
-    /// paired diagnostic always describes the correction actually returned.
+    /// Wide systems use the least-squares implementation's minimum-norm
+    /// pseudoinverse result, while square and tall systems use the same
+    /// condition-aware QR/SVD dispatcher. The paired diagnostic always
+    /// describes the correction actually returned.
     fn solve_least_squares_system(
         &self,
         j_matrix: &Matrix,
@@ -1619,19 +1368,6 @@ impl NewtonRaphsonSolver {
                 self.options.regularization_growth_factor.is_finite()
                     && self.options.regularization_growth_factor >= 1.0,
                 "regularization_growth_factor must be finite and at least one",
-            )?;
-        }
-
-        // Projection tolerance matters only when a wide solve uses the
-        // origin-based policy that can actually project the current point.
-        if self.jacobian.equation_count() < self.variables.len()
-            && self.options.underdetermined_policy
-                == UnderdeterminedPolicy::MinimumNormLinearizedSolution
-        {
-            Self::require_valid_option(
-                self.options.projection_tolerance_multiplier.is_finite()
-                    && self.options.projection_tolerance_multiplier >= 0.0,
-                "projection_tolerance_multiplier must be finite and non-negative",
             )?;
         }
 
@@ -2539,28 +2275,6 @@ mod tests {
                 other => panic!("expected InvalidInput, got {other:?}"),
             }
         }
-
-        // Projection tolerance becomes active only for an underdetermined solve
-        // using the origin-based minimum-norm point policy.
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
-        let compiled = Compiler::compile(&[equation]).expect("compile failed");
-        let solver = configure_options(
-            NewtonRaphsonSolver::new(compiled)
-                .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormLinearizedSolution),
-            |options| options.projection_tolerance_multiplier = f64::NAN,
-        );
-        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
-        let error = solver
-            .solve(initial)
-            .expect_err("invalid active projection policy must be rejected");
-        match error {
-            SolverError::InvalidInput(message) => {
-                assert!(message.contains("projection_tolerance_multiplier"));
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
     }
 
     /// Keep configuration validation constant-time and ignore numerical policy
@@ -2588,8 +2302,7 @@ mod tests {
             assert_eq!(solution.iterations, 0);
 
             // Ordinary Newton does not read line-search settings, and disabled
-            // regularization does not read its retry or condition controls. The
-            // default minimum-step policy also never reads projection tolerance.
+            // regularization does not read its retry or condition controls.
             let solver = configure_options(
                 solver_for_mode(vec![equation.clone()], mode.clone()),
                 |options| {
@@ -2600,7 +2313,6 @@ mod tests {
                     options.armijo_coefficient = f64::NAN;
                     options.line_search_max_trials = 0;
                     options.line_search_min_step = f64::NAN;
-                    options.projection_tolerance_multiplier = f64::NAN;
                 },
             );
             let solution = solver
@@ -2609,14 +2321,13 @@ mod tests {
             assert_eq!(solution.iterations, 0);
 
             // Conversely, line search does not read ordinary adaptive damping's
-            // floor. Regularization and projection remain inactive as above.
+            // floor. Regularization remains inactive as above.
             let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
                 options.min_damping = f64::NAN;
                 options.regularization = 0.0;
                 options.condition_limit = f64::NAN;
                 options.regularization_attempts = usize::MAX;
                 options.regularization_growth_factor = f64::NAN;
-                options.projection_tolerance_multiplier = f64::NAN;
             });
             let solution = solver
                 .solve_with_line_search(initial)
@@ -3523,96 +3234,61 @@ mod tests {
         }
     }
 
+    /// Ensure a nonlinear wide system certifies roots before mutation and still
+    /// makes genuine minimum-norm residual corrections away from a root.
     #[test]
-    fn test_underconstrained_linearized_solution_policy_returns_minimum_norm_point() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Underdetermined system: x + y = 1 has infinitely many solutions.
-            // The explicit point policy should discard the initial null-space
-            // component and return x=y=0.5.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-
-            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
-            let solver = solver_for_mode(vec![eq], mode)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(10)
-                .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormLinearizedSolution);
-
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 10.0);
-            initial.insert("y".to_string(), -10.0);
-
-            let solution = solver.solve(initial).expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
-            assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
-        }
-    }
-
-    /// Verify that damping changes only residual-space progress and never leaves
-    /// a fraction of an inherited Jacobian-null-space component in the result.
-    #[test]
-    fn test_damped_linearized_solution_policy_remains_minimum_norm() {
+    fn test_nonlinear_underdetermined_solver_never_starves_corrections() {
         for use_line_search in [false, true] {
-            let mut serial_solution: Option<Solution> = None;
             for mode in test_modes() {
-                let is_serial = matches!(mode, Mode::Serial);
-
-                // The initial values have a null-space component of magnitude
-                // 1e8. Damping the old current-to-target delta left about 0.0058
-                // of that component when residual tolerance terminated, yielding
-                // visibly unequal coordinates despite the point policy.
+                // The Jacobian row [y, x] rotates as either coordinate changes.
+                // The removed point-projection phase repeatedly chased that row
+                // space, moved the exact root (2, 0.5), and never executed the
+                // residual correction shared by ordinary and line-search solves.
                 let x = Exp::var("x");
                 let y = Exp::var("y");
-                let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+                let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
                 let solver = solver_for_mode(vec![equation], mode)
-                    .with_underdetermined_policy(
-                        UnderdeterminedPolicy::MinimumNormLinearizedSolution,
-                    )
-                    .with_damping(0.5)
-                    .with_residual_tolerance(1e-10)
-                    .with_max_iterations(100);
-                let initial = HashMap::from([("x".to_string(), 1.0e8), ("y".to_string(), -1.0e8)]);
+                    .with_residual_tolerance(1e-12)
+                    .with_regularization(0.0);
 
+                let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
+                let solution = if use_line_search {
+                    solver.solve_with_line_search(exact_root)
+                } else {
+                    solver.solve(exact_root)
+                }
+                .expect("an exact nonlinear root must remain unchanged");
+                assert_eq!(solution.iterations, 0);
+                assert_eq!(solution.values["x"], 2.0);
+                assert_eq!(solution.values["y"], 0.5);
+
+                // Reuse the same compiled solver away from the root. Every
+                // accepted iteration must now be a residual-reducing Newton
+                // correction rather than a projection-only state transition.
+                let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
                 let solution = if use_line_search {
                     solver.solve_with_line_search(initial)
                 } else {
                     solver.solve(initial)
                 }
-                .expect("damped point policy should retain minimum-norm semantics");
-
-                if is_serial {
-                    serial_solution = Some(solution.clone());
-                } else {
-                    let serial = serial_solution.as_ref().expect("serial solution missing");
-                    assert_solution_close(serial, &solution, 1e-10);
-                }
-                assert!((solution.values["x"] - 0.5).abs() < 1e-9);
-                assert!((solution.values["y"] - 0.5).abs() < 1e-9);
-                assert!((solution.values["x"] - solution.values["y"]).abs() < 1e-10);
+                .expect("a nonlinear wide system must execute Newton corrections");
+                assert!(solution.iterations > 0);
+                assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
             }
         }
     }
 
-    /// Confirm that the default minimum-step policy deliberately preserves the
-    /// initial Jacobian-null-space component for continuity-sensitive clients.
+    /// Confirm that a wide solve preserves the initial Jacobian-null-space
+    /// component by applying the unique minimum-norm Newton correction.
     #[test]
-    fn test_underconstrained_minimum_step_policy_preserves_null_space_component() {
+    fn test_underconstrained_solver_preserves_null_space_component() {
         for mode in test_modes() {
             // The initial point has x+y=0 and a large component in the [1,-1]
             // null-space direction. The minimum correction is [0.5,0.5].
             let x = Exp::var("x");
             let y = Exp::var("y");
             let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormStep);
+            let solver = solver_for_mode(vec![equation], mode);
             let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
 
             let solution = solver

@@ -19,8 +19,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nonlinear iteration, line-search, regularization, and rank policy.
 - Added structured equation diagnostics and optional caller-provided equation
   traces to make failed constraints identifiable without parsing messages.
-- Added explicit `UnderdeterminedPolicy` choices for minimum-norm corrections
-  and origin-based minimum-norm points.
 - Added structured matrix errors for invalid shapes and tolerances, overflowing
   dimensions, allocation failure, non-finite states, and failed convergence.
 - Added executable crate documentation, compiled README examples, complete
@@ -44,8 +42,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of scanning retry budgets or rejecting inactive numerical policies.
 - Changed Armijo line search to operate directly on the residual norm with the
   scale-safe directional derivative `(f / ||f||)^T (J delta)`.
-- Made minimum-norm-point projection a separate accepted update so damping does
-  not reintroduce an initial Jacobian-null-space component.
+- Removed origin-based point projection from nonlinear iteration; every wide
+  system now uses one minimum-norm Newton correction per accepted update.
 - Cached simplified symbolic derivatives at solver construction while keeping
   independent reusable numerical workspaces for every solve invocation.
 - Restricted the compiled-expression Jacobian to crate scope and removed the

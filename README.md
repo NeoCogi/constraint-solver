@@ -78,30 +78,28 @@ let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-10);
 ```
 
-### Under-constrained example (minimum-norm linearized solution)
+### Under-constrained example (minimum-norm correction)
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, UnderdeterminedPolicy};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
 let y = Exp::var("y");
 
-// x + y = 1 has infinitely many solutions. The point policy removes any
-// null-space component inherited from the initial guess.
+// x + y = 1 has infinitely many solutions. The minimum-norm Newton correction
+// preserves the initial [1, -1] null-space component.
 let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 let compiled = Compiler::compile(&[eq]).expect("compile failed");
-let solver = NewtonRaphsonSolver::new(compiled).with_underdetermined_policy(
-    UnderdeterminedPolicy::MinimumNormLinearizedSolution,
-);
+let solver = NewtonRaphsonSolver::new(compiled);
 
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 10.0);
 initial.insert("y".to_string(), -10.0);
 let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-10);
-assert!((solution.values["x"] - 0.5).abs() < 1e-10);
-assert!((solution.values["y"] - 0.5).abs() < 1e-10);
+assert!((solution.values["x"] - 10.5).abs() < 1e-10);
+assert!((solution.values["y"] + 9.5).abs() < 1e-10);
 ```
 
 ### Over-constrained example (least squares)
@@ -241,10 +239,8 @@ decisions.
 ## Notes
 
 - The solver supports square, under-constrained, and over-constrained systems.
-- The default underdetermined policy minimizes each Newton correction and
-  preserves the initial null-space component. Use
-  `UnderdeterminedPolicy::MinimumNormLinearizedSolution` when each local
-  linearization should instead choose its origin-based minimum-norm point.
+- Underdetermined systems use the Moore-Penrose minimum-norm Newton correction,
+  preserving the current Jacobian-null-space component for continuity.
 - Least squares solving uses Householder QR for full-rank systems and a
   one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
   avoid forming normal equations.
