@@ -50,6 +50,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sentinels or treating deliberately damped progress as stagnation.
 - Rejected NaN, infinity, and finite-input arithmetic overflow at matrix solve
   boundaries instead of returning invalid successful matrices.
+- Normalized Householder reflector construction before subtracting its leading
+  value, preventing large finite full-rank systems from returning inaccurate QR
+  solutions after an intermediate sum overflowed.
 - Checked matrix element products and augmented row sums before allocation.
 - Removed redundant initial-variable and Jacobian copies, unused Householder
   storage, and repeated quadratic clearing of immutable regularization zeros.

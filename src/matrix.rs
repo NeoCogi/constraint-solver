@@ -300,7 +300,82 @@ struct JacobiSvd {
     singular_values: Vec<f64>,
 }
 
+/// Compact parameters for one in-place Householder reflector.
+///
+/// Entries below the active diagonal are stored directly in the factor matrix
+/// with an implicit leading one. These two scalars complete the representation
+/// needed by both tall and transpose-oriented wide QR paths.
+#[derive(Debug, Clone, Copy)]
+struct HouseholderReflector {
+    /// Signed diagonal value written to the upper-triangular factor after the
+    /// reflector has been applied to all remaining operands.
+    diagonal: f64,
+    /// Multiplier `2 / (v^T v)` for the implicit-one reflector vector.
+    tau: f64,
+}
+
 impl Matrix {
+    /// Build one scale-safe Householder reflector in a matrix column.
+    ///
+    /// The active column begins at `diagonal_index` and extends to the matrix's
+    /// final row. Entries below the diagonal are replaced with the tail of a
+    /// reflector vector whose leading component is implicitly one. `None`
+    /// represents an already-zero active column.
+    fn prepare_householder_column(
+        factor: &mut Matrix,
+        diagonal_index: usize,
+        column: usize,
+        operation: &'static str,
+    ) -> Result<Option<HouseholderReflector>, MatrixError> {
+        // Accumulate the norm with `hypot` so finite columns do not overflow or
+        // underflow merely because their squared entries are outside f64 range.
+        let mut column_norm = 0.0_f64;
+        for row in diagonal_index..factor.rows {
+            column_norm = column_norm.hypot(factor[(row, column)]);
+        }
+        if !column_norm.is_finite() {
+            return Err(MatrixError::NonFiniteFactor { operation });
+        }
+        if column_norm == 0.0 {
+            return Ok(None);
+        }
+
+        let leading_value = factor[(diagonal_index, column)];
+        let sign = if leading_value >= 0.0 { 1.0 } else { -1.0 };
+        let diagonal = -sign * column_norm;
+
+        // The conventional denominator `leading_value - diagonal` can overflow
+        // when two same-scale finite magnitudes are added. Divide the complete
+        // expression by `column_norm` first: both numerator terms are bounded by
+        // one, while the normalized denominator has magnitude in [1, 2].
+        let normalized_leading_value = leading_value / column_norm;
+        let normalized_denominator = normalized_leading_value + sign;
+        if normalized_denominator == 0.0 || !normalized_denominator.is_finite() {
+            return Err(MatrixError::NonFiniteFactor { operation });
+        }
+
+        let mut vector_norm_squared = 1.0;
+        for row in (diagonal_index + 1)..factor.rows {
+            let normalized_entry = factor[(row, column)] / column_norm;
+            let reflector_entry = normalized_entry / normalized_denominator;
+            if !reflector_entry.is_finite() {
+                return Err(MatrixError::NonFiniteFactor { operation });
+            }
+            factor[(row, column)] = reflector_entry;
+            vector_norm_squared += reflector_entry * reflector_entry;
+        }
+        if !vector_norm_squared.is_finite() {
+            return Err(MatrixError::NonFiniteFactor { operation });
+        }
+
+        let tau = 2.0 / vector_norm_squared;
+        if !tau.is_finite() {
+            return Err(MatrixError::NonFiniteFactor { operation });
+        }
+
+        Ok(Some(HouseholderReflector { diagonal, tau }))
+    }
+
     /// Allocate a zero-filled matrix with the requested shape.
     ///
     /// # Panics
@@ -1177,37 +1252,12 @@ impl Matrix {
 
         // Householder QR factorization (thin): apply reflectors to `r` and `qt_b`.
         for k in 0..n {
-            let mut col_norm: f64 = 0.0;
-            for i in k..m {
-                col_norm = col_norm.hypot(r[(i, k)]);
-            }
-
-            if !col_norm.is_finite() {
-                return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares",
-                });
-            }
-
-            if col_norm == 0.0 {
+            let Some(reflector) =
+                Self::prepare_householder_column(&mut r, k, k, "solve_least_squares")?
+            else {
                 continue;
-            }
-
-            let x0 = r[(k, k)];
-            let sign = if x0 >= 0.0 { 1.0 } else { -1.0 };
-            let alpha = -sign * col_norm;
-            let v0 = x0 - alpha;
-
-            // Store Householder vector v in-place in column k (v0 is implicit 1.0).
-            for i in (k + 1)..m {
-                r[(i, k)] /= v0;
-            }
-
-            let mut v_sq = 1.0;
-            for i in (k + 1)..m {
-                let vi = r[(i, k)];
-                v_sq += vi * vi;
-            }
-            let tau = 2.0 / v_sq;
+            };
+            let tau = reflector.tau;
 
             // Apply reflector to remaining columns.
             let cols_left = n.saturating_sub(k + 1);
@@ -1297,7 +1347,7 @@ impl Matrix {
                 }
             }
 
-            r[(k, k)] = alpha;
+            r[(k, k)] = reflector.diagonal;
         }
 
         // Householder updates can overflow even when every input is finite.
@@ -1398,37 +1448,13 @@ impl Matrix {
 
         // Householder QR on r (n x m), producing R in the top m x m block.
         for k in 0..m {
-            let mut col_norm: f64 = 0.0;
-            for i in k..n {
-                col_norm = col_norm.hypot(r[(i, k)]);
-            }
-
-            if !col_norm.is_finite() {
-                return Err(MatrixError::NonFiniteFactor {
-                    operation: "solve_least_squares",
-                });
-            }
-
-            if col_norm == 0.0 {
+            let Some(reflector) =
+                Self::prepare_householder_column(&mut r, k, k, "solve_least_squares")?
+            else {
                 taus.push(0.0);
                 continue;
-            }
-
-            let x0 = r[(k, k)];
-            let sign = if x0 >= 0.0 { 1.0 } else { -1.0 };
-            let alpha = -sign * col_norm;
-            let v0 = x0 - alpha;
-
-            for i in (k + 1)..n {
-                r[(i, k)] /= v0;
-            }
-
-            let mut v_sq = 1.0;
-            for i in (k + 1)..n {
-                let vi = r[(i, k)];
-                v_sq += vi * vi;
-            }
-            let tau = 2.0 / v_sq;
+            };
+            let tau = reflector.tau;
             taus.push(tau);
 
             let cols_left = m.saturating_sub(k + 1);
@@ -1491,7 +1517,7 @@ impl Matrix {
                 }
             }
 
-            r[(k, k)] = alpha;
+            r[(k, k)] = reflector.diagonal;
         }
 
         // Do not let overflow in the transposed Householder factor masquerade as
@@ -2287,6 +2313,47 @@ mod tests {
         assert!(info.cond_est.is_finite());
         assert!((solution[(0, 0)] - 0.2).abs() < 1e-12);
         assert!((solution[(1, 0)] - 0.4).abs() < 1e-12);
+    }
+
+    /// Verify that reflector normalization does not overflow when a finite
+    /// leading value and finite column norm would have an unrepresentable sum.
+    #[test]
+    fn test_tall_qr_handles_extreme_finite_reflector_scale() {
+        let coefficient = Matrix::from_vec(vec![1e308, 1e308], 2, 1).unwrap();
+        let right_hand_side = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
+
+        let (solution, info) = coefficient
+            .solve_least_squares_with_info(&right_hand_side)
+            .unwrap();
+
+        // Both equations are identical after scaling, so x=1e-308 is the exact
+        // least-squares solution. Compare by ratio because the expected value is
+        // subnormal enough that an absolute tolerance would hide a large error.
+        let relative_error = (solution[(0, 0)] / 1e-308 - 1.0).abs();
+        assert!(relative_error < 1e-12, "relative error: {relative_error}");
+        assert_eq!(info.rank, 1);
+        assert_eq!(info.method, LeastSquaresMethod::HouseholderQr);
+    }
+
+    /// Exercise the same scale-safe reflector construction through the
+    /// transpose-oriented QR path used for wide minimum-norm systems.
+    #[test]
+    fn test_wide_qr_handles_extreme_finite_reflector_scale() {
+        let coefficient = Matrix::from_vec(vec![1e308, 1e308], 1, 2).unwrap();
+        let right_hand_side = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
+
+        let (solution, info) = coefficient
+            .solve_least_squares_with_info(&right_hand_side)
+            .unwrap();
+
+        // Symmetry gives the minimum-norm solution [5e-309, 5e-309]. Check each
+        // component relatively so the regression remains sensitive at this scale.
+        for row in 0..2 {
+            let relative_error = (solution[(row, 0)] / 5e-309 - 1.0).abs();
+            assert!(relative_error < 1e-12, "relative error: {relative_error}");
+        }
+        assert_eq!(info.rank, 1);
+        assert_eq!(info.method, LeastSquaresMethod::HouseholderQr);
     }
 
     #[test]
