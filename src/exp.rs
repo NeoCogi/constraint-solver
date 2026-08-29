@@ -31,7 +31,10 @@ use std::fmt;
 ///
 /// Expressions represent residual functions rather than equations with a
 /// separate equality operator: a constraint is satisfied when its expression
-/// evaluates to zero.
+/// evaluates to zero. The solver differentiates the tree as written and does
+/// not substitute finite-difference derivatives. Algebraically equivalent
+/// trees can consequently behave differently at domain boundaries where one
+/// symbolic derivative contains an indeterminate floating-point operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exp {
     /// Literal floating-point constant.

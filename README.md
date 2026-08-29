@@ -244,6 +244,13 @@ decisions.
   once during construction. Each solve creates independent numerical storage
   and reuses that storage between iterations, so solver reuse avoids both
   repeated symbolic work and per-iteration matrix allocation.
+- Derivatives are evaluated from the exact symbolic tree; the solver does not
+  replace non-finite derivatives with finite differences. A finite residual at
+  a domain boundary may therefore still return
+  `SolverError::NonFiniteEvaluation` when the written derivative contains an
+  indeterminate form such as `0 * infinity`. Start inside the differentiable
+  domain or rewrite the expression—for example, use `x^1.5` instead of
+  `x * sqrt(x)` when evaluating at `x = 0` is required.
 
 ## License
 

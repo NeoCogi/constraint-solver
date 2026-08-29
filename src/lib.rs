@@ -30,6 +30,15 @@ SOFTWARE.
 //! systems with [`NewtonRaphsonSolver`]. Rectangular linearizations use QR for
 //! full-rank systems and a Jacobi-SVD pseudoinverse for rank-deficient systems.
 //!
+//! The solver differentiates the supplied expression tree symbolically. It
+//! does not estimate or repair derivatives with finite differences. At a
+//! domain boundary, a finite residual can therefore have a non-finite symbolic
+//! derivative when the chosen expression contains an IEEE-754 indeterminate
+//! form such as `0 * infinity`. In that case solving returns
+//! [`SolverError::NonFiniteEvaluation`]; callers should start inside the
+//! expression's differentiable domain or rewrite the expression into a form
+//! whose derivative is finite at the intended starting point.
+//!
 //! # Quick start
 //!
 //! ```

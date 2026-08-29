@@ -2617,6 +2617,45 @@ mod tests {
         }
     }
 
+    /// Preserve exact symbolic-derivative behavior at a removable boundary
+    /// singularity and demonstrate the caller-controlled algebraic rewrite.
+    #[test]
+    fn test_solver_requires_boundary_safe_expression_form() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+
+            // Differentiating x*sqrt(x) with the product rule retains
+            // x*(0.5*x^-0.5). At x=0 that term evaluates as 0*infinity, so the
+            // exact symbolic Jacobian is NaN even though the residual is -1.
+            let boundary_singular = Exp::sub(
+                Exp::add(Exp::mul(x.clone(), Exp::power(x.clone(), 0.5)), x.clone()),
+                Exp::val(1.0),
+            );
+            let solver = solver_for_mode(vec![boundary_singular], mode.clone());
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial.clone())
+                .expect_err("the written product has a non-finite derivative at zero");
+            match error {
+                SolverError::NonFiniteEvaluation(diagnostic) => {
+                    assert!(diagnostic.message.contains("Jacobian evaluation"));
+                    assert_eq!(diagnostic.error, 1.0);
+                }
+                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+            }
+
+            // x^(3/2) is algebraically identical for x>=0, but its symbolic
+            // derivative is finite at zero. This explicit model rewrite lets
+            // Newton iteration leave the domain boundary and certify the root.
+            let boundary_safe = Exp::sub(Exp::add(Exp::power(x.clone(), 1.5), x), Exp::val(1.0));
+            let solution = solver_for_mode(vec![boundary_safe], mode)
+                .solve(initial)
+                .expect("the rewritten expression has a finite boundary derivative");
+            assert!(solution.error < 1e-10);
+        }
+    }
+
     #[test]
     fn test_with_equation_traces_rejects_invalid_length() {
         let mut serial_error: Option<SolverError> = None;
