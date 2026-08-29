@@ -70,8 +70,8 @@ pub use matrix::{
 };
 pub use mode::Mode;
 pub use solver::{
-    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverOptions,
-    SolverRunDiagnostic, UnderdeterminedPolicy,
+    EquationDiagnostic, EquationTrace, LinearSolveDiagnostic, NewtonRaphsonSolver, Solution,
+    SolverError, SolverOptions, SolverRunDiagnostic, UnderdeterminedPolicy,
 };
 
 /// Documentation-only container that makes every Rust block in the repository

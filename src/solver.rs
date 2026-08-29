@@ -99,6 +99,24 @@ struct ResidualGradientMeasure {
     relative_norm: Option<f64>,
 }
 
+/// Internal correction vector paired with the public diagnostic that describes
+/// how its linearized system was solved.
+struct LinearSolveResult {
+    /// Newton correction or projected variable vector produced by the solve.
+    solution: Matrix,
+    /// Factorization and regularization details for caller-facing results.
+    diagnostic: LinearSolveDiagnostic,
+}
+
+/// Internal result of testing an underdetermined current-point projection.
+struct ProjectionResult {
+    /// Replacement point when the current null-space component is significant,
+    /// or `None` when the point is already projected within tolerance.
+    projected_values: Option<Matrix>,
+    /// Linear solve used to compute the row-space representative.
+    diagnostic: LinearSolveDiagnostic,
+}
+
 impl ResidualGradientMeasure {
     /// Return whether the dimensionless gradient meets the configured
     /// first-order stationarity tolerance.
@@ -289,6 +307,9 @@ pub struct Solution {
     /// so the normalized first-order measure was undefined. A successful root
     /// commonly has a zero residual and therefore reports `None` here.
     pub relative_gradient_norm: Option<f64>,
+    /// Last linearized correction solve, or `None` when the initial point already
+    /// satisfied the residual tolerance and no factorization was needed.
+    pub last_linear_solve: Option<LinearSolveDiagnostic>,
     /// Residual norms for the initial point and each accepted update through the
     /// returned point.
     pub convergence_history: Vec<f64>,
@@ -316,6 +337,21 @@ pub struct EquationDiagnostic {
     pub trace: Option<EquationTrace>,
 }
 
+/// Numerical provenance for one accepted nonlinear correction or point
+/// projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearSolveDiagnostic {
+    /// Rank and condition classification of the original Jacobian solve when it
+    /// completed successfully, even if it was later replaced by regularization.
+    pub unregularized: Option<LeastSquaresInfo>,
+    /// Rank, condition estimate, and QR/SVD method that produced the correction
+    /// actually used by the nonlinear solver.
+    pub effective: LeastSquaresInfo,
+    /// Ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or `None` when the
+    /// original unregularized solution was used.
+    pub regularization: Option<f64>,
+}
+
 /// Complete numerical state captured when a solver run fails.
 #[derive(Debug, Clone)]
 pub struct SolverRunDiagnostic {
@@ -333,6 +369,11 @@ pub struct SolverRunDiagnostic {
     /// Dimensionless normalized residual-gradient norm when it was defined and
     /// evaluated at the diagnostic state.
     pub relative_gradient_norm: Option<f64>,
+    /// Last successful linearized solve represented by this failure state.
+    ///
+    /// `None` means failure occurred before any correction was produced, such as
+    /// an invalid initial evaluation or an initially stationary non-root.
+    pub last_linear_solve: Option<LinearSolveDiagnostic>,
     /// Variable values at the end of the run, keyed by compiled variable name.
     pub values: HashMap<String, f64>,
     /// Per-equation residuals enriched with any attached source metadata.
@@ -720,6 +761,9 @@ impl NewtonRaphsonSolver {
         // it observed an improvement from an artificial infinity sentinel.
         let mut damping = self.options.damping_factor;
         let mut last_error: Option<f64> = None;
+        // Retain only the most recent accepted projection or correction solve;
+        // this is the factorization provenance relevant to the current state.
+        let mut last_linear_solve: Option<LinearSolveDiagnostic> = None;
 
         let num_equations = jacobian.equation_count();
         let num_variables = self.variables.len();
@@ -744,19 +788,25 @@ impl NewtonRaphsonSolver {
             // Step 1: Evaluate function values f(x)
             jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
             if !f_vals.all_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Residual evaluation produced NaN or infinity",
-                    iter,
-                    &vars,
-                    &f_vals,
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Residual evaluation produced NaN or infinity",
+                        iter,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
                 ));
             }
             if !jacobian_workspace.jacobian().all_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Jacobian evaluation produced NaN or infinity",
-                    iter,
-                    &vars,
-                    &f_vals,
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Jacobian evaluation produced NaN or infinity",
+                        iter,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
                 ));
             }
             let error = f_vals.norm();
@@ -778,8 +828,8 @@ impl NewtonRaphsonSolver {
                     least_squares_workspace.as_mut(),
                     parallel,
                 );
-                let projected_values = match projection_result {
-                    Ok(projected_values) => projected_values,
+                let projection = match projection_result {
+                    Ok(projection) => projection,
                     Err(LeastSquaresSolveError::InvalidInput(err)) => {
                         return Err(SolverError::InvalidInput(err.to_string()));
                     }
@@ -787,7 +837,7 @@ impl NewtonRaphsonSolver {
                         unregularized_error,
                         regularized_error,
                     }) => {
-                        let diagnostic = self.build_diagnostic(
+                        let mut diagnostic = self.build_diagnostic(
                             format!(
                                 "Could not project the current point out of the Jacobian null space (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
                             ),
@@ -795,11 +845,13 @@ impl NewtonRaphsonSolver {
                             &vars,
                             &f_vals,
                         );
+                        diagnostic.last_linear_solve = last_linear_solve;
                         return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
                     }
                 };
+                last_linear_solve = Some(projection.diagnostic);
 
-                if let Some(projected_values) = projected_values {
+                if let Some(projected_values) = projection.projected_values {
                     // Apply the full null-space projection. Partial application
                     // would preserve null-space content and violate the selected
                     // point policy; damping is reserved for the residual-space
@@ -813,20 +865,26 @@ impl NewtonRaphsonSolver {
                     // update before the next linearization is constructed.
                     jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
                     if !f_vals.all_finite() {
-                        return Err(self.non_finite_evaluation_error(
-                            "Minimum-norm point projection produced non-finite residuals",
-                            iter + 1,
-                            &vars,
-                            &f_vals,
+                        return Err(Self::attach_linear_solve(
+                            self.non_finite_evaluation_error(
+                                "Minimum-norm point projection produced non-finite residuals",
+                                iter + 1,
+                                &vars,
+                                &f_vals,
+                            ),
+                            last_linear_solve,
                         ));
                     }
                     jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
                     if !jacobian_workspace.jacobian().all_finite() {
-                        return Err(self.non_finite_evaluation_error(
-                            "Minimum-norm point projection produced a non-finite Jacobian",
-                            iter + 1,
-                            &vars,
-                            &f_vals,
+                        return Err(Self::attach_linear_solve(
+                            self.non_finite_evaluation_error(
+                                "Minimum-norm point projection produced a non-finite Jacobian",
+                                iter + 1,
+                                &vars,
+                                &f_vals,
+                            ),
+                            last_linear_solve,
                         ));
                     }
 
@@ -849,7 +907,14 @@ impl NewtonRaphsonSolver {
                     &vars,
                     iter,
                 )?;
-                return Ok(self.build_solution(&vars, iter, error, gradient, convergence_history));
+                return Ok(self.build_solution(
+                    &vars,
+                    iter,
+                    error,
+                    gradient,
+                    last_linear_solve,
+                    convergence_history,
+                ));
             }
 
             // Every system shape can reach a first-order fixed point that is not
@@ -863,7 +928,13 @@ impl NewtonRaphsonSolver {
                 iter,
             )?;
             if gradient.is_stationary(self.options.stationarity_tolerance) {
-                return Err(self.stationary_non_root_error(iter, &vars, &f_vals, gradient));
+                return Err(self.stationary_non_root_error(
+                    iter,
+                    &vars,
+                    &f_vals,
+                    gradient,
+                    last_linear_solve,
+                ));
             }
 
             // Adaptive damping belongs only to the standard solver. Line search
@@ -921,8 +992,8 @@ impl NewtonRaphsonSolver {
                 }
             };
 
-            let delta = match delta_result {
-                Ok(delta) => delta,
+            let linear_solve = match delta_result {
+                Ok(linear_solve) => linear_solve,
                 Err(LeastSquaresSolveError::InvalidInput(err)) => {
                     return Err(SolverError::InvalidInput(err.to_string()));
                 }
@@ -930,7 +1001,7 @@ impl NewtonRaphsonSolver {
                     unregularized_error,
                     regularized_error,
                 }) => {
-                    let diagnostic = self.build_diagnostic(
+                    let mut diagnostic = self.build_diagnostic(
                         format!(
                             "Jacobian system could not produce a Newton correction (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
                         ),
@@ -938,16 +1009,22 @@ impl NewtonRaphsonSolver {
                         &vars,
                         &f_vals,
                     );
+                    diagnostic.last_linear_solve = last_linear_solve;
                     return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
                 }
             };
+            last_linear_solve = Some(linear_solve.diagnostic.clone());
+            let delta = linear_solve.solution;
 
             if !delta.all_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Linear solve produced a non-finite Newton correction",
-                    iter,
-                    &vars,
-                    &f_vals,
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Linear solve produced a non-finite Newton correction",
+                        iter,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
                 ));
             }
 
@@ -965,7 +1042,8 @@ impl NewtonRaphsonSolver {
                         parallel,
                         &vars,
                         iter,
-                    )?;
+                    )
+                    .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
                 self.line_search(LineSearchContext {
                     jacobian,
                     vars: &vars,
@@ -975,7 +1053,8 @@ impl NewtonRaphsonSolver {
                     accepted_updates: iter,
                     current_residuals: &f_vals,
                     candidate_residuals: &mut line_search_f_vals,
-                })?
+                })
+                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?
             } else {
                 // Use current damping factor as step size
                 damping
@@ -991,20 +1070,26 @@ impl NewtonRaphsonSolver {
             // the residual that preceded the update.
             jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
             if !f_vals.all_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Accepted Newton update produced non-finite residuals",
-                    iter + 1,
-                    &vars,
-                    &f_vals,
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Accepted Newton update produced non-finite residuals",
+                        iter + 1,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
                 ));
             }
             jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
             if !jacobian_workspace.jacobian().all_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Accepted Newton update produced a non-finite Jacobian",
-                    iter + 1,
-                    &vars,
-                    &f_vals,
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Accepted Newton update produced a non-finite Jacobian",
+                        iter + 1,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
                 ));
             }
             let updated_error = f_vals.norm();
@@ -1025,6 +1110,7 @@ impl NewtonRaphsonSolver {
                     iter + 1,
                     updated_error,
                     gradient,
+                    last_linear_solve,
                     convergence_history,
                 ));
             }
@@ -1038,11 +1124,14 @@ impl NewtonRaphsonSolver {
         // Failed to converge within max iterations
         let residuals = jacobian.evaluate_functions_checked(&vars)?;
         if !residuals.all_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Final residual evaluation produced NaN or infinity",
-                self.options.max_iterations,
-                &vars,
-                &residuals,
+            return Err(Self::attach_linear_solve(
+                self.non_finite_evaluation_error(
+                    "Final residual evaluation produced NaN or infinity",
+                    self.options.max_iterations,
+                    &vars,
+                    &residuals,
+                ),
+                last_linear_solve,
             ));
         }
         let final_error = residuals.norm();
@@ -1063,6 +1152,7 @@ impl NewtonRaphsonSolver {
                 self.options.max_iterations,
                 final_error,
                 gradient,
+                last_linear_solve,
                 convergence_history,
             ));
         }
@@ -1083,10 +1173,11 @@ impl NewtonRaphsonSolver {
                 &vars,
                 &residuals,
                 gradient,
+                last_linear_solve,
             ));
         }
 
-        let diag = self.build_diagnostic(
+        let mut diag = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
                 self.options.max_iterations, final_error
@@ -1095,6 +1186,7 @@ impl NewtonRaphsonSolver {
             &vars,
             &residuals,
         );
+        diag.last_linear_solve = last_linear_solve;
         Err(SolverError::NoConvergence(Box::new(diag)))
     }
 
@@ -1112,7 +1204,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         workspace: Option<&mut LeastSquaresWorkspace>,
         parallel: bool,
-    ) -> Result<Matrix, LeastSquaresSolveError> {
+    ) -> Result<LinearSolveResult, LeastSquaresSolveError> {
         match self.options.underdetermined_policy {
             UnderdeterminedPolicy::MinimumNormStep => {
                 // The rectangular least-squares solver returns the smallest
@@ -1138,14 +1230,20 @@ impl NewtonRaphsonSolver {
                 let projected_rhs = jacobian_times_current
                     .try_sub(residuals)
                     .map_err(LeastSquaresSolveError::InvalidInput)?;
-                let next_values =
+                let next_result =
                     self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
 
                 // The surrounding update loop consumes a correction, so convert
-                // the projected next point back into delta form.
-                next_values
+                // the projected next point back into delta form while preserving
+                // the factorization diagnostic from that point solve.
+                let solution = next_result
+                    .solution
                     .try_sub(&current_values)
-                    .map_err(LeastSquaresSolveError::InvalidInput)
+                    .map_err(LeastSquaresSolveError::InvalidInput)?;
+                Ok(LinearSolveResult {
+                    solution,
+                    diagnostic: next_result.diagnostic,
+                })
             }
         }
     }
@@ -1155,16 +1253,17 @@ impl NewtonRaphsonSolver {
     ///
     /// Solving `J * x_projected = J * x_current` for its minimum-norm solution
     /// removes exactly the component of `x_current` in the null space of `J`.
-    /// The returned `None` means the current point is already projected to
-    /// floating-point accuracy; `Some` contains a full replacement vector whose
-    /// application must not be damped.
+    /// The returned projection contains `None` when the current point is already
+    /// projected to floating-point accuracy or `Some` with a full replacement
+    /// vector whose application must not be damped. Both cases retain the
+    /// factorization diagnostic used for the comparison.
     fn project_underdetermined_current_point(
         &self,
         j_matrix: &Matrix,
         vars: &HashMap<VarId, f64>,
         workspace: Option<&mut LeastSquaresWorkspace>,
         parallel: bool,
-    ) -> Result<Option<Matrix>, LeastSquaresSolveError> {
+    ) -> Result<ProjectionResult, LeastSquaresSolveError> {
         // Assemble solve variables in Jacobian-column order. Fixed parameters do
         // not appear in this vector and remain untouched by the projection.
         let mut current_values = Matrix::new(self.variables.len(), 1);
@@ -1179,9 +1278,10 @@ impl NewtonRaphsonSolver {
         let projected_rhs = j_matrix
             .try_mul_with_parallel(&current_values, parallel)
             .map_err(LeastSquaresSolveError::InvalidInput)?;
-        let projected_values =
+        let projected_result =
             self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
-        let projection_delta = projected_values
+        let projection_delta = projected_result
+            .solution
             .try_sub(&current_values)
             .map_err(LeastSquaresSolveError::InvalidInput)?;
 
@@ -1192,11 +1292,15 @@ impl NewtonRaphsonSolver {
         let projection_threshold = self.options.projection_tolerance_multiplier
             * f64::EPSILON
             * current_values.norm().max(1.0);
-        if projection_delta.norm() <= projection_threshold {
-            Ok(None)
+        let projected_values = if projection_delta.norm() <= projection_threshold {
+            None
         } else {
-            Ok(Some(projected_values))
-        }
+            Some(projected_result.solution)
+        };
+        Ok(ProjectionResult {
+            projected_values,
+            diagnostic: projected_result.diagnostic,
+        })
     }
 
     /// Solve a possibly rectangular linear system against one right-hand side,
@@ -1204,14 +1308,15 @@ impl NewtonRaphsonSolver {
     /// excessive conditioning.
     ///
     /// The returned vector is intentionally named generically: callers use this
-    /// routine for both Newton corrections and projected next-point values.
+    /// routine for both Newton corrections and projected next-point values. Its
+    /// paired diagnostic always describes the correction actually returned.
     fn solve_least_squares_system(
         &self,
         j_matrix: &Matrix,
         rhs: &Matrix,
         workspace: Option<&mut LeastSquaresWorkspace>,
         parallel: bool,
-    ) -> Result<Matrix, LeastSquaresSolveError> {
+    ) -> Result<LinearSolveResult, LeastSquaresSolveError> {
         let mut workspace = workspace;
         // Prefer direct least squares to avoid forming normal equations (J^T J),
         // which can severely amplify conditioning issues. Full-rank systems use
@@ -1232,7 +1337,14 @@ impl NewtonRaphsonSolver {
         match j_matrix.solve_least_squares(rhs, self.options.least_squares, parallel) {
             Ok(result) => {
                 if !is_ill_conditioned(&result.info) {
-                    return Ok(result.solution);
+                    return Ok(LinearSolveResult {
+                        solution: result.solution,
+                        diagnostic: LinearSolveDiagnostic {
+                            unregularized: Some(result.info),
+                            effective: result.info,
+                            regularization: None,
+                        },
+                    });
                 }
                 unreg_delta = Some(result.solution);
                 unreg_info = Some(result.info);
@@ -1243,8 +1355,15 @@ impl NewtonRaphsonSolver {
         }
 
         if self.options.regularization <= 0.0 {
-            if let Some(delta) = unreg_delta {
-                return Ok(delta);
+            if let (Some(solution), Some(info)) = (unreg_delta, unreg_info) {
+                return Ok(LinearSolveResult {
+                    solution,
+                    diagnostic: LinearSolveDiagnostic {
+                        unregularized: Some(info),
+                        effective: info,
+                        regularization: None,
+                    },
+                });
             }
             return Err(LeastSquaresSolveError::Singular {
                 unregularized_error: unregularized_error
@@ -1254,7 +1373,7 @@ impl NewtonRaphsonSolver {
         }
 
         let mut last_err: Option<String> = None;
-        let mut last_solution: Option<Matrix> = None;
+        let mut last_result: Option<LinearSolveResult> = None;
         let mut regularization_factor = 1.0;
 
         for attempt in 0..self.options.regularization_attempts {
@@ -1334,10 +1453,18 @@ impl NewtonRaphsonSolver {
 
             match reg_result {
                 Ok(result) => {
-                    last_solution = Some(result.solution);
+                    let linear_result = LinearSolveResult {
+                        solution: result.solution,
+                        diagnostic: LinearSolveDiagnostic {
+                            unregularized: unreg_info,
+                            effective: result.info,
+                            regularization: Some(lambda),
+                        },
+                    };
                     if !is_ill_conditioned(&result.info) {
-                        return Ok(last_solution.unwrap());
+                        return Ok(linear_result);
                     }
+                    last_result = Some(linear_result);
                 }
                 Err(err) => {
                     last_err = Some(err.to_string());
@@ -1352,8 +1479,8 @@ impl NewtonRaphsonSolver {
             }
         }
 
-        if let Some(delta) = last_solution {
-            return Ok(delta);
+        if let Some(result) = last_result {
+            return Ok(result);
         }
 
         Err(LeastSquaresSolveError::Singular {
@@ -1595,6 +1722,7 @@ impl NewtonRaphsonSolver {
         iterations: usize,
         error: f64,
         gradient: ResidualGradientMeasure,
+        last_linear_solve: Option<LinearSolveDiagnostic>,
         convergence_history: Vec<f64>,
     ) -> Solution {
         // Convert internal IDs only after all numerical convergence checks have
@@ -1605,6 +1733,7 @@ impl NewtonRaphsonSolver {
             error,
             gradient_norm: gradient.absolute_norm,
             relative_gradient_norm: gradient.relative_norm,
+            last_linear_solve,
             convergence_history,
         }
     }
@@ -1617,6 +1746,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
         gradient: ResidualGradientMeasure,
+        last_linear_solve: Option<LinearSolveDiagnostic>,
     ) -> SolverError {
         // Start with the same values and per-equation trace data as every other
         // run failure, then attach the already-computed gradient measures so no
@@ -1634,7 +1764,30 @@ impl NewtonRaphsonSolver {
         );
         diagnostic.gradient_norm = Some(gradient.absolute_norm);
         diagnostic.relative_gradient_norm = gradient.relative_norm;
+        diagnostic.last_linear_solve = last_linear_solve;
         SolverError::StationaryNonRoot(Box::new(diagnostic))
+    }
+
+    /// Attach the last successful linear solve to any run-state error produced
+    /// after that correction was available.
+    fn attach_linear_solve(
+        mut error: SolverError,
+        last_linear_solve: Option<LinearSolveDiagnostic>,
+    ) -> SolverError {
+        // All run-state variants own the same boxed diagnostic shape. Invalid
+        // configuration errors occur before numerical correction and therefore
+        // have no attachment point.
+        let diagnostic = match &mut error {
+            SolverError::SingularMatrix(diagnostic)
+            | SolverError::NoConvergence(diagnostic)
+            | SolverError::NonFiniteEvaluation(diagnostic)
+            | SolverError::StationaryNonRoot(diagnostic) => Some(diagnostic),
+            SolverError::InvalidInput(_) => None,
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.last_linear_solve = last_linear_solve;
+        }
+        error
     }
 
     /// Compute absolute and dimensionless first-order least-squares gradients.
@@ -1843,6 +1996,7 @@ impl NewtonRaphsonSolver {
             error: residuals_matrix.norm(),
             gradient_norm: None,
             relative_gradient_norm: None,
+            last_linear_solve: None,
             values: self.values_by_name(vars),
             equations,
         }
@@ -1982,9 +2136,9 @@ impl NewtonRaphsonSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mode;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
+    use crate::{LeastSquaresMethod, Mode};
 
     struct TestRng {
         state: u64,
@@ -3005,6 +3159,12 @@ mod tests {
                     .relative_gradient_norm
                     .is_some_and(|norm| norm < 1e-8)
             );
+            let linear = diagnostic
+                .last_linear_solve
+                .as_ref()
+                .expect("stationarity reached after a QR correction");
+            assert_eq!(linear.effective.method, LeastSquaresMethod::HouseholderQr);
+            assert_eq!(linear.regularization, None);
         }
     }
 
@@ -3061,6 +3221,7 @@ mod tests {
 
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.convergence_history, vec![0.0]);
+            assert_eq!(solution.last_linear_solve, None);
         }
     }
 
@@ -3365,6 +3526,12 @@ mod tests {
             assert!(solution.error < 1e-12);
             assert!((solution.values["x"] - 0.5).abs() < 1e-10);
             assert!((solution.values["y"] - 0.5).abs() < 1e-10);
+            let linear = solution
+                .last_linear_solve
+                .expect("the accepted correction must retain SVD diagnostics");
+            assert_eq!(linear.effective.method, LeastSquaresMethod::JacobiSvd);
+            assert_eq!(linear.effective.rank, 1);
+            assert_eq!(linear.regularization, None);
         }
     }
 
@@ -3397,6 +3564,17 @@ mod tests {
                     assert_eq!(diagnostic.iterations, 1);
                     assert!(diagnostic.values["x"].abs() < 0.1);
                     assert!(diagnostic.error > 1e-12);
+                    let linear = diagnostic
+                        .last_linear_solve
+                        .as_ref()
+                        .expect("regularized correction diagnostics must be retained");
+                    assert_eq!(linear.effective.method, LeastSquaresMethod::HouseholderQr);
+                    assert!(linear.regularization.is_some());
+                    assert!(
+                        linear
+                            .unregularized
+                            .is_some_and(|info| info.cond_est > 1e12)
+                    );
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
