@@ -380,8 +380,10 @@ impl NewtonRaphsonSolver {
 
     /// Override the finite initial damping factor in the interval `(0, 1]`.
     ///
-    /// Configuration is validated when a solve begins; invalid values are not
-    /// silently clamped.
+    /// Standard solves use this value for their first accepted update and adapt
+    /// it only after observing a later residual. Line-search solves use it as
+    /// the largest initial trial step on every iteration. Configuration is
+    /// validated when a solve begins; invalid values are not silently clamped.
     pub fn with_damping(mut self, damping_factor: f64) -> Self {
         // Preserve the requested value for deterministic validation and error
         // reporting at the shared solve entry point.
@@ -455,9 +457,11 @@ impl NewtonRaphsonSolver {
         // accepted update.
         let mut convergence_history =
             Vec::with_capacity(self.max_iterations.saturating_add(1));
-        // Start with configured damping factor, will be adapted during iterations
+        // Standard solves begin with exactly the configured damping factor. A
+        // previous residual is optional so the first iteration cannot pretend
+        // it observed an improvement from an artificial infinity sentinel.
         let mut damping = self.damping_factor;
-        let mut last_error = f64::INFINITY;
+        let mut last_error: Option<f64> = None;
 
         let num_equations = self.equations.len();
         let num_variables = self.variables.len();
@@ -524,34 +528,46 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
-            // Check for stagnation (error not decreasing significantly)
-            if iter > 0 && (error - last_error).abs() < self.tolerance * 0.1 {
-                damping *= 0.5; // Reduce step size
-                if damping < self.min_damping {
-                    let diag = self.build_diagnostic(
-                        format!(
-                            "Solver stagnated at iteration {} with error {:.2e}",
-                            iter + 1,
-                            error
-                        ),
-                        iter + 1,
-                        &vars,
-                        &f_vals,
-                    );
-                    return Err(SolverError::NoConvergence(diag));
+            // Adaptive damping belongs only to the standard solver. Line search
+            // has its own evaluated acceptance and exhaustion rules, so mutating
+            // an unused damping value must not influence its stagnation outcome.
+            if !use_line_search {
+                if let Some(previous_error) = last_error {
+                    // A negligible residual change reduces the next standard
+                    // step. Repeated reductions below the supported minimum are
+                    // reported as stagnation.
+                    if (error - previous_error).abs() < self.tolerance * 0.1 {
+                        damping *= 0.5;
+                        if damping < self.min_damping {
+                            let diag = self.build_diagnostic(
+                                format!(
+                                    "Solver stagnated at iteration {} with error {:.2e}",
+                                    iter + 1,
+                                    error
+                                ),
+                                iter + 1,
+                                &vars,
+                                &f_vals,
+                            );
+                            return Err(SolverError::NoConvergence(diag));
+                        }
+                    }
+
+                    // Compare only two real consecutive residuals. This keeps
+                    // the caller's configured damping unchanged for the first
+                    // update and adapts it for subsequent updates.
+                    if error > previous_error * 1.5 {
+                        damping *= 0.5;
+                    } else if error < previous_error * 0.5 {
+                        damping = (damping * 1.2).min(1.0);
+                    }
                 }
-            }
 
-            // Adaptive damping based on error change
-            if error > last_error * 1.5 {
-                // Error increased significantly - reduce damping for stability
-                damping *= 0.5;
-            } else if error < last_error * 0.5 {
-                // Error decreased significantly - can increase damping for faster convergence
-                damping = (damping * 1.2).min(1.0);
+                // Retain the current residual for a genuine consecutive
+                // comparison on the next standard iteration. Line search does
+                // not maintain this unused state.
+                last_error = Some(error);
             }
-
-            last_error = error;
 
             for i in 0..num_equations {
                 f_neg[(i, 0)] = -f_vals[(i, 0)];
@@ -1219,9 +1235,10 @@ impl NewtonRaphsonSolver {
         const MIN_LINE_SEARCH_STEP: f64 = 1e-12;
         const SUFFICIENT_DECREASE_FRACTION: f64 = 0.5;
 
-        // Begin with the full Newton step and reuse a cloned variable map for
-        // all candidates so fixed parameters remain present on every trial.
-        let mut alpha = 1.0;
+        // Begin with the caller's configured maximum step and reuse a cloned
+        // variable map for all candidates so fixed parameters remain present on
+        // every trial.
+        let mut alpha = self.damping_factor;
         let mut new_vars = vars.clone();
         let mut attempted_trials = 0;
 
@@ -1763,6 +1780,62 @@ mod tests {
                     assert_eq!(diagnostic.error, 1.0);
                 }
                 other => panic!("expected line-search NoConvergence, got {other:?}"),
+            }
+        }
+    }
+
+    /// Verify that a standard solve uses the configured damping value unchanged
+    /// for its first Newton update.
+    #[test]
+    fn test_standard_solver_honors_initial_damping_on_first_step() {
+        for mode in test_modes() {
+            // The undamped Newton correction from x=0 is exactly one. With a
+            // single allowed update and damping 0.5, the final diagnostic must
+            // therefore contain x=0.5 rather than the formerly inflated x=0.6.
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_damping(0.5)
+                .with_max_iterations(1);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("one half-step cannot yet reach the root");
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert!((diagnostic.values["x"] - 0.5).abs() < 1e-12);
+                    assert!((diagnostic.error - 0.5).abs() < 1e-12);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
+            }
+        }
+    }
+
+    /// Confirm that damping is an effective maximum trial size for line-search
+    /// solves rather than an ignored setting.
+    #[test]
+    fn test_line_search_uses_configured_initial_trial_size() {
+        for mode in test_modes() {
+            // The full Newton step would solve this equation immediately. A
+            // configured maximum alpha of 0.25 must instead stop at x=0.25 after
+            // the single allowed update.
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_damping(0.25)
+                .with_max_iterations(1);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve_with_line_search(initial)
+                .expect_err("one quarter-step cannot yet reach the root");
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert!((diagnostic.values["x"] - 0.25).abs() < 1e-12);
+                    assert!((diagnostic.error - 0.75).abs() < 1e-12);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
             }
         }
     }
