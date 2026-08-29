@@ -33,10 +33,10 @@ pub mod solver;
 mod matrix_test;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
-pub use exp::{Exp, MissingVarError};
+pub use exp::Exp;
 pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 pub use mode::Mode;
 pub use solver::{
-    ConvergenceReason, EquationTrace, NewtonRaphsonSolver, Solution, SolverError,
-    SolverRunDiagnostic, UnderdeterminedPolicy,
+    ConvergenceReason, EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution,
+    SolverError, SolverRunDiagnostic, UnderdeterminedPolicy,
 };

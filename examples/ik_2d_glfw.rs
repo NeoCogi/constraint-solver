@@ -197,7 +197,9 @@ fn draw_vertices(
         gl.line_width(line_width);
 
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(state.vbo));
-        let byte_len = vertices.len() * std::mem::size_of::<f32>();
+        // Compute the complete slice size directly so element-count arithmetic
+        // cannot drift from the vertex element type.
+        let byte_len = std::mem::size_of_val(vertices);
         let bytes = std::slice::from_raw_parts(vertices.as_ptr() as *const u8, byte_len);
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
 

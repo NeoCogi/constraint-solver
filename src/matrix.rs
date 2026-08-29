@@ -52,17 +52,76 @@ fn qr_rank_tolerance(max_diagonal: f64) -> f64 {
     QR_RANK_RELATIVE_EPSILON * max_diagonal
 }
 
+/// Structured failure returned by all fallible matrix construction and linear
+/// algebra operations.
+///
+/// Variants retain machine-readable dimensions and operation names so callers
+/// no longer need to parse unrelated ad-hoc strings from LU and QR routines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixError {
+    /// Two matrix operands do not have the shapes required by an operation.
     DimensionMismatch {
+        /// Stable name of the operation that rejected the operands.
         operation: &'static str,
+        /// Shape of the primary or left-hand matrix as `(rows, columns)`.
         left: (usize, usize),
+        /// Shape of the secondary or right-hand matrix as `(rows, columns)`.
         right: (usize, usize),
+    },
+    /// A flat data buffer does not contain exactly one element per requested
+    /// matrix position.
+    InvalidDataLength {
+        /// Requested row count.
+        rows: usize,
+        /// Requested column count.
+        cols: usize,
+        /// Required data length for the requested shape.
+        expected: usize,
+        /// Actual number of supplied elements.
+        actual: usize,
+    },
+    /// Multiplying the requested dimensions overflowed `usize`, so the shape
+    /// cannot be represented by the contiguous matrix storage.
+    ElementCountOverflow {
+        /// Requested row count.
+        rows: usize,
+        /// Requested column count.
+        cols: usize,
+    },
+    /// An algorithm that requires a square coefficient matrix received a
+    /// rectangular matrix.
+    NonSquare {
+        /// Stable name of the rejecting operation.
+        operation: &'static str,
+        /// Actual matrix shape as `(rows, columns)`.
+        matrix: (usize, usize),
+    },
+    /// A numerical tolerance was negative, NaN, or infinite.
+    InvalidTolerance {
+        /// Stable name of the operation whose tolerance was invalid.
+        operation: &'static str,
+    },
+    /// A factorization encountered a pivot too small relative to its local
+    /// scale to support a stable solve.
+    Singular {
+        /// Stable name of the factorization or solve that detected singularity.
+        operation: &'static str,
+    },
+    /// Factorization arithmetic produced or encountered a non-finite diagonal
+    /// value.
+    NonFiniteFactor {
+        /// Stable name of the factorization or solve that detected the value.
+        operation: &'static str,
+    },
+    /// A QR solve could not determine a unique independent triangular system.
+    RankDeficient {
+        /// Stable name of the QR operation that detected rank loss.
+        operation: &'static str,
     },
 }
 
-#[derive(Debug, Clone, Copy)]
 /// Numerical diagnostics produced alongside a Householder QR solution.
+#[derive(Debug, Clone, Copy)]
 pub struct LeastSquaresQrInfo {
     /// Estimated numerical rank of the triangular factor using a threshold
     /// relative to its largest diagonal element.
@@ -85,31 +144,88 @@ impl fmt::Display for MatrixError {
                 "Matrix dimension mismatch for {}: left is {}x{}, right is {}x{}",
                 operation, left.0, left.1, right.0, right.1
             ),
+            MatrixError::InvalidDataLength {
+                rows,
+                cols,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Matrix data length mismatch for shape {rows}x{cols}: expected {expected}, got {actual}"
+            ),
+            MatrixError::ElementCountOverflow { rows, cols } => write!(
+                f,
+                "Matrix shape {rows}x{cols} exceeds the addressable element count"
+            ),
+            MatrixError::NonSquare { operation, matrix } => write!(
+                f,
+                "Matrix must be square for {operation}: received {}x{}",
+                matrix.0, matrix.1
+            ),
+            MatrixError::InvalidTolerance { operation } => {
+                write!(f, "Invalid numerical tolerance for {operation}")
+            }
+            MatrixError::Singular { operation } => {
+                write!(f, "Matrix is singular during {operation}")
+            }
+            MatrixError::NonFiniteFactor { operation } => {
+                write!(f, "Non-finite factor encountered during {operation}")
+            }
+            MatrixError::RankDeficient { operation } => {
+                write!(f, "Matrix is rank deficient during {operation}")
+            }
         }
     }
 }
 
 impl std::error::Error for MatrixError {}
 
+/// Dense row-major matrix of `f64` values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
+    /// Contiguous row-major element storage.
     data: Vec<f64>,
+    /// Number of logical rows represented by `data`.
     rows: usize,
+    /// Number of logical columns represented by `data`.
     cols: usize,
 }
 
 impl Matrix {
+    /// Allocate a zero-filled matrix with the requested shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rows * cols` cannot be represented by `usize`, or if the
+    /// allocator cannot satisfy the resulting request.
     pub fn new(rows: usize, cols: usize) -> Self {
+        // Detect dimension arithmetic overflow explicitly; allowing release-mode
+        // wrapping here would create storage inconsistent with the public shape.
+        let element_count = rows
+            .checked_mul(cols)
+            .expect("matrix dimensions exceed the addressable element count");
         Matrix {
-            data: vec![0.0; rows * cols],
+            data: vec![0.0; element_count],
             rows,
             cols,
         }
     }
 
-    pub fn from_vec(data: Vec<f64>, rows: usize, cols: usize) -> Result<Self, String> {
-        if data.len() != rows * cols {
-            return Err("Data length doesn't match dimensions".to_string());
+    /// Construct a row-major matrix from an owned element buffer.
+    ///
+    /// Returns structured errors when the requested element count overflows or
+    /// the supplied buffer length does not exactly match the shape.
+    pub fn from_vec(data: Vec<f64>, rows: usize, cols: usize) -> Result<Self, MatrixError> {
+        let expected = rows
+            .checked_mul(cols)
+            .ok_or(MatrixError::ElementCountOverflow { rows, cols })?;
+        if data.len() != expected {
+            return Err(MatrixError::InvalidDataLength {
+                rows,
+                cols,
+                expected,
+                actual: data.len(),
+            });
         }
         Ok(Matrix { data, rows, cols })
     }
@@ -157,19 +273,28 @@ impl Matrix {
         result
     }
 
-    pub fn lu_decomposition(&self) -> Result<(Matrix, Matrix, Vec<usize>), String> {
+    /// Compute a partial-pivoting LU factorization using the default relative
+    /// singularity threshold.
+    pub fn lu_decomposition(&self) -> Result<(Matrix, Matrix, Vec<usize>), MatrixError> {
         self.lu_decomposition_with_tolerance(1e-12)
     }
 
+    /// Compute a partial-pivoting LU factorization with a caller-selected
+    /// non-negative finite relative pivot threshold.
     pub fn lu_decomposition_with_tolerance(
         &self,
         singular_relative_epsilon: f64,
-    ) -> Result<(Matrix, Matrix, Vec<usize>), String> {
+    ) -> Result<(Matrix, Matrix, Vec<usize>), MatrixError> {
         if self.rows != self.cols {
-            return Err("Matrix must be square for LU decomposition".to_string());
+            return Err(MatrixError::NonSquare {
+                operation: "lu_decomposition",
+                matrix: (self.rows, self.cols),
+            });
         }
         if !singular_relative_epsilon.is_finite() || singular_relative_epsilon < 0.0 {
-            return Err("Invalid singular tolerance".to_string());
+            return Err(MatrixError::InvalidTolerance {
+                operation: "lu_decomposition",
+            });
         }
 
         let n = self.rows;
@@ -194,7 +319,9 @@ impl Matrix {
             }
 
             if max_val <= singular_relative_epsilon * row_norm {
-                return Err("Matrix is singular".to_string());
+                return Err(MatrixError::Singular {
+                    operation: "lu_decomposition",
+                });
             }
 
             if max_row != k {
@@ -222,20 +349,31 @@ impl Matrix {
         Ok((l, u, pivot))
     }
 
-    pub fn solve_lu(&self, b: &Matrix) -> Result<Matrix, String> {
+    /// Solve a square system with partial-pivoting LU and the default relative
+    /// singularity threshold.
+    pub fn solve_lu(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
         self.solve_lu_with_tolerance(b, 1e-12)
     }
 
+    /// Solve a square system against one column-vector right-hand side using a
+    /// caller-selected non-negative finite relative pivot threshold.
     pub fn solve_lu_with_tolerance(
         &self,
         b: &Matrix,
         singular_relative_epsilon: f64,
-    ) -> Result<Matrix, String> {
+    ) -> Result<Matrix, MatrixError> {
         if self.rows != self.cols {
-            return Err("Matrix must be square".to_string());
+            return Err(MatrixError::NonSquare {
+                operation: "solve_lu",
+                matrix: (self.rows, self.cols),
+            });
         }
         if b.rows != self.rows || b.cols != 1 {
-            return Err("Invalid dimensions for b".to_string());
+            return Err(MatrixError::DimensionMismatch {
+                operation: "solve_lu",
+                left: (self.rows, 1),
+                right: (b.rows, b.cols),
+            });
         }
 
         let (l, u, pivot) = self.lu_decomposition_with_tolerance(singular_relative_epsilon)?;
@@ -270,16 +408,18 @@ impl Matrix {
     /// Solves `min_x ||A x - b||_2`, where `A` is `self`.
     /// - If `rows >= cols`, returns the standard least-squares solution.
     /// - If `rows < cols`, returns the minimum-norm solution among all minimizers.
-    pub fn solve_least_squares_qr(&self, b: &Matrix) -> Result<Matrix, String> {
+    pub fn solve_least_squares_qr(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
         self.solve_least_squares_qr_with_info(b)
             .map(|(solution, _)| solution)
     }
 
+    /// Solve a possibly rectangular least-squares system while optionally
+    /// parallelizing sufficiently large Householder updates.
     pub fn solve_least_squares_qr_with_parallel(
         &self,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<Matrix, String> {
+    ) -> Result<Matrix, MatrixError> {
         self.solve_least_squares_qr_with_info_with_parallel(b, parallel)
             .map(|(solution, _)| solution)
     }
@@ -289,20 +429,30 @@ impl Matrix {
     pub fn solve_least_squares_qr_with_info(
         &self,
         b: &Matrix,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
+    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
         self.solve_least_squares_qr_with_info_with_parallel(b, false)
     }
 
+    /// Solve a possibly rectangular least-squares system and return rank and
+    /// condition diagnostics, with optional parallel Householder updates.
     pub fn solve_least_squares_qr_with_info_with_parallel(
         &self,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
+    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
         if b.cols != 1 {
-            return Err("Invalid dimensions for b (expected column vector)".to_string());
+            return Err(MatrixError::DimensionMismatch {
+                operation: "solve_least_squares_qr",
+                left: (self.rows, 1),
+                right: (b.rows, b.cols),
+            });
         }
         if b.rows != self.rows {
-            return Err("Invalid dimensions for b".to_string());
+            return Err(MatrixError::DimensionMismatch {
+                operation: "solve_least_squares_qr",
+                left: (self.rows, 1),
+                right: (b.rows, b.cols),
+            });
         }
 
         let m = self.rows;
@@ -477,7 +627,7 @@ impl Matrix {
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
+    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
         let m = a.rows;
         let n = a.cols;
 
@@ -635,7 +785,9 @@ impl Matrix {
 
             let diag = r[(i, i)];
             if !diag.is_finite() {
-                return Err("Least squares solve failed: non-finite diagonal in R".to_string());
+                return Err(MatrixError::NonFiniteFactor {
+                    operation: "solve_least_squares_qr",
+                });
             }
 
             let mut row_norm: f64 = 0.0;
@@ -644,7 +796,9 @@ impl Matrix {
             }
 
             if diag.abs() <= 1e-12 * row_norm {
-                return Err("Least squares solve failed: matrix is rank deficient".to_string());
+                return Err(MatrixError::RankDeficient {
+                    operation: "solve_least_squares_qr",
+                });
             }
 
             x[(i, 0)] = sum / diag;
@@ -663,7 +817,7 @@ impl Matrix {
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresQrInfo), String> {
+    ) -> Result<(Matrix, LeastSquaresQrInfo), MatrixError> {
         // Use QR on A^T to compute the minimum-norm least squares solution.
         //
         // Let A be m x n with m < n. Compute QR of A^T (n x m):
@@ -796,7 +950,9 @@ impl Matrix {
 
             let diag = r[(i, i)];
             if !diag.is_finite() {
-                return Err("Least squares solve failed: non-finite diagonal in R".to_string());
+                return Err(MatrixError::NonFiniteFactor {
+                    operation: "solve_least_squares_qr",
+                });
             }
 
             let mut col_norm: f64 = 0.0;
@@ -805,7 +961,9 @@ impl Matrix {
             }
 
             if diag.abs() <= 1e-12 * col_norm {
-                return Err("Least squares solve failed: matrix is rank deficient".to_string());
+                return Err(MatrixError::RankDeficient {
+                    operation: "solve_least_squares_qr",
+                });
             }
 
             y[i] = sum / diag;
@@ -1587,7 +1745,69 @@ mod tests {
         let err_parallel = a
             .solve_least_squares_qr_with_info_with_parallel(&b, true)
             .expect_err("expected rank-deficient QR solve to fail");
-        assert!(err_serial.contains("rank deficient"), "{err_serial}");
-        assert!(err_parallel.contains("rank deficient"), "{err_parallel}");
+        assert_eq!(
+            err_serial,
+            MatrixError::RankDeficient {
+                operation: "solve_least_squares_qr"
+            }
+        );
+        assert_eq!(err_parallel, err_serial);
+    }
+
+    /// Verify that fallible construction reports both ordinary length mismatch
+    /// and dimension-product overflow through structured matrix errors.
+    #[test]
+    fn test_from_vec_reports_structured_shape_errors() {
+        let length_error = Matrix::from_vec(vec![1.0, 2.0], 2, 2).unwrap_err();
+        assert_eq!(
+            length_error,
+            MatrixError::InvalidDataLength {
+                rows: 2,
+                cols: 2,
+                expected: 4,
+                actual: 2,
+            }
+        );
+
+        let overflow_error = Matrix::from_vec(Vec::new(), usize::MAX, 2).unwrap_err();
+        assert_eq!(
+            overflow_error,
+            MatrixError::ElementCountOverflow {
+                rows: usize::MAX,
+                cols: 2,
+            }
+        );
+    }
+
+    /// Confirm that LU shape, tolerance, and singularity failures use distinct
+    /// structured variants rather than unrelated error strings.
+    #[test]
+    fn test_lu_reports_structured_errors() {
+        let rectangular = Matrix::new(2, 3);
+        assert_eq!(
+            rectangular.lu_decomposition().unwrap_err(),
+            MatrixError::NonSquare {
+                operation: "lu_decomposition",
+                matrix: (2, 3),
+            }
+        );
+
+        let identity = Matrix::identity(2);
+        assert_eq!(
+            identity
+                .lu_decomposition_with_tolerance(f64::NAN)
+                .unwrap_err(),
+            MatrixError::InvalidTolerance {
+                operation: "lu_decomposition",
+            }
+        );
+
+        let singular = Matrix::from_vec(vec![1.0, 2.0, 2.0, 4.0], 2, 2).unwrap();
+        assert_eq!(
+            singular.lu_decomposition().unwrap_err(),
+            MatrixError::Singular {
+                operation: "lu_decomposition",
+            }
+        );
     }
 }

@@ -24,19 +24,6 @@ SOFTWARE.
 
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingVarError {
-    pub var_name: String,
-}
-
-impl fmt::Display for MissingVarError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Missing variable '{}'", self.var_name)
-    }
-}
-
-impl std::error::Error for MissingVarError {}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exp {
     Val(f64),

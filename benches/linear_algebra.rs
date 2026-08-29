@@ -1,6 +1,7 @@
 use constraint_solver::Matrix;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rayon::ThreadPoolBuilder;
+use std::hint::black_box;
 use std::sync::Once;
 
 static LOG_RAYON_THREADS: Once = Once::new();

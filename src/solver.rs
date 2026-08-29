@@ -22,18 +22,23 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use crate::compiler::{CompiledExp, CompiledSystem, VarId, VarTable};
-use crate::exp::MissingVarError;
+use crate::compiler::{CompiledExp, CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 use crate::mode::{build_thread_pool, Mode};
 use rayon::ThreadPool;
 use std::collections::HashMap;
+use std::fmt;
 
+/// Reusable storage for the augmented system used by regularized QR solves.
 struct LeastSquaresWorkspace {
+    /// Coefficient matrix `[J; sqrt(lambda) I]` populated for each solve.
     augmented_j: Matrix,
+    /// Right-hand side `[rhs; 0]` paired with `augmented_j`.
     augmented_b: Matrix,
+    /// Number of residual rows copied from the unregularized Jacobian.
     num_equations: usize,
+    /// Number of solve variables and regularization rows.
     num_variables: usize,
 }
 
@@ -61,7 +66,11 @@ struct LineSearchContext<'a> {
 }
 
 impl LeastSquaresWorkspace {
+    /// Allocate reusable augmented matrices and initialize the diagonal for the
+    /// caller's first regularization strength.
     fn new(num_equations: usize, num_variables: usize, sqrt_reg: f64) -> Self {
+        // Regularization rows are diagonal; residual rows are overwritten by
+        // each solve before this workspace is consumed.
         let mut augmented_j = Matrix::new(num_equations + num_variables, num_variables);
         for i in 0..num_variables {
             augmented_j[(num_equations + i, i)] = sqrt_reg;
@@ -76,9 +85,21 @@ impl LeastSquaresWorkspace {
     }
 }
 
+/// Internal distinction between invalid linear-algebra inputs and exhaustion of
+/// both the direct and regularized QR paths.
 enum LeastSquaresSolveError {
+    /// A shape or matrix-operation precondition failed before a numerical solve
+    /// could be attempted.
     InvalidInput(MatrixError),
-    Singular { qr_err: String, normal_eq_err: String },
+    /// Neither unregularized QR nor any configured augmented QR attempt
+    /// produced an acceptable solution.
+    Singular {
+        /// Explanation from the direct, unregularized QR path or its condition
+        /// diagnostics.
+        unregularized_qr_error: String,
+        /// Explanation from the augmented regularized QR fallback.
+        regularized_qr_error: String,
+    },
 }
 
 /// Selects how an underdetermined Newton iteration resolves its null-space
@@ -168,47 +189,90 @@ pub struct Solution {
     pub convergence_history: Vec<f64>,
 }
 
-/// Provides traceability information back to the constraint that generated an equation
-#[derive(Debug, Clone)]
+/// Metadata connecting one compiled residual equation to its source constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EquationTrace {
+    /// Caller-defined stable identifier for the source constraint.
     pub constraint_id: usize,
+    /// Human-readable description suitable for logs and failure reports.
     pub description: String,
 }
 
-/// Diagnostic data captured when the solver fails
-#[derive(Debug, Clone)]
-pub struct SolverRunDiagnostic {
-    pub message: String,
-    pub iterations: usize,
-    pub error: f64,
-    /// Variable values at the end of the run (variable name -> value)
-    pub values: HashMap<String, f64>,
-    pub residuals: Vec<f64>,
+/// Residual and optional source metadata for one equation at a failed solver
+/// state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EquationDiagnostic {
+    /// Zero-based equation index matching compilation order.
+    pub equation_index: usize,
+    /// Signed scalar residual evaluated at the diagnostic's `values`.
+    pub residual: f64,
+    /// Caller-provided source metadata, or `None` when no trace was attached for
+    /// this equation.
+    pub trace: Option<EquationTrace>,
 }
 
-/// Possible solver error conditions
+/// Complete numerical state captured when a solver run fails.
+#[derive(Debug, Clone)]
+pub struct SolverRunDiagnostic {
+    /// Human-readable summary of the terminating failure.
+    pub message: String,
+    /// Number of accepted Newton updates represented by the diagnostic state.
+    pub iterations: usize,
+    /// Euclidean norm of all entries in `equations`.
+    pub error: f64,
+    /// Variable values at the end of the run, keyed by compiled variable name.
+    pub values: HashMap<String, f64>,
+    /// Per-equation residuals enriched with any attached source metadata.
+    pub equations: Vec<EquationDiagnostic>,
+}
+
+/// Failures returned by solver construction, validation, and iteration.
 #[derive(Debug, Clone)]
 pub enum SolverError {
-    /// Jacobian matrix became singular and couldn't be inverted
+    /// The Jacobian or regularized least-squares system could not be solved.
     SingularMatrix(SolverRunDiagnostic),
-    /// Failed to converge within the maximum number of iterations
+    /// The configured update budget or line search ended without convergence.
     NoConvergence(SolverRunDiagnostic),
     /// Expression, Jacobian, update, or residual-gradient evaluation produced
     /// NaN or infinity.
     NonFiniteEvaluation(SolverRunDiagnostic),
-    /// A required variable was missing during evaluation
-    MissingVariable(MissingVarError),
-    /// Invalid input parameters or system setup
+    /// Invalid input parameters or system setup.
     InvalidInput(String),
 }
 
-impl From<MissingVarError> for SolverError {
-    fn from(value: MissingVarError) -> Self {
-        SolverError::MissingVariable(value)
+impl fmt::Display for SolverError {
+    /// Format the concise diagnostic summary while preserving structured state
+    /// for callers that pattern-match the error.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SolverError::SingularMatrix(diagnostic) => {
+                write!(f, "Singular matrix: {}", diagnostic.message)
+            }
+            SolverError::NoConvergence(diagnostic) => {
+                write!(f, "Solver did not converge: {}", diagnostic.message)
+            }
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                write!(f, "Non-finite solver evaluation: {}", diagnostic.message)
+            }
+            SolverError::InvalidInput(message) => write!(f, "Invalid solver input: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SolverError {}
+
+impl From<EvaluationError> for SolverError {
+    /// Convert an impossible-after-validation evaluation mismatch into an
+    /// explicit invariant failure without exposing an unreachable public error
+    /// variant.
+    fn from(value: EvaluationError) -> Self {
+        SolverError::InvalidInput(format!("Internal compiled-system invariant failed: {value}"))
     }
 }
 
 impl From<MatrixError> for SolverError {
+    /// Preserve matrix validation context in the solver's public input-error
+    /// channel.
     fn from(value: MatrixError) -> Self {
         SolverError::InvalidInput(value.to_string())
     }
@@ -348,12 +412,19 @@ impl NewtonRaphsonSolver {
         }
     }
 
-    /// Attach metadata describing the origin of each equation in the system
-    pub fn try_with_equation_traces(
+    /// Attach optional source metadata for every equation in compilation order.
+    ///
+    /// The trace vector must contain exactly one entry per equation, including
+    /// for an empty system. Use `None` for an equation whose source is unknown.
+    /// This fallible builder avoids the former API's input-dependent panic.
+    pub fn with_equation_traces(
         mut self,
         traces: Vec<Option<EquationTrace>>,
     ) -> Result<Self, SolverError> {
-        if !self.equations.is_empty() && traces.len() != self.equations.len() {
+        // Exact cardinality preserves the positional equation-to-trace mapping;
+        // accepting arbitrary entries for an empty system would create metadata
+        // that could never appear in a residual diagnostic.
+        if traces.len() != self.equations.len() {
             return Err(SolverError::InvalidInput(format!(
                 "Equation trace length ({}) does not match number of equations ({})",
                 traces.len(),
@@ -364,17 +435,13 @@ impl NewtonRaphsonSolver {
         Ok(self)
     }
 
-    /// Attach metadata describing the origin of each equation in the system
-    pub fn with_equation_traces(self, traces: Vec<Option<EquationTrace>>) -> Self {
-        self.try_with_equation_traces(traces)
-            .unwrap_or_else(|err| match err {
-                SolverError::InvalidInput(msg) => panic!("{}", msg),
-                other => panic!("{other:?}"),
-            })
-    }
-
-    /// Fetch trace metadata for a specific equation, if available
+    /// Fetch source metadata for a specific equation, if an entry was attached.
+    ///
+    /// Returns `None` both for an out-of-range index and for an explicitly
+    /// untraced equation.
     pub fn trace_for_equation(&self, equation_index: usize) -> Option<&EquationTrace> {
+        // Preserve borrowing so callers can inspect potentially long
+        // descriptions without cloning them.
         self.equation_traces
             .get(equation_index)
             .and_then(|entry| entry.as_ref())
@@ -655,12 +722,12 @@ impl NewtonRaphsonSolver {
                             return Err(SolverError::InvalidInput(err.to_string()));
                         }
                         Err(LeastSquaresSolveError::Singular {
-                            qr_err,
-                            normal_eq_err,
+                            unregularized_qr_error,
+                            regularized_qr_error,
                         }) => {
                             let diag = self.build_diagnostic(
                                 format!(
-                                    "Least squares system is singular (qr_err: {qr_err}; normal_eq_err: {normal_eq_err})"
+                                    "Least squares system is singular (unregularized_qr_error: {unregularized_qr_error}; regularized_qr_error: {regularized_qr_error})"
                                 ),
                                 iter + 1,
                                 &vars,
@@ -891,7 +958,7 @@ impl NewtonRaphsonSolver {
                 || info.cond_est > COND_LIMIT
         };
 
-        let mut qr_err: Option<String> = None;
+        let mut unregularized_qr_error: Option<String> = None;
         let mut unreg_delta: Option<Matrix> = None;
         let mut unreg_info: Option<LeastSquaresQrInfo> = None;
 
@@ -904,7 +971,7 @@ impl NewtonRaphsonSolver {
                 unreg_info = Some(info);
             }
             Err(err) => {
-                qr_err = Some(err);
+                unregularized_qr_error = Some(err.to_string());
             }
         }
 
@@ -913,8 +980,9 @@ impl NewtonRaphsonSolver {
                 return Ok(delta);
             }
             return Err(LeastSquaresSolveError::Singular {
-                qr_err: qr_err.unwrap_or_else(|| "QR least squares failed".to_string()),
-                normal_eq_err: "Regularization disabled".to_string(),
+                unregularized_qr_error: unregularized_qr_error
+                    .unwrap_or_else(|| "QR least squares failed".to_string()),
+                regularized_qr_error: "Regularization disabled".to_string(),
             });
         }
 
@@ -993,7 +1061,7 @@ impl NewtonRaphsonSolver {
                     }
                 }
                 Err(err) => {
-                    last_err = Some(err);
+                    last_err = Some(err.to_string());
                 }
             }
         }
@@ -1003,13 +1071,14 @@ impl NewtonRaphsonSolver {
         }
 
         Err(LeastSquaresSolveError::Singular {
-            qr_err: qr_err
+            unregularized_qr_error: unregularized_qr_error
                 .or_else(|| {
                     unreg_info
                         .map(|info| format!("QR ill-conditioned (rank {}, cond {:.2e})", info.rank, info.cond_est))
                 })
                 .unwrap_or_else(|| "QR least squares failed".to_string()),
-            normal_eq_err: last_err.unwrap_or_else(|| "Regularized QR failed".to_string()),
+            regularized_qr_error: last_err
+                .unwrap_or_else(|| "Regularized QR failed".to_string()),
         })
     }
 
@@ -1198,6 +1267,8 @@ impl NewtonRaphsonSolver {
         ))
     }
 
+    /// Capture a failure message together with the exact variable and
+    /// per-equation residual state at which it occurred.
     fn build_diagnostic(
         &self,
         message: String,
@@ -1205,9 +1276,16 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals_matrix: &Matrix,
     ) -> SolverRunDiagnostic {
-        let mut residuals = Vec::with_capacity(residuals_matrix.rows());
-        for i in 0..residuals_matrix.rows() {
-            residuals.push(residuals_matrix[(i, 0)]);
+        // Residual row order matches compiled equation order. Clone optional
+        // trace metadata into the owned diagnostic so it remains useful after
+        // the solver itself has been dropped.
+        let mut equations = Vec::with_capacity(residuals_matrix.rows());
+        for equation_index in 0..residuals_matrix.rows() {
+            equations.push(EquationDiagnostic {
+                equation_index,
+                residual: residuals_matrix[(equation_index, 0)],
+                trace: self.trace_for_equation(equation_index).cloned(),
+            });
         }
 
         SolverRunDiagnostic {
@@ -1215,7 +1293,7 @@ impl NewtonRaphsonSolver {
             iterations,
             error: residuals_matrix.norm(),
             values: self.values_by_name(vars),
-            residuals,
+            equations,
         }
     }
 
@@ -1369,8 +1447,7 @@ mod tests {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(4)
-            .max(1);
+            .clamp(1, 4);
         vec![Mode::Serial, Mode::Parallel { thread_count: threads }]
     }
 
@@ -1388,12 +1465,8 @@ mod tests {
             std::mem::discriminant(serial),
             std::mem::discriminant(parallel)
         );
-        match (serial, parallel) {
-            (SolverError::InvalidInput(a), SolverError::InvalidInput(b)) => assert_eq!(a, b),
-            (SolverError::MissingVariable(a), SolverError::MissingVariable(b)) => {
-                assert_eq!(a, b)
-            }
-            _ => {}
+        if let (SolverError::InvalidInput(a), SolverError::InvalidInput(b)) = (serial, parallel) {
+            assert_eq!(a, b);
         }
     }
 
@@ -1497,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solver_errors_on_missing_variable() {
+    fn test_solver_rejects_missing_fixed_parameter() {
         let mut serial_error: Option<SolverError> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
@@ -1564,28 +1637,31 @@ mod tests {
     /// its documented finite range before iteration begins.
     #[test]
     fn test_solver_rejects_invalid_configuration() {
+        /// Boxed builder mutation used to exercise one invalid configuration
+        /// while constructing a fresh solver for each table entry.
+        type SolverConfigurator = Box<dyn Fn(NewtonRaphsonSolver) -> NewtonRaphsonSolver>;
+
         // Each case constructs a fresh solver because builder methods consume
         // and return the solver by value.
-        let invalid_cases: Vec<(&str, Box<dyn Fn(NewtonRaphsonSolver) -> NewtonRaphsonSolver>)> =
-            vec![
-                ("max_iterations", Box::new(|solver| solver.with_max_iterations(0))),
-                ("tolerance", Box::new(|solver| solver.with_tolerance(0.0))),
-                ("tolerance", Box::new(|solver| solver.with_tolerance(f64::NAN))),
-                ("damping_factor", Box::new(|solver| solver.with_damping(0.0))),
-                ("damping_factor", Box::new(|solver| solver.with_damping(1.1))),
-                (
-                    "damping_factor",
-                    Box::new(|solver| solver.with_damping(f64::INFINITY)),
-                ),
-                (
-                    "regularization",
-                    Box::new(|solver| solver.with_regularization(-1.0)),
-                ),
-                (
-                    "regularization",
-                    Box::new(|solver| solver.with_regularization(f64::INFINITY)),
-                ),
-            ];
+        let invalid_cases: Vec<(&str, SolverConfigurator)> = vec![
+            ("max_iterations", Box::new(|solver| solver.with_max_iterations(0))),
+            ("tolerance", Box::new(|solver| solver.with_tolerance(0.0))),
+            ("tolerance", Box::new(|solver| solver.with_tolerance(f64::NAN))),
+            ("damping_factor", Box::new(|solver| solver.with_damping(0.0))),
+            ("damping_factor", Box::new(|solver| solver.with_damping(1.1))),
+            (
+                "damping_factor",
+                Box::new(|solver| solver.with_damping(f64::INFINITY)),
+            ),
+            (
+                "regularization",
+                Box::new(|solver| solver.with_regularization(-1.0)),
+            ),
+            (
+                "regularization",
+                Box::new(|solver| solver.with_regularization(f64::INFINITY)),
+            ),
+        ];
 
         for (expected_parameter, configure) in invalid_cases {
             let x = Exp::var("x");
@@ -1679,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_with_equation_traces_invalid_length() {
+    fn test_with_equation_traces_rejects_invalid_length() {
         let mut serial_error: Option<SolverError> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
@@ -1695,7 +1771,7 @@ mod tests {
                 }),
                 None,
             ];
-            let err = match solver.try_with_equation_traces(traces) {
+            let err = match solver.with_equation_traces(traces) {
                 Ok(_) => panic!("expected invalid input for trace length mismatch"),
                 Err(err) => err,
             };
@@ -1713,6 +1789,57 @@ mod tests {
                 other => panic!("expected InvalidInput, got {:?}", other),
             }
         }
+
+        // Empty systems must reject unreachable trace entries as strictly as
+        // non-empty systems reject too many or too few entries.
+        let empty = NewtonRaphsonSolver::new(
+            Compiler::compile(&[]).expect("empty equation system should compile"),
+        );
+        let error = match empty.with_equation_traces(vec![None]) {
+            Ok(_) => panic!("empty system must reject an unreachable trace"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SolverError::InvalidInput(_)));
+    }
+
+    /// Ensure failure diagnostics pair each residual with its positional source
+    /// metadata and retain explicit `None` entries for untraced equations.
+    #[test]
+    fn test_diagnostics_include_equation_traces() {
+        let equations = vec![
+            Exp::sub(Exp::var("x"), Exp::val(1.0)),
+            Exp::sub(Exp::var("x"), Exp::val(2.0)),
+        ];
+        let trace = EquationTrace {
+            constraint_id: 41,
+            description: "horizontal alignment".to_string(),
+        };
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(&equations).expect("equations should compile"),
+        )
+        .with_equation_traces(vec![Some(trace.clone()), None])
+        .expect("trace cardinality matches equation cardinality");
+        let vars = solver
+            .map_initial_guess(HashMap::from([("x".to_string(), 0.0)]))
+            .expect("initial guess should map to the compiled variable");
+        let residuals = Matrix::from_vec(vec![-1.0, -2.0], 2, 1)
+            .expect("residual vector shape should be valid");
+
+        let diagnostic =
+            solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals);
+
+        assert_eq!(diagnostic.equations.len(), 2);
+        assert_eq!(
+            diagnostic.equations[0],
+            EquationDiagnostic {
+                equation_index: 0,
+                residual: -1.0,
+                trace: Some(trace),
+            }
+        );
+        assert_eq!(diagnostic.equations[1].equation_index, 1);
+        assert_eq!(diagnostic.equations[1].residual, -2.0);
+        assert_eq!(diagnostic.equations[1].trace, None);
     }
 
     #[test]
@@ -2195,19 +2322,21 @@ mod tests {
             for case_index in 0..5 {
                 let n = 3;
                 let mut a = vec![vec![0.0; n]; n];
-                for i in 0..n {
-                    for j in 0..n {
-                        a[i][j] = rng.next_f64();
+                for (diagonal_index, row) in a.iter_mut().enumerate() {
+                    for coefficient in row.iter_mut() {
+                        *coefficient = rng.next_f64();
                     }
-                    a[i][i] += 2.0;
+                    row[diagonal_index] += 2.0;
                 }
 
-                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
                 let mut b = vec![0.0; n];
-                for i in 0..n {
-                    for j in 0..n {
-                        b[i] += a[i][j] * x_true[j];
-                    }
+                for (rhs, row) in b.iter_mut().zip(&a) {
+                    *rhs = row
+                        .iter()
+                        .zip(x_true.iter())
+                        .map(|(coefficient, value)| coefficient * value)
+                        .sum();
                 }
 
                 let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
@@ -2230,9 +2359,9 @@ mod tests {
                 } else {
                     assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
                 }
-                for i in 0..n {
+                for (i, expected_value) in x_true.iter().enumerate() {
                     let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - x_true[i]).abs() < 1e-8);
+                    assert!((value - expected_value).abs() < 1e-8);
                 }
             }
         }
@@ -2249,21 +2378,23 @@ mod tests {
 
             for case_index in 0..5 {
                 let mut a = vec![vec![0.0; n]; m];
-                for i in 0..m {
-                    for j in 0..n {
-                        a[i][j] = rng.next_f64();
+                for row in &mut a {
+                    for coefficient in row {
+                        *coefficient = rng.next_f64();
                     }
                 }
-                for i in 0..n {
-                    a[i][i] += 2.0;
+                for (diagonal_index, row) in a.iter_mut().take(n).enumerate() {
+                    row[diagonal_index] += 2.0;
                 }
 
-                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
                 let mut b = vec![0.0; m];
-                for i in 0..m {
-                    for j in 0..n {
-                        b[i] += a[i][j] * x_true[j];
-                    }
+                for (rhs, row) in b.iter_mut().zip(&a) {
+                    *rhs = row
+                        .iter()
+                        .zip(x_true.iter())
+                        .map(|(coefficient, value)| coefficient * value)
+                        .sum();
                 }
 
                 let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
@@ -2286,9 +2417,9 @@ mod tests {
                 } else {
                     assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
                 }
-                for i in 0..n {
+                for (i, expected_value) in x_true.iter().enumerate() {
                     let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - x_true[i]).abs() < 1e-8);
+                    assert!((value - expected_value).abs() < 1e-8);
                 }
             }
         }

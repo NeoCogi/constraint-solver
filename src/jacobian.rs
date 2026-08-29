@@ -22,8 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use crate::compiler::{CompiledExp, VarId};
-use crate::exp::MissingVarError;
+use crate::compiler::{CompiledExp, EvaluationError, VarId};
 use crate::matrix::Matrix;
 use std::collections::HashMap;
 
@@ -102,7 +101,7 @@ impl Jacobian {
     pub(crate) fn evaluate_checked(
         &self,
         vars: &HashMap<VarId, f64>,
-    ) -> Result<Matrix, MissingVarError> {
+    ) -> Result<Matrix, EvaluationError> {
         let rows = self.expressions.len();
         let cols = self.variables.len();
         let mut result = Matrix::new(rows, cols);
@@ -115,7 +114,7 @@ impl Jacobian {
         &self,
         vars: &HashMap<VarId, f64>,
         workspace: &'a mut JacobianWorkspace,
-    ) -> Result<&'a mut Matrix, MissingVarError> {
+    ) -> Result<&'a mut Matrix, EvaluationError> {
         self.evaluate_checked_into(vars, &mut workspace.jacobian)?;
         Ok(&mut workspace.jacobian)
     }
@@ -124,7 +123,7 @@ impl Jacobian {
         &self,
         vars: &HashMap<VarId, f64>,
         out: &mut Matrix,
-    ) -> Result<(), MissingVarError> {
+    ) -> Result<(), EvaluationError> {
         let rows = self.expressions.len();
         let cols = self.variables.len();
         if out.rows() != rows || out.cols() != cols {
@@ -142,7 +141,7 @@ impl Jacobian {
     pub(crate) fn evaluate_functions_checked(
         &self,
         vars: &HashMap<VarId, f64>,
-    ) -> Result<Matrix, MissingVarError> {
+    ) -> Result<Matrix, EvaluationError> {
         let rows = self.expressions.len();
         let mut result = Matrix::new(rows, 1);
 
@@ -155,7 +154,7 @@ impl Jacobian {
         &self,
         vars: &HashMap<VarId, f64>,
         out: &mut Matrix,
-    ) -> Result<(), MissingVarError> {
+    ) -> Result<(), EvaluationError> {
         let rows = self.expressions.len();
         if out.rows() != rows || out.cols() != 1 {
             *out = Matrix::new(rows, 1);

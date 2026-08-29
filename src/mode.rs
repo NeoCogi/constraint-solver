@@ -24,29 +24,44 @@ SOFTWARE.
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
-#[derive(Debug, Clone)]
+/// Execution strategy used for matrix operations within a solver instance.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
+    /// Execute all supported numerical operations on the calling thread.
+    #[default]
     Serial,
-    Parallel { thread_count: usize },
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Serial
-    }
+    /// Execute sufficiently large supported operations in a dedicated Rayon
+    /// pool with exactly `thread_count` worker threads.
+    Parallel {
+        /// Positive number of worker threads allocated to this solver.
+        thread_count: usize,
+    },
 }
 
 impl Mode {
+    /// Construct the serial execution strategy.
     pub fn serial() -> Self {
+        // Use the named variant rather than relying on `Default` so the
+        // constructor's meaning remains explicit if defaults ever evolve.
         Mode::Serial
     }
 
+    /// Construct a parallel execution strategy requesting `thread_count`
+    /// workers.
+    ///
+    /// The count is validated when a solver installs the mode so this
+    /// constructor remains lightweight and composable with builder APIs.
     pub fn parallel(thread_count: usize) -> Self {
+        // Preserve the exact request; silently changing zero would hide invalid
+        // configuration from `build_thread_pool`.
         Mode::Parallel { thread_count }
     }
 }
 
+/// Build the optional dedicated thread pool represented by an execution mode.
 pub(crate) fn build_thread_pool(mode: &Mode) -> Result<Option<ThreadPool>, String> {
+    // Serial mode needs no pool. Parallel mode validates its public count before
+    // delegating platform-specific worker creation to Rayon.
     match mode {
         Mode::Serial => Ok(None),
         Mode::Parallel { thread_count } => {
