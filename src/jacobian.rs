@@ -26,15 +26,17 @@ use crate::compiler::{CompiledExp, EvaluationError, VarId};
 use crate::matrix::Matrix;
 use std::collections::HashMap;
 
-/// Jacobian matrix calculator for systems of symbolic expressions
+/// Crate-internal Jacobian evaluator for compiled symbolic expressions.
 ///
 /// The Jacobian matrix J is the matrix of all first-order partial derivatives
 /// of a vector-valued function f(x). For a system with m equations and n variables:
 ///
 /// J[i,j] = df_i/dx_j
 ///
-/// This is essential for Newton-Raphson iteration: x_{k+1} = x_k - J^{-1} * f(x_k)
-pub struct Jacobian {
+/// The nonlinear solver owns this type because its expressions and variable IDs
+/// are tied to one crate-private compiled-system registry. Exposing the type
+/// publicly would not expose a constructible or evaluable public abstraction.
+pub(crate) struct Jacobian {
     /// Vector of expressions f_i(x), each representing one equation in the system
     expressions: Vec<CompiledExp>,
     /// Variable IDs that correspond to the unknowns x_j in the system
@@ -68,7 +70,7 @@ impl JacobianWorkspace {
 }
 
 impl Jacobian {
-    /// Create a new Jacobian calculator
+    /// Create an internal Jacobian cache for one compiled system.
     ///
     /// # Arguments
     /// * `expressions` - Vector of symbolic expressions representing the system equations
@@ -79,7 +81,7 @@ impl Jacobian {
     /// The Jacobian would be:
     /// J = [df1/dx  df1/dy] = [2x   2y]
     ///     [df2/dx  df2/dy]   [y    x ]
-    pub fn new(expressions: Vec<CompiledExp>, variables: Vec<VarId>) -> Self {
+    pub(crate) fn new(expressions: Vec<CompiledExp>, variables: Vec<VarId>) -> Self {
         // Pre-compute symbolic derivatives once since Newton iterations repeatedly
         // evaluate J at different points.
         let mut symbolic_jacobian = Vec::new();

@@ -26,6 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   factorization-independent `solve_least_squares*`, `LeastSquaresInfo`, and
   `LeastSquaresMethod` API. Backward compatibility with the pre-0.3 API is not
   retained.
+- Restricted the compiled-expression `Jacobian` implementation to crate scope;
+  its module, constructor inputs, and evaluation methods were already private,
+  so its nominally public declarations could not form a usable external API.
 - Changed line search to a slope-based Armijo condition for the residual norm,
   using `(f^T J delta) / ||f||` as its directional derivative, and kept its
   configured initial trial size authoritative.
