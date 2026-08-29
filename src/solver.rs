@@ -143,7 +143,11 @@ pub struct NewtonRaphsonSolver {
     /// Initial damping factor (step size multiplier, 0 < damping <= 1)
     /// Lower values make convergence more stable but slower
     damping_factor: f64,
-    /// Minimum allowed damping before declaring convergence failure
+    /// Lower bound applied when repeated residual growth reduces adaptive damping.
+    ///
+    /// Reaching this bound is not itself a convergence failure: a non-zero
+    /// least-squares residual can change very little near a valid stationary
+    /// point, so termination must be decided from `J^T f`, not damping size.
     min_damping: f64,
     /// Base regularization parameter used when the system is ill-conditioned
     regularization: f64,
@@ -622,36 +626,44 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
+            // A non-zero residual can still be the mathematically correct result
+            // of an inconsistent overdetermined system. Test first-order
+            // least-squares stationarity before damping adaptation so the small
+            // objective changes near a residual floor cannot be misclassified as
+            // solver stagnation.
+            if num_equations > num_variables {
+                let gradient_norm = self.residual_gradient_norm(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    parallel,
+                    &vars,
+                    iter,
+                )?;
+                if gradient_norm < self.tolerance {
+                    return Ok(self.build_solution(
+                        &vars,
+                        iter,
+                        error,
+                        gradient_norm,
+                        ConvergenceReason::LeastSquaresStationary,
+                        convergence_history,
+                    ));
+                }
+            }
+
             // Adaptive damping belongs only to the standard solver. Line search
             // has its own evaluated acceptance and exhaustion rules, so mutating
             // an unused damping value must not influence its stagnation outcome.
             if !use_line_search {
                 if let Some(previous_error) = last_error {
-                    // A negligible residual change reduces the next standard
-                    // step. Repeated reductions below the supported minimum are
-                    // reported as stagnation.
-                    if (error - previous_error).abs() < self.tolerance * 0.1 {
-                        damping *= 0.5;
-                        if damping < self.min_damping {
-                            let diag = self.build_diagnostic(
-                                format!(
-                                    "Solver stagnated at iteration {} with error {:.2e}",
-                                    iter + 1,
-                                    error
-                                ),
-                                iter,
-                                &vars,
-                                &f_vals,
-                            );
-                            return Err(SolverError::NoConvergence(diag));
-                        }
-                    }
-
                     // Compare only two real consecutive residuals. This keeps
                     // the caller's configured damping unchanged for the first
-                    // update and adapts it for subsequent updates.
+                    // update and adapts it for subsequent updates. Only genuine
+                    // residual growth reduces damping; a small improvement is
+                    // expected near a non-zero least-squares optimum and is not
+                    // evidence of stagnation.
                     if error > previous_error * 1.5 {
-                        damping *= 0.5;
+                        damping = (damping * 0.5).max(self.min_damping);
                     } else if error < previous_error * 0.5 {
                         damping = (damping * 1.2).min(1.0);
                     }
@@ -773,10 +785,6 @@ impl NewtonRaphsonSolver {
             };
 
             // Step 5: Update variables: x_new = x_old + step_size * delta.
-            // Retain the undamped correction norm for the overdetermined
-            // stationarity test. The applied step may be intentionally tiny
-            // because of damping and is therefore not a convergence condition.
-            let correction_norm = delta.norm();
             for (i, &var_id) in self.variables.iter().enumerate() {
                 vars.insert(var_id, vars[&var_id] + step_size * delta[(i, 0)]);
             }
@@ -826,30 +834,10 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
-            // A non-zero residual is a valid successful outcome only for an
-            // overdetermined least-squares problem. Use the undamped correction
-            // norm so a caller-selected small step size cannot manufacture
-            // stationarity in an ordinary damped root solve.
-            if num_equations > num_variables && correction_norm < self.tolerance {
-                let gradient_norm = self.residual_gradient_norm(
-                    jacobian_workspace.jacobian(),
-                    &f_vals,
-                    parallel,
-                    &vars,
-                    iter + 1,
-                )?;
-                if gradient_norm < self.tolerance {
-                    convergence_history.push(updated_error);
-                    return Ok(self.build_solution(
-                        &vars,
-                        iter + 1,
-                        updated_error,
-                        gradient_norm,
-                        ConvergenceReason::LeastSquaresStationary,
-                        convergence_history,
-                    ));
-                }
-            }
+            // Least-squares stationarity is checked once at the beginning of the
+            // next iteration. Deferring that check avoids computing `J^T f`
+            // twice for every accepted state while still testing the final state
+            // explicitly after the update budget is exhausted below.
         }
 
         // Failed to converge within max iterations
@@ -862,11 +850,37 @@ impl NewtonRaphsonSolver {
                 &residuals,
             ));
         }
+        let final_error = residuals.norm();
+        if num_equations > num_variables {
+            // The loop normally checks stationarity at the start of the next
+            // iteration. When the final allowed update lands on an optimum there
+            // is no next iteration, so perform the same test here before
+            // reporting budget exhaustion.
+            let gradient_norm = self.residual_gradient_norm(
+                jacobian_workspace.jacobian(),
+                &residuals,
+                parallel,
+                &vars,
+                self.max_iterations,
+            )?;
+            if gradient_norm < self.tolerance {
+                convergence_history.push(final_error);
+                return Ok(self.build_solution(
+                    &vars,
+                    self.max_iterations,
+                    final_error,
+                    gradient_norm,
+                    ConvergenceReason::LeastSquaresStationary,
+                    convergence_history,
+                ));
+            }
+        }
+
         let diag = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
                 self.max_iterations,
-                residuals.norm()
+                final_error
             ),
             self.max_iterations,
             &vars,
@@ -2077,6 +2091,46 @@ mod tests {
             );
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-12);
             assert!(solution.gradient_norm < 1e-10);
+        }
+    }
+
+    /// Ensure the default damping policy can approach a non-zero residual floor
+    /// instead of treating the naturally shrinking objective changes as failure.
+    #[test]
+    fn test_inconsistent_overdetermined_system_reaches_stationarity_from_away() {
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+
+            // The least-squares objective for these incompatible equations has
+            // its unique stationary point at x=0 and residual norm sqrt(2). The
+            // previous absolute residual-change stagnation rule stopped around
+            // x=3e-6 under the default 0.7 damping, before `J^T f` met tolerance.
+            let x = Exp::var("x");
+            let equations = vec![
+                Exp::sub(x.clone(), Exp::val(1.0)),
+                Exp::add(x, Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.1)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("default damping should reach least-squares stationarity");
+
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-10);
+            }
+            assert_eq!(
+                solution.reason,
+                ConvergenceReason::LeastSquaresStationary
+            );
+            assert!(solution.values["x"].abs() < 1e-8);
+            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
+            assert!(solution.gradient_norm < 1e-8);
         }
     }
 
