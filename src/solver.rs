@@ -702,10 +702,10 @@ impl NewtonRaphsonSolver {
             };
 
             // Step 5: Update variables: x_new = x_old + step_size * delta.
-            // Retain the applied step norm before refreshing numerical state so
-            // a tiny update can be diagnosed without being treated as success
-            // on its own.
-            let applied_step_norm = delta.norm() * step_size;
+            // Retain the undamped correction norm for the overdetermined
+            // stationarity test. The applied step may be intentionally tiny
+            // because of damping and is therefore not a convergence condition.
+            let correction_norm = delta.norm();
             for (i, &var_id) in self.variables.iter().enumerate() {
                 vars.insert(var_id, vars[&var_id] + step_size * delta[(i, 0)]);
             }
@@ -733,7 +733,7 @@ impl NewtonRaphsonSolver {
             }
             let updated_error = f_vals.norm();
 
-            if updated_error < self.tolerance || applied_step_norm < self.tolerance {
+            if updated_error < self.tolerance {
                 // A terminating candidate belongs in the history even though a
                 // subsequent loop iteration will not push it.
                 convergence_history.push(updated_error);
@@ -745,22 +745,30 @@ impl NewtonRaphsonSolver {
                     iter + 1,
                 )?;
 
-                if updated_error < self.tolerance {
-                    return Ok(self.build_solution(
-                        &vars,
-                        iter + 1,
-                        updated_error,
-                        gradient_norm,
-                        ConvergenceReason::ResidualTolerance,
-                        convergence_history,
-                    ));
-                }
+                return Ok(self.build_solution(
+                    &vars,
+                    iter + 1,
+                    updated_error,
+                    gradient_norm,
+                    ConvergenceReason::ResidualTolerance,
+                    convergence_history,
+                ));
+            }
 
-                // A non-zero least-squares residual is an expected outcome only
-                // for overdetermined systems. Require both a small accepted step
-                // and a small J^T f norm so regularization or poor scaling alone
-                // cannot manufacture convergence.
-                if num_equations > num_variables && gradient_norm < self.tolerance {
+            // A non-zero residual is a valid successful outcome only for an
+            // overdetermined least-squares problem. Use the undamped correction
+            // norm so a caller-selected small step size cannot manufacture
+            // stationarity in an ordinary damped root solve.
+            if num_equations > num_variables && correction_norm < self.tolerance {
+                let gradient_norm = self.residual_gradient_norm(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    parallel,
+                    &vars,
+                    iter + 1,
+                )?;
+                if gradient_norm < self.tolerance {
+                    convergence_history.push(updated_error);
                     return Ok(self.build_solution(
                         &vars,
                         iter + 1,
@@ -770,17 +778,6 @@ impl NewtonRaphsonSolver {
                         convergence_history,
                     ));
                 }
-
-                let diagnostic = self.build_diagnostic(
-                    format!(
-                        "Newton step fell below tolerance at iteration {} without satisfying residual or least-squares stationarity criteria",
-                        iter + 1
-                    ),
-                    iter + 1,
-                    &vars,
-                    &f_vals,
-                );
-                return Err(SolverError::NoConvergence(diagnostic));
             }
         }
 
@@ -1862,6 +1859,37 @@ mod tests {
                     assert!((diagnostic.error - 0.75).abs() < 1e-12);
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
+            }
+        }
+    }
+
+    /// Ensure that intentionally small damping does not become a false
+    /// small-step failure before the residual tolerance is satisfied.
+    #[test]
+    fn test_heavily_damped_linear_solve_reaches_residual_tolerance() {
+        for use_line_search in [false, true] {
+            for mode in test_modes() {
+                // Damping 0.1 requires roughly 220 geometric updates to reduce
+                // the residual below 1e-10. The applied update becomes smaller
+                // than tolerance earlier, but that is a caller-selected step
+                // size rather than evidence of numerical stagnation.
+                let x = Exp::var("x");
+                let equation = Exp::sub(x, Exp::val(1.0));
+                let solver = solver_for_mode(vec![equation], mode)
+                    .with_damping(0.1)
+                    .with_tolerance(1e-10)
+                    .with_max_iterations(300);
+                let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+                let solution = if use_line_search {
+                    solver.solve_with_line_search(initial)
+                } else {
+                    solver.solve(initial)
+                }
+                .expect("damped linear updates should eventually reach the root");
+
+                assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+                assert!(solution.error < 1e-10);
             }
         }
     }
