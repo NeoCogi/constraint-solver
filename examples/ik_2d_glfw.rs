@@ -184,6 +184,30 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     }
 }
 
+/// Delete every OpenGL object owned by [`GlState`] while its context is still
+/// current on this thread.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn destroy_gl_state(gl: &glow::Context, state: GlState) {
+    // Clear bindings before deletion so no subsequent context teardown step can
+    // observe handles that the example no longer owns.
+    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    gl.use_program(None);
+    gl.delete_buffer(state.vbo);
+    gl.delete_program(state.program);
+}
+
+/// Print a solver failure only when it differs from the most recently reported
+/// failure, then retain it for change detection on the next frame.
+fn report_changed_solver_error(last_error: &mut Option<String>, message: String) {
+    // A continuously unreachable cursor target can fail for many consecutive
+    // frames. Suppressing identical messages keeps stderr useful without hiding
+    // transitions to a different failure mode.
+    if last_error.as_deref() != Some(message.as_str()) {
+        eprintln!("IK solver error: {message}");
+    }
+    *last_error = Some(message);
+}
+
 fn draw_vertices(
     gl: &glow::Context,
     state: &GlState,
@@ -355,6 +379,9 @@ fn main() {
         .expect("failed to create window");
 
     window.make_current();
+    // Synchronize buffer swaps to the display so the continuously solving demo
+    // does not consume an entire CPU core rendering imperceptible extra frames.
+    glfw.set_swap_interval(glfw::SwapInterval::Sync(1));
     window.set_key_polling(true);
     window.set_cursor_pos_polling(true);
     window.set_framebuffer_size_polling(true);
@@ -409,6 +436,9 @@ fn main() {
         joint3: vec2(LINK_1 + LINK_2 + LINK_3, 0.0),
         effector: vec2(LINK_1 + LINK_2 + LINK_3 + LINK_4, 0.0),
     };
+    // Retain the last user-visible failure so a repeated per-frame error is
+    // reported once rather than flooding the terminal.
+    let mut last_solver_error: Option<String> = None;
 
     while !window.should_close() {
         glfw.poll_events();
@@ -454,21 +484,36 @@ fn main() {
         }
         target.vars.insert_values(&mut initial, &clamped_target);
 
-        // Solve for the joint positions.
-        if let Ok(solution) = solver.solve(initial) {
-            // Every successful result now carries an explicit convergence reason;
-            // failures are represented only by `Err`, so no redundant boolean
-            // success check is needed here.
-            if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
-                joint1.vars.read_values(&solution.values),
-                joint2.vars.read_values(&solution.values),
-                joint3.vars.read_values(&solution.values),
-                joint4.vars.read_values(&solution.values),
-            ) {
-                state.joint1 = j1;
-                state.joint2 = j2;
-                state.joint3 = j3;
-                state.effector = j4;
+        // Solve for joint positions and retain the last valid pose whenever a
+        // frame cannot be solved. Failures remain visible without making the
+        // graphical example terminate on a transient numerical condition.
+        match solver.solve(initial) {
+            Ok(solution) => {
+                if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
+                    joint1.vars.read_values(&solution.values),
+                    joint2.vars.read_values(&solution.values),
+                    joint3.vars.read_values(&solution.values),
+                    joint4.vars.read_values(&solution.values),
+                ) {
+                    state.joint1 = j1;
+                    state.joint2 = j2;
+                    state.joint3 = j3;
+                    state.effector = j4;
+
+                    // Report recovery once when a valid complete pose follows a
+                    // previously surfaced error.
+                    if last_solver_error.take().is_some() {
+                        eprintln!("IK solver recovered");
+                    }
+                } else {
+                    report_changed_solver_error(
+                        &mut last_solver_error,
+                        "successful solve omitted one or more joint coordinates".to_string(),
+                    );
+                }
+            }
+            Err(error) => {
+                report_changed_solver_error(&mut last_solver_error, error.to_string());
             }
         }
 
@@ -556,5 +601,11 @@ fn main() {
         }
 
         window.swap_buffers();
+    }
+
+    // Release GPU resources explicitly before `window` destroys the current
+    // context; deleting them afterward would be invalid OpenGL usage.
+    unsafe {
+        destroy_gl_state(&gl, gl_state);
     }
 }
