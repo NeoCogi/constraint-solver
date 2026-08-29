@@ -12,6 +12,27 @@ permissions:
   contents: read
 
 jobs:
+  dependency-audit:
+    name: Audit RustSec advisories
+    runs-on: ubuntu-latest
+    permissions:
+      # The RustSec action reads the lockfile and publishes a dedicated check;
+      # it receives no issue, pull-request, package, or repository-write access.
+      contents: read
+      checks: write
+
+    steps:
+      # Audit the exact locked transitive graph belonging to this revision.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # RustSec's maintained action installs cargo-audit, refreshes the advisory
+      # database, and fails this job when the lockfile contains a vulnerability.
+      - name: Check dependency advisories
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   msrv:
     name: Minimum supported Rust 1.86
     runs-on: ubuntu-latest

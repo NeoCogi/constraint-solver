@@ -19,8 +19,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an enforced missing-documentation lint.
 - README Rust examples compiled and executed by the documentation-test suite so
   published usage snippets cannot drift away from the public API.
-- Continuous integration gates for formatting, clippy, unit and example tests,
-  documentation tests, benchmark compilation, and crate packaging.
+- Continuous integration gates for RustSec advisories, formatting, clippy,
+  unit and example tests, documentation tests, benchmark compilation, and crate
+  packaging.
 
 ### Changed
 
