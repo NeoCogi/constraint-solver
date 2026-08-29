@@ -92,21 +92,23 @@ mod additional_matrix_tests {
 
     #[test]
     fn test_lu_nearly_singular() {
-        // Nearly singular matrix
+        // This matrix has a small but non-zero second pivot. The right-hand side
+        // is constructed from x = [1, 1], so the default relative LU policy must
+        // return that known solution rather than making the test accept either
+        // success or an arbitrary error.
         let a = Matrix::from_vec(vec![1.0, 1.0, 1.0, 1.0 + 1e-12], 2, 2).unwrap();
-
         let b = Matrix::from_vec(vec![2.0, 2.0 + 1e-12], 2, 1).unwrap();
+        let x = a
+            .solve_lu(&b)
+            .expect("a finite non-zero pivot should remain solvable");
 
-        // Should still solve (though with reduced accuracy)
-        match a.solve_lu(&b) {
-            Ok(x) => {
-                // Solution should be approximately [1, 1]
-                assert!((x[(0, 0)] - 1.0).abs() < 1e-6);
-                assert!((x[(1, 0)] - 1.0).abs() < 1e-6);
-            }
-            Err(_) => {
-                // It's OK if it fails due to being too singular
-            }
-        }
+        // Check both coordinates and the reconstructed right-hand side. The
+        // residual assertion catches compensating coordinate errors that a
+        // looser component-only check could miss on an ill-conditioned matrix.
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-6);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-6);
+        let reconstructed = a.try_mul(&x).expect("compatible product must work");
+        assert!((reconstructed[(0, 0)] - b[(0, 0)]).abs() < 1e-12);
+        assert!((reconstructed[(1, 0)] - b[(1, 0)]).abs() < 1e-12);
     }
 }
