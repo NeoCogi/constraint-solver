@@ -29,6 +29,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Restricted the compiled-expression `Jacobian` implementation to crate scope;
   its module, constructor inputs, and evaluation methods were already private,
   so its nominally public declarations could not form a usable external API.
+- Removed the unreachable public `MatrixError::RankDeficient` variant. QR rank
+  loss is now an explicitly private dispatch outcome that selects the SVD
+  pseudoinverse; it was never returned by public least-squares operations.
 - Changed line search to a slope-based Armijo condition for the residual norm,
   using `(f^T J delta) / ||f||` as its directional derivative, and kept its
   configured initial trial size authoritative.

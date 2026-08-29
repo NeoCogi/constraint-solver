@@ -164,11 +164,6 @@ pub enum MatrixError {
         /// Stable name of the solve that produced the invalid solution.
         operation: &'static str,
     },
-    /// A QR solve could not determine a unique independent triangular system.
-    RankDeficient {
-        /// Stable name of the QR operation that detected rank loss.
-        operation: &'static str,
-    },
     /// An iterative factorization exhausted its bounded iteration budget before
     /// reaching the requested numerical orthogonality.
     FactorizationDidNotConverge {
@@ -260,9 +255,6 @@ impl fmt::Display for MatrixError {
             MatrixError::NonFiniteResult { operation } => {
                 write!(f, "Non-finite result produced during {operation}")
             }
-            MatrixError::RankDeficient { operation } => {
-                write!(f, "Matrix is rank deficient during {operation}")
-            }
             MatrixError::FactorizationDidNotConverge { operation, sweeps } => write!(
                 f,
                 "Factorization {operation} did not converge after {sweeps} sweeps"
@@ -312,6 +304,25 @@ struct HouseholderReflector {
     diagonal: f64,
     /// Multiplier `2 / (v^T v)` for the implicit-one reflector vector.
     tau: f64,
+}
+
+/// Internal disposition of a completed Householder QR attempt.
+///
+/// Numerical rank loss is an instruction for the public least-squares
+/// dispatcher to retry with the Moore-Penrose SVD path, not a terminal matrix
+/// error exposed to callers.
+enum QrLeastSquaresOutcome {
+    /// QR produced a stable triangular solution for every independent column or
+    /// row required by the system orientation.
+    FullRank {
+        /// Full-rank least-squares or minimum-norm solution.
+        solution: Matrix,
+        /// Rank, conditioning, and factorization diagnostics for the solution.
+        diagnostics: LeastSquaresInfo,
+    },
+    /// QR found a diagonal too small for stable triangular substitution, so the
+    /// dispatcher must compute a pseudoinverse instead.
+    RankDeficient,
 }
 
 impl Matrix {
@@ -740,10 +751,12 @@ impl Matrix {
         // failure of the least-squares problem itself, so route only that case to
         // the SVD pseudoinverse while preserving unrelated validation and
         // arithmetic errors unchanged.
-        let full_rank = m.min(n);
         let result = match qr_result {
-            Ok((solution, info)) if info.rank == full_rank => (solution, info),
-            Ok(_) | Err(MatrixError::RankDeficient { .. }) => {
+            Ok(QrLeastSquaresOutcome::FullRank {
+                solution,
+                diagnostics,
+            }) => (solution, diagnostics),
+            Ok(QrLeastSquaresOutcome::RankDeficient) => {
                 Self::solve_least_squares_svd_with_info(self, b)?
             }
             Err(error) => return Err(error),
@@ -1243,7 +1256,7 @@ impl Matrix {
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+    ) -> Result<QrLeastSquaresOutcome, MatrixError> {
         let m = a.rows;
         let n = a.cols;
 
@@ -1378,11 +1391,12 @@ impl Matrix {
                 rank += 1;
             }
         }
-        let cond_est = if rank < n {
-            f64::INFINITY
-        } else {
-            Self::estimate_upper_triangular_condition(&r, n)
-        };
+        if rank < n {
+            // Rank loss is recoverable through the SVD dispatcher and therefore
+            // must not escape through the public matrix error type.
+            return Ok(QrLeastSquaresOutcome::RankDeficient);
+        }
+        let cond_est = Self::estimate_upper_triangular_condition(&r, n);
 
         // Back-substitute R x = Q^T b, using the top n entries.
         let mut x = Matrix::new(n, 1);
@@ -1405,22 +1419,22 @@ impl Matrix {
             }
 
             if diag.abs() <= 1e-12 * row_norm {
-                return Err(MatrixError::RankDeficient {
-                    operation: "solve_least_squares",
-                });
+                // A diagonal can pass the global rank threshold yet remain too
+                // small relative to its own row for stable substitution.
+                return Ok(QrLeastSquaresOutcome::RankDeficient);
             }
 
             x[(i, 0)] = sum / diag;
         }
 
-        Ok((
-            x,
-            LeastSquaresInfo {
+        Ok(QrLeastSquaresOutcome::FullRank {
+            solution: x,
+            diagnostics: LeastSquaresInfo {
                 rank,
                 cond_est,
                 method: LeastSquaresMethod::HouseholderQr,
             },
-        ))
+        })
     }
 
     /// Solve a wide full-row-rank system by Householder QR of its transpose.
@@ -1432,7 +1446,7 @@ impl Matrix {
         a: &Matrix,
         b: &Matrix,
         parallel: bool,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+    ) -> Result<QrLeastSquaresOutcome, MatrixError> {
         // Use QR on A^T to compute the minimum-norm least squares solution.
         //
         // Let A be m x n with m < n. Compute QR of A^T (n x m):
@@ -1542,11 +1556,12 @@ impl Matrix {
                 rank += 1;
             }
         }
-        let cond_est = if rank < m {
-            f64::INFINITY
-        } else {
-            Self::estimate_upper_triangular_condition(&r, m)
-        };
+        if rank < m {
+            // Let SVD determine the retained singular subspace and unique
+            // minimum-norm result for this recoverable rank-loss case.
+            return Ok(QrLeastSquaresOutcome::RankDeficient);
+        }
+        let cond_est = Self::estimate_upper_triangular_condition(&r, m);
 
         // Solve R^T y = b (R is m x m upper triangular, so R^T is lower triangular).
         let mut y = vec![0.0; m];
@@ -1569,9 +1584,9 @@ impl Matrix {
             }
 
             if diag.abs() <= 1e-12 * col_norm {
-                return Err(MatrixError::RankDeficient {
-                    operation: "solve_least_squares",
-                });
+                // Local triangular scaling can reveal instability not captured
+                // by the factor-wide diagonal maximum used for rank estimation.
+                return Ok(QrLeastSquaresOutcome::RankDeficient);
             }
 
             y[i] = sum / diag;
@@ -1622,15 +1637,13 @@ impl Matrix {
             }
         }
 
-        Matrix::from_vec(w, n, 1).map(|solution| {
-            (
-                solution,
-                LeastSquaresInfo {
-                    rank,
-                    cond_est,
-                    method: LeastSquaresMethod::HouseholderQr,
-                },
-            )
+        Matrix::from_vec(w, n, 1).map(|solution| QrLeastSquaresOutcome::FullRank {
+            solution,
+            diagnostics: LeastSquaresInfo {
+                rank,
+                cond_est,
+                method: LeastSquaresMethod::HouseholderQr,
+            },
         })
     }
 
