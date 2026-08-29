@@ -38,8 +38,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Unified nonlinear Jacobian correction policy across all shapes. Full-rank
   systems use Householder QR, rank-deficient systems use the SVD pseudoinverse,
   and ill-conditioned retained subspaces use augmented ridge regularization.
-- Centralized numerical defaults and made selected-path validation constant-time
-  instead of scanning retry budgets or rejecting inactive numerical policies.
+- Replaced caller-controlled regularization retry counts and growth factors
+  with a fixed three-strength fallback, so retries are bounded and distinct.
+- Centralized numerical defaults and ignored numerical policies that the
+  selected solve path cannot execute.
 - Changed Armijo line search to operate directly on the residual norm with the
   scale-safe directional derivative `(f / ||f||)^T (J delta)`.
 - Removed origin-based point projection from nonlinear iteration; every wide

@@ -33,6 +33,15 @@ use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
 
+/// Distinct ridge strengths attempted after an enabled direct solve is judged
+/// ill-conditioned.
+///
+/// Regularization is a bounded numerical fallback, not an iteration budget.
+/// Keeping this short geometric schedule structural prevents callers from
+/// requesting unbounded work or repeating an identical factorization while
+/// still testing the base scale and two meaningfully stronger alternatives.
+const REGULARIZATION_MULTIPLIERS: [f64; 3] = [1.0, 10.0, 100.0];
+
 /// Reusable storage for the augmented system used by regularized least-squares
 /// solves.
 struct LeastSquaresWorkspace {
@@ -152,8 +161,8 @@ enum LeastSquaresSolveError {
     /// A shape or matrix-operation precondition failed before a numerical solve
     /// could be attempted.
     InvalidInput(MatrixError),
-    /// Neither the unregularized solve nor any configured augmented attempt
-    /// produced an acceptable solution.
+    /// Neither the unregularized solve nor any fixed augmented fallback
+    /// strength produced an acceptable solution.
     Singular {
         /// Explanation from the direct, unregularized path or its condition
         /// diagnostics.
@@ -185,10 +194,6 @@ pub struct SolverOptions {
     pub regularization: f64,
     /// Condition estimate above which enabled regularization is attempted.
     pub condition_limit: f64,
-    /// Number of augmented strengths attempted when regularization is enabled.
-    pub regularization_attempts: usize,
-    /// Multiplicative increase between enabled regularization attempts.
-    pub regularization_growth_factor: f64,
     /// QR/SVD numerical-rank policy used by every Jacobian shape.
     pub least_squares: LeastSquaresOptions,
     /// Armijo sufficient-decrease coefficient used only by line search.
@@ -212,8 +217,6 @@ impl Default for SolverOptions {
             min_damping: 0.001,
             regularization: 1e-8,
             condition_limit: 1e12,
-            regularization_attempts: 3,
-            regularization_growth_factor: 10.0,
             least_squares: LeastSquaresOptions::default(),
             armijo_coefficient: 1e-4,
             line_search_max_trials: 64,
@@ -1104,14 +1107,12 @@ impl NewtonRaphsonSolver {
 
         let mut last_err: Option<String> = None;
         let mut last_result: Option<LinearSolveResult> = None;
-        let mut regularization_factor = 1.0;
-
-        for attempt in 0..self.options.regularization_attempts {
-            let lambda = self.options.regularization * regularization_factor;
+        for (attempt, multiplier) in REGULARIZATION_MULTIPLIERS.iter().copied().enumerate() {
+            let lambda = self.options.regularization * multiplier;
             if !lambda.is_finite() {
-                // Retry count is caller-controlled, so validate derived schedule
-                // values only when reached. Stop at the first overflow instead
-                // of scanning or repeatedly attempting the unusable remainder.
+                // A finite base can overflow at a stronger fixed multiplier.
+                // Stop at that boundary because all following strengths are
+                // larger and therefore unusable as well.
                 last_err = Some(format!(
                     "Regularization strength overflowed before attempt {}",
                     attempt + 1
@@ -1206,13 +1207,6 @@ impl NewtonRaphsonSolver {
                 Err(err) => {
                     last_err = Some(err.to_string());
                 }
-            }
-
-            // Advance the geometric retry schedule only after the current
-            // finite strength has actually been attempted. The next iteration
-            // performs the derived-value overflow check above.
-            if attempt + 1 < self.options.regularization_attempts {
-                regularization_factor *= self.options.regularization_growth_factor;
             }
         }
 
@@ -1352,22 +1346,14 @@ impl NewtonRaphsonSolver {
             )?;
         }
 
-        // Retry controls are inactive when regularization is disabled. Validate
-        // only their constant-time preconditions; derived strengths are checked
-        // lazily if an ill-conditioned linear solve reaches them.
+        // The condition threshold has no effect when regularization is
+        // disabled. When active, require a mathematically meaningful condition
+        // number: every non-empty retained singular subspace has condition at
+        // least one.
         if self.options.regularization > 0.0 {
             Self::require_valid_option(
-                self.options.condition_limit.is_finite() && self.options.condition_limit > 0.0,
-                "condition_limit must be finite and greater than zero",
-            )?;
-            Self::require_valid_option(
-                self.options.regularization_attempts > 0,
-                "regularization_attempts must be greater than zero",
-            )?;
-            Self::require_valid_option(
-                self.options.regularization_growth_factor.is_finite()
-                    && self.options.regularization_growth_factor >= 1.0,
-                "regularization_growth_factor must be finite and at least one",
+                self.options.condition_limit.is_finite() && self.options.condition_limit >= 1.0,
+                "condition_limit must be finite and at least one",
             )?;
         }
 
@@ -2210,15 +2196,9 @@ mod tests {
                 }),
             ),
             (
-                "regularization_attempts",
+                "condition_limit",
                 Box::new(|solver| {
-                    configure_options(solver, |options| options.regularization_attempts = 0)
-                }),
-            ),
-            (
-                "regularization_growth_factor",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.regularization_growth_factor = 0.5)
+                    configure_options(solver, |options| options.condition_limit = 0.5)
                 }),
             ),
             (
@@ -2277,39 +2257,21 @@ mod tests {
         }
     }
 
-    /// Keep configuration validation constant-time and ignore numerical policy
-    /// that the selected solve path cannot execute.
+    /// Ignore numerical policy that the selected solve path cannot execute.
     #[test]
-    fn test_configuration_validation_is_constant_time_and_policy_aware() {
+    fn test_configuration_validation_ignores_inactive_policy() {
         for mode in test_modes() {
             let x = Exp::var("x");
             let equation = Exp::sub(x, Exp::val(1.0));
             let initial = HashMap::from([("x".to_string(), 1.0)]);
 
-            // Retry count is an execution budget, not validation work. An exact
-            // root never performs regularization, so even the largest possible
-            // active budget must reach root certification immediately.
-            let solver = configure_options(
-                solver_for_mode(vec![equation.clone()], mode.clone()),
-                |options| {
-                    options.regularization_attempts = usize::MAX;
-                    options.regularization_growth_factor = 1.0;
-                },
-            );
-            let solution = solver
-                .solve(initial.clone())
-                .expect("validation must not enumerate the retry schedule");
-            assert_eq!(solution.iterations, 0);
-
             // Ordinary Newton does not read line-search settings, and disabled
-            // regularization does not read its retry or condition controls.
+            // regularization does not read its condition threshold.
             let solver = configure_options(
                 solver_for_mode(vec![equation.clone()], mode.clone()),
                 |options| {
                     options.regularization = 0.0;
                     options.condition_limit = f64::NAN;
-                    options.regularization_attempts = usize::MAX;
-                    options.regularization_growth_factor = f64::NAN;
                     options.armijo_coefficient = f64::NAN;
                     options.line_search_max_trials = 0;
                     options.line_search_min_step = f64::NAN;
@@ -2326,8 +2288,6 @@ mod tests {
                 options.min_damping = f64::NAN;
                 options.regularization = 0.0;
                 options.condition_limit = f64::NAN;
-                options.regularization_attempts = usize::MAX;
-                options.regularization_growth_factor = f64::NAN;
             });
             let solution = solver
                 .solve_with_line_search(initial)
@@ -3480,6 +3440,40 @@ mod tests {
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
         }
+    }
+
+    /// Keep regularization fallback finite and ensure each attempted augmented
+    /// factorization uses a distinct, stronger ridge value.
+    #[test]
+    fn test_regularization_uses_fixed_distinct_bounded_schedule() {
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::add(x, y);
+        let solver = configure_options(solver_for_mode(vec![equation], Mode::Serial), |options| {
+            options.regularization = 1e-8;
+            options.condition_limit = 1.0;
+        });
+
+        // Every augmented diagonal system remains above the deliberately strict
+        // condition limit, forcing the fallback to exhaust its structural
+        // schedule and return the final usable result.
+        let jacobian = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-8], 2, 2)
+            .expect("the fixture has a valid square shape");
+        let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1)
+            .expect("the fixture has a valid right-hand-side shape");
+        let result = match solver.solve_least_squares_system(&jacobian, &rhs, None, false) {
+            Ok(result) => result,
+            Err(_) => panic!("finite ridge systems must remain solvable"),
+        };
+
+        // The last of the three distinct strengths is base * 100. A
+        // caller-controlled identical or unbounded retry loop no longer exists.
+        let used_regularization = result
+            .diagnostic
+            .regularization
+            .expect("ill-conditioning must select an augmented solve");
+        assert!((used_regularization - 1e-6).abs() <= f64::EPSILON);
+        assert!(result.diagnostic.effective.cond_est > 1.0);
     }
 
     #[test]
