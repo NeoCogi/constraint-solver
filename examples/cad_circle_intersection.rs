@@ -25,7 +25,10 @@ SOFTWARE.
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
+/// Build the zero-valued residual for one circle equation.
 fn circle_eq(x: &Exp, y: &Exp, cx: f64, cy: f64, r: f64) -> Exp {
+    // Express squared coordinate offsets separately so the resulting tree
+    // mirrors (x-cx)^2 + (y-cy)^2 - r^2 and remains easy to inspect.
     let dx = Exp::sub(x.clone(), Exp::val(cx));
     let dy = Exp::sub(y.clone(), Exp::val(cy));
     Exp::sub(
@@ -53,5 +56,11 @@ fn main() {
     let x_sol = solution.values.get("x").copied().unwrap();
     let y_sol = solution.values.get("y").copied().unwrap();
 
+    // The initial positive y coordinate selects the upper intersection. Check
+    // the known geometry so this executable example is also a CI smoke test.
+    assert!(solution.error < 1e-10);
+    assert!(solution.iterations > 0);
+    assert!((x_sol - 2.0).abs() < 1e-10);
+    assert!((y_sol - 5.0_f64.sqrt()).abs() < 1e-10);
     println!("intersection: x={:.6}, y={:.6}", x_sol, y_sol);
 }

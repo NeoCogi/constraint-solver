@@ -58,5 +58,13 @@ fn main() {
     let i_sol = solution.values.get("i").copied().unwrap();
     let vd_sol = solution.values.get("vd").copied().unwrap();
 
+    // Verify the selected forward-biased operating point as well as the
+    // solver's aggregate residual. These bounds are intentionally tighter
+    // than the printed precision while allowing harmless floating-point drift.
+    assert!(solution.error < 1e-10);
+    assert!(solution.iterations > 0);
+    assert!((i_sol - 0.004_425_85).abs() < 1e-8);
+    assert!((vd_sol - 0.574_147).abs() < 1e-6);
+    assert!((vs - i_sol * r - vd_sol).abs() < 1e-10);
     println!("diode: i={:.6} A, vd={:.6} V", i_sol, vd_sol);
 }
