@@ -78,20 +78,35 @@ struct LineSearchContext<'a> {
 impl LeastSquaresWorkspace {
     /// Allocate reusable augmented matrices and initialize the diagonal for the
     /// caller's first regularization strength.
-    fn new(num_equations: usize, num_variables: usize, sqrt_reg: f64) -> Self {
+    fn new(
+        num_equations: usize,
+        num_variables: usize,
+        sqrt_reg: f64,
+    ) -> Result<Self, MatrixError> {
+        // The augmented row count is caller-derived dimension arithmetic and
+        // must be checked before allocation so release builds cannot wrap to a
+        // smaller, internally inconsistent matrix.
+        let augmented_rows = num_equations.checked_add(num_variables).ok_or(
+            MatrixError::DimensionSumOverflow {
+                operation: "regularized least-squares workspace construction",
+                left: num_equations,
+                right: num_variables,
+            },
+        )?;
+
         // Regularization rows are diagonal; residual rows are overwritten by
         // each solve before this workspace is consumed.
-        let mut augmented_j = Matrix::new(num_equations + num_variables, num_variables);
+        let mut augmented_j = Matrix::try_new(augmented_rows, num_variables)?;
         for i in 0..num_variables {
             augmented_j[(num_equations + i, i)] = sqrt_reg;
         }
 
-        LeastSquaresWorkspace {
+        Ok(LeastSquaresWorkspace {
             augmented_j,
-            augmented_b: Matrix::new(num_equations + num_variables, 1),
+            augmented_b: Matrix::try_new(augmented_rows, 1)?,
             num_equations,
             num_variables,
-        }
+        })
     }
 }
 
@@ -582,7 +597,7 @@ impl NewtonRaphsonSolver {
                     num_equations,
                     num_variables,
                     self.regularization.sqrt(),
-                ))
+                )?)
             } else {
                 None
             };
@@ -1224,9 +1239,22 @@ impl NewtonRaphsonSolver {
                         )
                 }
                 None => {
-                    let mut augmented_j =
-                        Matrix::new(j_matrix.rows() + j_matrix.cols(), j_matrix.cols());
-                    let mut augmented_b = Matrix::new(j_matrix.rows() + j_matrix.cols(), 1);
+                    // This allocation fallback is normally avoided by the
+                    // reusable workspace, but it remains independently safe for
+                    // future callers that do not provide one.
+                    let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
+                        LeastSquaresSolveError::InvalidInput(
+                            MatrixError::DimensionSumOverflow {
+                                operation: "regularized least-squares allocation",
+                                left: j_matrix.rows(),
+                                right: j_matrix.cols(),
+                            },
+                        ),
+                    )?;
+                    let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())
+                        .map_err(LeastSquaresSolveError::InvalidInput)?;
+                    let mut augmented_b = Matrix::try_new(augmented_rows, 1)
+                        .map_err(LeastSquaresSolveError::InvalidInput)?;
                     for i in 0..j_matrix.rows() {
                         for j in 0..j_matrix.cols() {
                             augmented_j[(i, j)] = j_matrix[(i, j)];

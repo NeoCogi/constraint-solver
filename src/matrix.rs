@@ -88,6 +88,16 @@ pub enum MatrixError {
         /// Requested column count.
         cols: usize,
     },
+    /// Adding logical dimensions overflowed `usize` before a matrix shape could
+    /// be constructed.
+    DimensionSumOverflow {
+        /// Stable name of the operation assembling the combined dimension.
+        operation: &'static str,
+        /// First dimension participating in the overflowing addition.
+        left: usize,
+        /// Second dimension participating in the overflowing addition.
+        right: usize,
+    },
     /// An algorithm that requires a square coefficient matrix received a
     /// rectangular matrix.
     NonSquare {
@@ -157,6 +167,14 @@ impl fmt::Display for MatrixError {
                 f,
                 "Matrix shape {rows}x{cols} exceeds the addressable element count"
             ),
+            MatrixError::DimensionSumOverflow {
+                operation,
+                left,
+                right,
+            } => write!(
+                f,
+                "Matrix dimension addition overflow during {operation}: {left} + {right}"
+            ),
             MatrixError::NonSquare { operation, matrix } => write!(
                 f,
                 "Matrix must be square for {operation}: received {}x{}",
@@ -199,16 +217,28 @@ impl Matrix {
     /// Panics if `rows * cols` cannot be represented by `usize`, or if the
     /// allocator cannot satisfy the resulting request.
     pub fn new(rows: usize, cols: usize) -> Self {
+        // Preserve the convenient infallible constructor for statically known
+        // internal shapes while routing all validation through `try_new`.
+        // Callers handling untrusted dimensions can use the fallible API below.
+        Self::try_new(rows, cols).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Allocate a zero-filled matrix with a fully validated shape.
+    ///
+    /// Unlike [`Matrix::new`], this constructor never panics for dimension
+    /// arithmetic overflow. Allocation exhaustion can still abort according to
+    /// the process allocator, as with ordinary `Vec` construction.
+    pub fn try_new(rows: usize, cols: usize) -> Result<Self, MatrixError> {
         // Detect dimension arithmetic overflow explicitly; allowing release-mode
-        // wrapping here would create storage inconsistent with the public shape.
+        // wrapping would create storage inconsistent with the public shape.
         let element_count = rows
             .checked_mul(cols)
-            .expect("matrix dimensions exceed the addressable element count");
-        Matrix {
+            .ok_or(MatrixError::ElementCountOverflow { rows, cols })?;
+        Ok(Matrix {
             data: vec![0.0; element_count],
             rows,
             cols,
-        }
+        })
     }
 
     /// Construct a row-major matrix from an owned element buffer.
@@ -1618,6 +1648,23 @@ mod tests {
                 assert!((x_parallel[(i, 0)] - x_true[i]).abs() < 1e-8);
             }
         }
+    }
+
+    /// Verify that callers with untrusted dimensions can observe shape overflow
+    /// as structured data instead of triggering the infallible constructor's
+    /// documented panic.
+    #[test]
+    fn test_try_new_reports_element_count_overflow() {
+        let error = Matrix::try_new(usize::MAX, 2)
+            .expect_err("overflowing element counts must be rejected");
+
+        assert_eq!(
+            error,
+            MatrixError::ElementCountOverflow {
+                rows: usize::MAX,
+                cols: 2,
+            }
+        );
     }
 
     #[test]
