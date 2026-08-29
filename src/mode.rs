@@ -22,6 +22,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Serial and explicitly sized parallel execution modes for solver-owned
+//! numerical work.
+
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 /// Execution strategy used for matrix operations within a solver instance.

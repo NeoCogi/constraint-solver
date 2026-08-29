@@ -177,10 +177,7 @@ mod tests {
         }
 
         fn next_u32(&mut self) -> u32 {
-            self.state = self
-                .state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (self.state >> 32) as u32
         }
 
@@ -223,10 +220,7 @@ mod tests {
         let f2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
         let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
-        let jacobian = Jacobian::new(
-            compiled.equations.clone(),
-            compiled.var_table.all_var_ids(),
-        );
+        let jacobian = Jacobian::new(compiled.equations.clone(), compiled.var_table.all_var_ids());
 
         // Evaluate at point (0.5, 0.5)
         let mut vars = HashMap::new();
@@ -269,10 +263,7 @@ mod tests {
         let f2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
         let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
-        let jacobian = Jacobian::new(
-            compiled.equations.clone(),
-            compiled.var_table.all_var_ids(),
-        );
+        let jacobian = Jacobian::new(compiled.equations.clone(), compiled.var_table.all_var_ids());
 
         // Evaluate at origin (0, 0)
         let mut vars = HashMap::new();
@@ -314,10 +305,7 @@ mod tests {
         let f2 = Exp::mul(x.clone(), y.clone()); // x*y
 
         let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
-        let jacobian = Jacobian::new(
-            compiled.equations.clone(),
-            compiled.var_table.all_var_ids(),
-        );
+        let jacobian = Jacobian::new(compiled.equations.clone(), compiled.var_table.all_var_ids());
         let mut workspace = jacobian.workspace();
         // Tests are descendants of this module and can deliberately corrupt the
         // private shape without retaining a production-only replacement API.
@@ -372,10 +360,7 @@ mod tests {
         }
 
         let compiled = Compiler::compile(&equations).expect("compile failed");
-        let jacobian = Jacobian::new(
-            compiled.equations.clone(),
-            compiled.var_table.all_var_ids(),
-        );
+        let jacobian = Jacobian::new(compiled.equations.clone(), compiled.var_table.all_var_ids());
         let mut workspace = jacobian.workspace();
 
         for _ in 0..25 {

@@ -22,77 +22,131 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Symbolic scalar expression nodes and ergonomic constructors used to define
+//! nonlinear equation residuals.
+
 use std::fmt;
 
+/// Immutable symbolic scalar expression tree.
+///
+/// Expressions represent residual functions rather than equations with a
+/// separate equality operator: a constraint is satisfied when its expression
+/// evaluates to zero.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exp {
+    /// Literal floating-point constant.
     Val(f64),
+    /// Variable referenced by its pre-compilation name.
     Var(String),
+    /// Sum of two child expressions.
     Add(Box<Exp>, Box<Exp>),
+    /// Difference between left and right child expressions.
     Sub(Box<Exp>, Box<Exp>),
+    /// Product of two child expressions.
     Mul(Box<Exp>, Box<Exp>),
+    /// Quotient of the left child by the right child.
     Div(Box<Exp>, Box<Exp>),
+    /// Real-valued constant power of a base expression.
     Power(Box<Exp>, f64),
+    /// Arithmetic negation of a child expression.
     Neg(Box<Exp>),
+    /// Sine of a child expression, measured in radians.
     Sin(Box<Exp>),
+    /// Cosine of a child expression, measured in radians.
     Cos(Box<Exp>),
+    /// Natural logarithm of a child expression.
     Ln(Box<Exp>),
+    /// Natural exponential of a child expression.
     Exp(Box<Exp>),
 }
 
 #[allow(clippy::self_named_constructors, clippy::should_implement_trait)]
 impl Exp {
+    /// Construct a named symbolic variable.
     pub fn var(name: impl Into<String>) -> Self {
+        // Retain the caller-facing name until compilation assigns a dense ID.
         Exp::Var(name.into())
     }
 
+    /// Construct a literal floating-point constant.
     pub fn val(v: f64) -> Self {
+        // Constants are stored without normalization so IEEE-754 behavior is
+        // preserved during checked evaluation.
         Exp::Val(v)
     }
 
+    /// Construct the sum `lhs + rhs`.
     pub fn add(lhs: Exp, rhs: Exp) -> Self {
+        // Box recursive children so every enum value has a fixed stack size.
         Exp::Add(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Construct the difference `lhs - rhs`.
     pub fn sub(lhs: Exp, rhs: Exp) -> Self {
+        // Preserve operand order because subtraction is not commutative.
         Exp::Sub(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Construct the product `lhs * rhs`.
     pub fn mul(lhs: Exp, rhs: Exp) -> Self {
+        // Symbolic simplification occurs during compilation, not construction.
         Exp::Mul(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Construct the quotient `lhs / rhs`.
     pub fn div(lhs: Exp, rhs: Exp) -> Self {
+        // Domain and division-by-zero checks remain evaluation concerns because
+        // the right expression can depend on variables.
         Exp::Div(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Construct `base` raised to the constant real exponent `exp`.
     pub fn power(base: Exp, exp: f64) -> Self {
+        // The exponent is scalar metadata rather than another expression,
+        // matching the derivative rules supported by the compiler.
         Exp::Power(Box::new(base), exp)
     }
 
+    /// Construct arithmetic negation of `exp`.
     pub fn neg(exp: Exp) -> Self {
+        // Keep negation explicit so differentiation and formatting can preserve
+        // its unary structure.
         Exp::Neg(Box::new(exp))
     }
 
+    /// Construct the sine of `exp`, interpreted in radians.
     pub fn sin(exp: Exp) -> Self {
+        // Trigonometric evaluation and differentiation operate on this owned
+        // boxed child.
         Exp::Sin(Box::new(exp))
     }
 
+    /// Construct the cosine of `exp`, interpreted in radians.
     pub fn cos(exp: Exp) -> Self {
+        // Retain cosine as a distinct node so its derivative can introduce the
+        // correct negated sine expression.
         Exp::Cos(Box::new(exp))
     }
 
+    /// Construct the natural logarithm of `exp`.
     pub fn ln(exp: Exp) -> Self {
+        // The positive-domain requirement is checked when concrete variable
+        // values are evaluated.
         Exp::Ln(Box::new(exp))
     }
 
+    /// Construct the natural exponential of `exp`.
     pub fn exp(exp: Exp) -> Self {
+        // Use the enum-qualified name to disambiguate the node from this
+        // convenience constructor.
         Exp::Exp(Box::new(exp))
     }
 }
 
 impl fmt::Display for Exp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Parenthesize binary operations consistently so the rendered tree is
+        // unambiguous without relying on precedence rules.
         match self {
             Exp::Val(v) => write!(f, "{v}"),
             Exp::Var(name) => write!(f, "{name}"),

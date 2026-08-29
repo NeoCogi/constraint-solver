@@ -37,14 +37,14 @@ fn main() {
     let vt = 0.02585;
 
     // KVL: Vs - I*R - Vd = 0
-    let kvl = Exp::sub(Exp::sub(Exp::val(vs), Exp::mul(i.clone(), Exp::val(r))), vd.clone());
+    let kvl = Exp::sub(
+        Exp::sub(Exp::val(vs), Exp::mul(i.clone(), Exp::val(r))),
+        vd.clone(),
+    );
 
     // I - Is * (exp(Vd / (n*Vt)) - 1) = 0
     let exp_arg = Exp::div(vd.clone(), Exp::val(n * vt));
-    let diode_i = Exp::mul(
-        Exp::val(isat),
-        Exp::sub(Exp::exp(exp_arg), Exp::val(1.0)),
-    );
+    let diode_i = Exp::mul(Exp::val(isat), Exp::sub(Exp::exp(exp_arg), Exp::val(1.0)));
     let diode_eq = Exp::sub(i.clone(), diode_i);
 
     let compiled = Compiler::compile(&[kvl, diode_eq]).expect("compile failed");

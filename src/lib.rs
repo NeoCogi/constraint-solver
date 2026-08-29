@@ -22,6 +22,36 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Symbolic construction and numerical solution of small dense nonlinear
+//! constraint systems.
+//!
+//! Build residual expressions with [`Exp`], compile their variable names once
+//! with [`Compiler`], and solve square, underdetermined, or overdetermined
+//! systems with [`NewtonRaphsonSolver`]. Rectangular linearizations use QR for
+//! full-rank systems and a Jacobi-SVD pseudoinverse for rank-deficient systems.
+//!
+//! # Quick start
+//!
+//! ```
+//! use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
+//! use std::collections::HashMap;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Residual zero means x = 2.
+//! let equation = Exp::sub(Exp::var("x"), Exp::val(2.0));
+//! let compiled = Compiler::compile(&[equation])?;
+//! let solver = NewtonRaphsonSolver::new(compiled);
+//! let initial = HashMap::from([("x".to_string(), 0.0)]);
+//!
+//! let solution = solver.solve(initial)?;
+//! assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+//! assert!((solution.values["x"] - 2.0).abs() < 1e-10);
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
 pub mod compiler;
 pub mod exp;
 mod jacobian;

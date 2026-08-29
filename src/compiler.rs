@@ -22,6 +22,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Compilation of name-based symbolic expressions into compact, indexed
+//! equation systems suitable for repeated numerical evaluation.
+
 use std::collections::HashMap;
 use std::fmt;
 

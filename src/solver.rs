@@ -22,10 +22,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Damped Newton-Raphson iteration, line search, regularized least squares,
+//! convergence results, and structured failure diagnostics.
+
 use crate::compiler::{CompiledExp, CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
-use crate::mode::{build_thread_pool, Mode};
+use crate::mode::{Mode, build_thread_pool};
 use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
@@ -77,20 +80,18 @@ struct LineSearchContext<'a> {
 
 impl LeastSquaresWorkspace {
     /// Allocate zero-filled augmented matrices for repeated regularized solves.
-    fn new(
-        num_equations: usize,
-        num_variables: usize,
-    ) -> Result<Self, MatrixError> {
+    fn new(num_equations: usize, num_variables: usize) -> Result<Self, MatrixError> {
         // The augmented row count is caller-derived dimension arithmetic and
         // must be checked before allocation so release builds cannot wrap to a
         // smaller, internally inconsistent matrix.
-        let augmented_rows = num_equations.checked_add(num_variables).ok_or(
-            MatrixError::DimensionSumOverflow {
-                operation: "regularized least-squares workspace construction",
-                left: num_equations,
-                right: num_variables,
-            },
-        )?;
+        let augmented_rows =
+            num_equations
+                .checked_add(num_variables)
+                .ok_or(MatrixError::DimensionSumOverflow {
+                    operation: "regularized least-squares workspace construction",
+                    left: num_equations,
+                    right: num_variables,
+                })?;
 
         // Both augmented matrices start at zero. Each solve overwrites the
         // residual block and regularization diagonal; every lower off-diagonal
@@ -289,7 +290,9 @@ impl From<EvaluationError> for SolverError {
     /// explicit invariant failure without exposing an unreachable public error
     /// variant.
     fn from(value: EvaluationError) -> Self {
-        SolverError::InvalidInput(format!("Internal compiled-system invariant failed: {value}"))
+        SolverError::InvalidInput(format!(
+            "Internal compiled-system invariant failed: {value}"
+        ))
     }
 }
 
@@ -519,10 +522,7 @@ impl NewtonRaphsonSolver {
     /// Select how underdetermined iterations resolve their Jacobian null space.
     ///
     /// This setting has no effect on square or overdetermined systems.
-    pub fn with_underdetermined_policy(
-        mut self,
-        policy: UnderdeterminedPolicy,
-    ) -> Self {
+    pub fn with_underdetermined_policy(mut self, policy: UnderdeterminedPolicy) -> Self {
         // Store the policy on the reusable solver so every solve invocation has
         // deterministic null-space behavior.
         self.underdetermined_policy = policy;
@@ -570,8 +570,7 @@ impl NewtonRaphsonSolver {
         let mut jacobian_workspace = jacobian.workspace();
         // Store the initial residual plus at most one residual for every
         // accepted update.
-        let mut convergence_history =
-            Vec::with_capacity(self.max_iterations.saturating_add(1));
+        let mut convergence_history = Vec::with_capacity(self.max_iterations.saturating_add(1));
         // Standard solves begin with exactly the configured damping factor. A
         // previous residual is optional so the first iteration cannot pretend
         // it observed an improvement from an artificial infinity sentinel.
@@ -592,10 +591,7 @@ impl NewtonRaphsonSolver {
 
         let mut least_squares_workspace =
             if self.regularization > 0.0 && num_equations != num_variables {
-                Some(LeastSquaresWorkspace::new(
-                    num_equations,
-                    num_variables,
-                )?)
+                Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
             } else {
                 None
             };
@@ -789,9 +785,8 @@ impl NewtonRaphsonSolver {
                             // line-search slope calculations must use J, not the
                             // numerically modified system used only to obtain p.
                             let mut regularized_jacobian = j_matrix.clone();
-                            let diag_size = regularized_jacobian
-                                .rows()
-                                .min(regularized_jacobian.cols());
+                            let diag_size =
+                                regularized_jacobian.rows().min(regularized_jacobian.cols());
                             for i in 0..diag_size {
                                 regularized_jacobian[(i, i)] += self.regularization * 100.0;
                             }
@@ -799,9 +794,7 @@ impl NewtonRaphsonSolver {
                                 Ok(d) => d,
                                 Err(e) => {
                                     let diag = self.build_diagnostic(
-                                        format!(
-                                            "Matrix is singular even with regularization: {e}"
-                                        ),
+                                        format!("Matrix is singular even with regularization: {e}"),
                                         iter,
                                         &vars,
                                         &f_vals,
@@ -871,15 +864,14 @@ impl NewtonRaphsonSolver {
                 // demonstrated sufficient residual reduction. Passing the
                 // current residuals lets an exhausted search report the state
                 // at which it failed rather than the final rejected candidate.
-                let objective_directional_derivative =
-                    self.least_squares_directional_derivative(
-                        jacobian_workspace.jacobian(),
-                        &f_vals,
-                        &delta,
-                        parallel,
-                        &vars,
-                        iter,
-                    )?;
+                let objective_directional_derivative = self.least_squares_directional_derivative(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    &delta,
+                    parallel,
+                    &vars,
+                    iter,
+                )?;
                 self.line_search(LineSearchContext {
                     jacobian: &jacobian,
                     vars: &vars,
@@ -1012,8 +1004,7 @@ impl NewtonRaphsonSolver {
         let diag = self.build_diagnostic(
             format!(
                 "Failed to converge after {} iterations. Final error: {:.2e}",
-                self.max_iterations,
-                final_error
+                self.max_iterations, final_error
             ),
             self.max_iterations,
             &vars,
@@ -1042,12 +1033,7 @@ impl NewtonRaphsonSolver {
                 // The wide QR solver returns the smallest correction satisfying
                 // the linearized equation J*delta=-f. Adding it to the current
                 // point preserves all existing Jacobian-null-space components.
-                self.solve_least_squares_system(
-                    j_matrix,
-                    negative_residuals,
-                    workspace,
-                    parallel,
-                )
+                self.solve_least_squares_system(j_matrix, negative_residuals, workspace, parallel)
             }
             UnderdeterminedPolicy::MinimumNormLinearizedSolution => {
                 // Assemble the current solve-variable vector in exactly the
@@ -1066,12 +1052,8 @@ impl NewtonRaphsonSolver {
                 let projected_rhs = jacobian_times_current
                     .try_sub(residuals)
                     .map_err(LeastSquaresSolveError::InvalidInput)?;
-                let next_values = self.solve_least_squares_system(
-                    j_matrix,
-                    &projected_rhs,
-                    workspace,
-                    parallel,
-                )?;
+                let next_values =
+                    self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
 
                 // The surrounding update loop consumes a correction, so convert
                 // the projected next point back into delta form.
@@ -1111,12 +1093,8 @@ impl NewtonRaphsonSolver {
         let projected_rhs = j_matrix
             .try_mul_with_parallel(&current_values, parallel)
             .map_err(LeastSquaresSolveError::InvalidInput)?;
-        let projected_values = self.solve_least_squares_system(
-            j_matrix,
-            &projected_rhs,
-            workspace,
-            parallel,
-        )?;
+        let projected_values =
+            self.solve_least_squares_system(j_matrix, &projected_rhs, workspace, parallel)?;
         let projection_delta = projected_values
             .try_sub(&current_values)
             .map_err(LeastSquaresSolveError::InvalidInput)?;
@@ -1125,9 +1103,8 @@ impl NewtonRaphsonSolver {
         // the current vector norm makes the threshold invariant under unit
         // changes while the epsilon multiplier allows ordinary QR noise.
         const PROJECTION_EPSILON_MULTIPLIER: f64 = 64.0;
-        let projection_threshold = PROJECTION_EPSILON_MULTIPLIER
-            * f64::EPSILON
-            * current_values.norm().max(1.0);
+        let projection_threshold =
+            PROJECTION_EPSILON_MULTIPLIER * f64::EPSILON * current_values.norm().max(1.0);
         if projection_delta.norm() <= projection_threshold {
             Ok(None)
         } else {
@@ -1243,13 +1220,11 @@ impl NewtonRaphsonSolver {
                     // reusable workspace, but it remains independently safe for
                     // future callers that do not provide one.
                     let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
-                        LeastSquaresSolveError::InvalidInput(
-                            MatrixError::DimensionSumOverflow {
-                                operation: "regularized least-squares allocation",
-                                left: j_matrix.rows(),
-                                right: j_matrix.cols(),
-                            },
-                        ),
+                        LeastSquaresSolveError::InvalidInput(MatrixError::DimensionSumOverflow {
+                            operation: "regularized least-squares allocation",
+                            left: j_matrix.rows(),
+                            right: j_matrix.cols(),
+                        }),
                     )?;
                     let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())
                         .map_err(LeastSquaresSolveError::InvalidInput)?;
@@ -1265,10 +1240,7 @@ impl NewtonRaphsonSolver {
                         augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
                         augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
                     }
-                    augmented_j.solve_least_squares_with_info_with_parallel(
-                        &augmented_b,
-                        parallel,
-                    )
+                    augmented_j.solve_least_squares_with_info_with_parallel(&augmented_b, parallel)
                 }
             };
 
@@ -1292,8 +1264,12 @@ impl NewtonRaphsonSolver {
         Err(LeastSquaresSolveError::Singular {
             unregularized_error: unregularized_error
                 .or_else(|| {
-                    unreg_info
-                        .map(|info| format!("Least squares ill-conditioned (rank {}, cond {:.2e})", info.rank, info.cond_est))
+                    unreg_info.map(|info| {
+                        format!(
+                            "Least squares ill-conditioned (rank {}, cond {:.2e})",
+                            info.rank, info.cond_est
+                        )
+                    })
                 })
                 .unwrap_or_else(|| "Unregularized least squares failed".to_string()),
             regularized_error: last_err
@@ -1727,9 +1703,9 @@ impl NewtonRaphsonSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Mode;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
-    use crate::Mode;
 
     struct TestRng {
         state: u64,
@@ -1741,10 +1717,7 @@ mod tests {
         }
 
         fn next_u32(&mut self) -> u32 {
-            self.state = self
-                .state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (self.state >> 32) as u32
         }
 
@@ -1768,7 +1741,12 @@ mod tests {
             .map(|n| n.get())
             .unwrap_or(1)
             .clamp(1, 4);
-        vec![Mode::Serial, Mode::Parallel { thread_count: threads }]
+        vec![
+            Mode::Serial,
+            Mode::Parallel {
+                thread_count: threads,
+            },
+        ]
     }
 
     fn assert_solution_close(serial: &Solution, parallel: &Solution, tol: f64) {
@@ -1905,7 +1883,9 @@ mod tests {
             let mut initial = HashMap::new();
             initial.insert("x".to_string(), 1.0);
 
-            let err = solver.solve(initial).expect_err("expected missing variable error");
+            let err = solver
+                .solve(initial)
+                .expect_err("expected missing variable error");
             if is_serial {
                 serial_error = Some(err.clone());
             } else {
@@ -1964,11 +1944,23 @@ mod tests {
         // Each case constructs a fresh solver because builder methods consume
         // and return the solver by value.
         let invalid_cases: Vec<(&str, SolverConfigurator)> = vec![
-            ("max_iterations", Box::new(|solver| solver.with_max_iterations(0))),
+            (
+                "max_iterations",
+                Box::new(|solver| solver.with_max_iterations(0)),
+            ),
             ("tolerance", Box::new(|solver| solver.with_tolerance(0.0))),
-            ("tolerance", Box::new(|solver| solver.with_tolerance(f64::NAN))),
-            ("damping_factor", Box::new(|solver| solver.with_damping(0.0))),
-            ("damping_factor", Box::new(|solver| solver.with_damping(1.1))),
+            (
+                "tolerance",
+                Box::new(|solver| solver.with_tolerance(f64::NAN)),
+            ),
+            (
+                "damping_factor",
+                Box::new(|solver| solver.with_damping(0.0)),
+            ),
+            (
+                "damping_factor",
+                Box::new(|solver| solver.with_damping(1.1)),
+            ),
             (
                 "damping_factor",
                 Box::new(|solver| solver.with_damping(f64::INFINITY)),
@@ -2145,8 +2137,7 @@ mod tests {
         let residuals = Matrix::from_vec(vec![-1.0, -2.0], 2, 1)
             .expect("residual vector shape should be valid");
 
-        let diagnostic =
-            solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals);
+        let diagnostic = solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals);
 
         assert_eq!(diagnostic.equations.len(), 2);
         assert_eq!(
@@ -2361,7 +2352,9 @@ mod tests {
             let solver = solver_for_mode(vec![equation], mode);
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver.solve(initial).expect("scaled linear root should solve");
+            let solution = solver
+                .solve(initial)
+                .expect("scaled linear root should solve");
 
             let returned_residual = 1e20 * solution.values["x"] + 1.0;
             assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
@@ -2391,10 +2384,7 @@ mod tests {
                 .solve(initial)
                 .expect("stationary least-squares result should be explicit");
 
-            assert_eq!(
-                solution.reason,
-                ConvergenceReason::LeastSquaresStationary
-            );
+            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-12);
             assert!(solution.gradient_norm < 1e-10);
         }
@@ -2430,10 +2420,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(
-                solution.reason,
-                ConvergenceReason::LeastSquaresStationary
-            );
+            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
             assert!(solution.values["x"].abs() < 1e-8);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
             assert!(solution.gradient_norm < 1e-8);
@@ -2470,10 +2457,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert_eq!(
-                solution.reason,
-                ConvergenceReason::LeastSquaresStationary
-            );
+            assert_eq!(solution.reason, ConvergenceReason::LeastSquaresStationary);
             assert!(solution.values["x"].abs() < 1e-8);
             assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-10);
         }
@@ -2565,9 +2549,7 @@ mod tests {
             let solver = solver_for_mode(vec![eq], mode)
                 .with_tolerance(1e-12)
                 .with_max_iterations(10)
-                .with_underdetermined_policy(
-                    UnderdeterminedPolicy::MinimumNormLinearizedSolution,
-                );
+                .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormLinearizedSolution);
 
             let mut initial = HashMap::new();
             initial.insert("x".to_string(), 10.0);
@@ -2609,10 +2591,7 @@ mod tests {
                     .with_damping(0.5)
                     .with_tolerance(1e-10)
                     .with_max_iterations(100);
-                let initial = HashMap::from([
-                    ("x".to_string(), 1.0e8),
-                    ("y".to_string(), -1.0e8),
-                ]);
+                let initial = HashMap::from([("x".to_string(), 1.0e8), ("y".to_string(), -1.0e8)]);
 
                 let solution = if use_line_search {
                     solver.solve_with_line_search(initial)
@@ -2647,12 +2626,11 @@ mod tests {
             let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
             let solver = solver_for_mode(vec![equation], mode)
                 .with_underdetermined_policy(UnderdeterminedPolicy::MinimumNormStep);
-            let initial = HashMap::from([
-                ("x".to_string(), 10.0),
-                ("y".to_string(), -10.0),
-            ]);
+            let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
 
-            let solution = solver.solve(initial).expect("linear constraint should solve");
+            let solution = solver
+                .solve(initial)
+                .expect("linear constraint should solve");
 
             assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values["x"] - 10.5).abs() < 1e-10);

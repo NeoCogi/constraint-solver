@@ -27,8 +27,8 @@ use glfw::{Action, Context, Key, WindowEvent};
 use glow::HasContext;
 use rs_math3d::Vec2d;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::f64::consts::PI;
+use std::ffi::c_void;
 
 // Link lengths and draw sizes (world units == screen pixels).
 const LINK_1: f64 = 140.0;
@@ -141,7 +141,9 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     "#;
 
     let program = gl.create_program().expect("create program");
-    let vertex = gl.create_shader(glow::VERTEX_SHADER).expect("create vertex shader");
+    let vertex = gl
+        .create_shader(glow::VERTEX_SHADER)
+        .expect("create vertex shader");
     gl.shader_source(vertex, vertex_src);
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
@@ -154,7 +156,10 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     gl.shader_source(fragment, fragment_src);
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
-        panic!("fragment shader error: {}", gl.get_shader_info_log(fragment));
+        panic!(
+            "fragment shader error: {}",
+            gl.get_shader_info_log(fragment)
+        );
     }
 
     gl.attach_shader(program, vertex);
@@ -375,7 +380,12 @@ fn main() {
     glfw.window_hint(glfw::WindowHint::ContextVersion(2, 1));
 
     let (mut window, events) = glfw
-        .create_window(900, 700, "2D IK (constraint-solver)", glfw::WindowMode::Windowed)
+        .create_window(
+            900,
+            700,
+            "2D IK (constraint-solver)",
+            glfw::WindowMode::Windowed,
+        )
         .expect("failed to create window");
 
     window.make_current();
@@ -531,20 +541,10 @@ fn main() {
             gl.viewport(0, 0, fb_w as i32, fb_h as i32);
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(gl_state.program));
-            gl.uniform_2_f32(
-                gl_state.u_view_loc.as_ref(),
-                fb_w as f32,
-                fb_h as f32,
-            );
+            gl.uniform_2_f32(gl_state.u_view_loc.as_ref(), fb_w as f32, fb_h as f32);
 
             let mut line_vertices = Vec::with_capacity(16);
-            let points = [
-                base,
-                joint1_world,
-                joint2_world,
-                joint3_world,
-                eff_world,
-            ];
+            let points = [base, joint1_world, joint2_world, joint3_world, eff_world];
             for i in 0..points.len() - 1 {
                 let a = &points[i];
                 let b = &points[i + 1];
