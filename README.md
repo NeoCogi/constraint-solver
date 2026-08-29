@@ -30,9 +30,10 @@ in addition to validating the repository with the current stable toolchain.
 
 The solver supports all three system shapes:
 
-- Square systems (equations == variables): solved via LU on the Jacobian, with
-  QR/SVD pseudoinverse and augmented regularization fallback when LU cannot
-  produce a stable correction.
+- Square systems (equations == variables): solved by the same condition-aware
+  QR/SVD policy as rectangular Jacobians. Full-rank systems use QR,
+  rank-deficient systems use an SVD pseudoinverse, and an ill-conditioned
+  retained subspace can select augmented ridge regularization.
 - Under-constrained systems (equations < variables): solved via QR/SVD least squares.
   Callers explicitly choose between a minimum-norm Newton correction, which
   preserves null-space continuity, and the minimum-norm solution of each local
@@ -41,6 +42,11 @@ The solver supports all three system shapes:
   squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
   system that reaches first-order stationarity returns
   `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
+
+Every system shape has the same success contract: `Ok(Solution)` means the
+returned residual norm satisfies `SolverOptions::residual_tolerance`. A
+first-order stationary point whose residual remains too large is an error even
+for a square or under-constrained system.
 
 ### Square system example
 
@@ -159,7 +165,10 @@ let _solver = NewtonRaphsonSolver::new_with_mode(compiled, Mode::Parallel { thre
 moved into a solver. Optional equation traces are positional and must include
 exactly one entry per equation; attaching them is fallible. On failure,
 `SolverRunDiagnostic::equations` pairs every signed residual with its equation
-index and optional trace.
+index and optional trace. Successful solutions and run diagnostics also expose
+`last_linear_solve`, which reports the effective QR/SVD rank and condition
+estimate, whether regularization was used, and the original unregularized
+classification when a ridge solve replaced it.
 
 ```rust
 use constraint_solver::{Compiler, EquationTrace, Exp, NewtonRaphsonSolver};
@@ -241,9 +250,10 @@ decisions.
   to disable it. Rank loss by itself does not force damping when the retained
   SVD subspace is well conditioned.
 - Line search applies a slope-based Armijo condition directly to the residual
-  norm `||f||`, using directional derivative `(f^T J delta) / ||f||`. This
-  avoids overflowing by squaring a large finite norm and reports failure
-  without counting rejected candidates as accepted solver updates.
+  norm `||f||`. It evaluates the equivalent scale-safe directional derivative
+  `(f / ||f||)^T (J delta)` without first forming the potentially overflowing
+  dot product `f^T J delta`, and reports failure without counting rejected
+  candidates as accepted solver updates.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.
