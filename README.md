@@ -1,7 +1,7 @@
 # constraint-solver
 [![crates.io](https://img.shields.io/crates/v/constraint-solver?style=flat-square)](https://crates.io/crates/constraint-solver)
 
-A small, generic constraint-solving core for nonlinear systems. This crate provides:
+A small `f64` constraint-solving core for nonlinear systems. This crate provides:
 
 - A symbolic expression tree (`Exp`) for building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
@@ -38,9 +38,8 @@ The solver supports all three system shapes:
   rank-deficient systems use an SVD pseudoinverse, and an ill-conditioned
   retained subspace can select augmented ridge regularization.
 - Under-constrained systems (equations < variables): solved via QR/SVD least squares.
-  Callers explicitly choose between a minimum-norm Newton correction, which
-  preserves null-space continuity, and the minimum-norm solution of each local
-  linearization.
+  The Moore-Penrose minimum-norm Newton correction preserves the current local
+  Jacobian-null-space component for continuity.
 - Over-constrained systems (equations > variables): solved via QR/SVD least
   squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
   system whose residual is orthogonal to every Jacobian column returns
@@ -123,7 +122,7 @@ let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-10);
 ```
 
-### Line search and regularization
+### Line search
 
 ```rust
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
@@ -137,8 +136,7 @@ let f2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
 let solver = NewtonRaphsonSolver::new(compiled)
     .with_residual_tolerance(1e-8)
-    .with_max_iterations(50)
-    .with_regularization(1e-8);
+    .with_max_iterations(50);
 
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.5);
@@ -259,8 +257,9 @@ decisions.
   guess map; missing variables are treated as errors.
 - Internally, the solver differentiates and simplifies its symbolic Jacobian
   once during construction. Each solve creates independent numerical storage
-  and reuses that storage between iterations, so solver reuse avoids both
-  repeated symbolic work and per-iteration matrix allocation.
+  and reuses residual, Jacobian, and regularization workspaces between
+  iterations. Matrix factorizations still allocate their own working copies and
+  temporary vectors.
 - Derivatives are evaluated from the exact symbolic tree; the solver does not
   replace non-finite derivatives with finite differences. A finite residual at
   a domain boundary may therefore still return

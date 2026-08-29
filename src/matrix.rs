@@ -156,8 +156,8 @@ pub enum MatrixError {
         /// Operand in which the invalid value was observed.
         operand: MatrixOperand,
     },
-    /// A factorization encountered a pivot too small relative to its local
-    /// scale to support a stable solve.
+    /// A factorization encountered a pivot too small relative to its complete
+    /// coefficient-matrix scale to support a stable solve.
     Singular {
         /// Stable name of the factorization or solve that detected singularity.
         operation: &'static str,

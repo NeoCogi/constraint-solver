@@ -206,7 +206,11 @@ mod tests {
         }
     }
 
+    /// Build `sum(coefficients[i] * variables[i]^2) - rhs` for a Jacobian
+    /// fixture whose derivatives have a simple independent closed form.
     fn nonlinear_equation(coeffs: &[f64], vars: &[Exp], rhs: f64) -> Exp {
+        // Assemble the expression through the public symbolic constructors so
+        // the test exercises the same compilation path as crate users.
         let mut sum = Exp::val(0.0);
         for (coeff, var) in coeffs.iter().zip(vars.iter()) {
             let term = Exp::mul(Exp::val(*coeff), Exp::mul(var.clone(), var.clone()));
@@ -355,11 +359,14 @@ mod tests {
         assert!((j2[(1, 1)] + 1.0).abs() < 1e-12); // df2/dy = x
     }
 
+    /// Compare reused nonlinear Jacobian evaluation with its analytical
+    /// derivative rather than a second invocation of the same implementation.
     #[test]
-    fn test_reused_workspace_matches_fresh_random_nonlinear() {
+    fn test_reused_workspace_matches_analytic_random_nonlinear_jacobian() {
         let mut rng = TestRng::new(0x9e37_79b9_7f4a_7c15);
         let vars: Vec<Exp> = (0..3).map(|i| Exp::var(format!("x{i}"))).collect();
         let mut equations = Vec::new();
+        let mut equation_coefficients = Vec::new();
 
         for eq_idx in 0..3 {
             let mut coeffs = Vec::with_capacity(vars.len());
@@ -372,34 +379,43 @@ mod tests {
             }
             let rhs = rng.next_f64_range(-1.0, 1.0);
             equations.push(nonlinear_equation(&coeffs, &vars, rhs));
+            equation_coefficients.push(coeffs);
         }
 
         let compiled = Compiler::compile(&equations).expect("compile failed");
         let jacobian = Jacobian::new(compiled.equations.clone(), compiled.var_table.all_var_ids());
         let mut workspace = jacobian.workspace();
+        let variable_ids = compiled.var_table.all_var_ids();
 
         for _ in 0..25 {
             let mut values = HashMap::new();
-            for name in compiled.var_table.names().iter() {
-                let id = compiled.var_table.get_id(name).expect("missing id");
-                values.insert(id, rng.next_f64());
+            let mut point = Vec::with_capacity(variable_ids.len());
+            for &variable_id in &variable_ids {
+                let value = rng.next_f64();
+                values.insert(variable_id, value);
+                point.push(value);
             }
 
-            // A newly allocated workspace provides an independent baseline for
-            // detecting stale elements left in the long-lived workspace.
-            let mut fresh_workspace = jacobian.workspace();
-            let fresh = jacobian
-                .evaluate_checked_in_workspace(&values, &mut fresh_workspace)
-                .expect("fresh jacobian evaluate failed");
-            let in_ws = jacobian
+            // For f_i = sum_j(a_ij * x_j^2) - rhs_i, the independent analytical
+            // oracle is df_i/dx_j = 2 * a_ij * x_j. Repeated points exercise
+            // workspace reuse while this closed form detects shared compiler or
+            // evaluator mistakes that a fresh workspace could not reveal.
+            let evaluated = jacobian
                 .evaluate_checked_in_workspace(&values, &mut workspace)
                 .expect("jacobian workspace evaluate failed");
 
-            assert_eq!(fresh.rows(), in_ws.rows());
-            assert_eq!(fresh.cols(), in_ws.cols());
-            for i in 0..fresh.rows() {
-                for j in 0..fresh.cols() {
-                    assert!((fresh[(i, j)] - in_ws[(i, j)]).abs() < 1e-12);
+            assert_eq!(evaluated.rows(), equation_coefficients.len());
+            assert_eq!(evaluated.cols(), point.len());
+            for equation_index in 0..evaluated.rows() {
+                for variable_index in 0..evaluated.cols() {
+                    let expected = 2.0
+                        * equation_coefficients[equation_index][variable_index]
+                        * point[variable_index];
+                    assert!(
+                        (evaluated[(equation_index, variable_index)] - expected).abs() < 1e-12,
+                        "equation {equation_index}, variable {variable_index}: expected {expected}, got {}",
+                        evaluated[(equation_index, variable_index)]
+                    );
                 }
             }
         }

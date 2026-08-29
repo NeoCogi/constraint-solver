@@ -152,6 +152,12 @@ jobs:
       - name: Run unit and example tests
         run: cargo test --locked --all-targets
 
+      # Optimized arithmetic disables debug overflow traps. Re-run library
+      # regressions in the release profile so coordinate and dimension safety
+      # cannot accidentally depend on debug-only behavior.
+      - name: Run optimized library tests
+        run: cargo test --release --locked --lib
+
       # `cargo test --all-targets` builds example harnesses but does not execute
       # their `main` functions. Run every headless example so solver failures and
       # their self-checking numerical assertions participate in the release

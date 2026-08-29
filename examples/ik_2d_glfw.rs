@@ -38,12 +38,15 @@ const LINK_4: f64 = 80.0;
 const JOINT_RADIUS: f64 = 6.0;
 const TARGET_RADIUS: f64 = 8.0;
 
-// Current IK solution in local (base-centered) coordinates.
-#[derive(Clone)]
+/// Current IK solution in local, base-centered coordinates.
 struct IkState {
+    /// Endpoint of the first fixed-length link.
     joint1: Vec2d,
+    /// Endpoint of the second fixed-length link.
     joint2: Vec2d,
+    /// Endpoint of the third fixed-length link.
     joint3: Vec2d,
+    /// Endpoint of the fourth link and constrained target effector.
     effector: Vec2d,
 }
 
@@ -267,7 +270,6 @@ impl PointExpr {
 // Constraint interface used by joints and the target.
 trait IKConstraint {
     fn equations(&self) -> Vec<Exp>;
-    fn variables(&self) -> &Vec<String>;
 }
 
 // Names + expressions for a 2D point in the solver.
@@ -292,10 +294,6 @@ impl JointVars {
             y_name,
             var_names,
         }
-    }
-
-    fn variables(&self) -> &Vec<String> {
-        &self.var_names
     }
 
     // Insert a Vec2d into the solver input map.
@@ -340,10 +338,6 @@ impl IKConstraint for Joint {
             self.length,
         )]
     }
-
-    fn variables(&self) -> &Vec<String> {
-        self.vars.variables()
-    }
 }
 
 // Target constraint: effector should match a target point.
@@ -369,9 +363,108 @@ impl IKConstraint for Target {
             Exp::sub(self.effector.y.clone(), self.vars.y.clone()),
         ]
     }
+}
 
-    fn variables(&self) -> &Vec<String> {
-        self.vars.variables()
+/// Complete reusable constraint model for the four-link graphical IK example.
+///
+/// Owning model construction and pose translation here keeps the interactive
+/// loop and the headless regression on exactly the same compile/solve path.
+struct IkModel {
+    /// Ordered link constraints from the base-adjacent joint to the effector.
+    joints: [Joint; 4],
+    /// Fixed-parameter point that the end effector must match.
+    target: Target,
+    /// Compiled nonlinear solver reused across graphical frames.
+    solver: NewtonRaphsonSolver,
+}
+
+impl IkModel {
+    /// Build and compile the same four-link constraint graph used by every
+    /// graphical frame and headless end-to-end test.
+    fn new() -> Self {
+        // Point expressions own cloned symbolic trees rather than references,
+        // so the complete chain can be assembled before its joints are moved
+        // into the returned model.
+        let origin = PointExpr::constant(0.0, 0.0);
+        let joint1 = Joint::new("j1", origin, LINK_1);
+        let joint2 = Joint::new("j2", PointExpr::from_vars(&joint1.vars), LINK_2);
+        let joint3 = Joint::new("j3", PointExpr::from_vars(&joint2.vars), LINK_3);
+        let joint4 = Joint::new("j4", PointExpr::from_vars(&joint3.vars), LINK_4);
+        let target = Target::new("t", PointExpr::from_vars(&joint4.vars));
+
+        // Compile every constraint once. The target variables remain fixed
+        // parameters because only joint names are supplied as solve variables.
+        let constraints: [&dyn IKConstraint; 5] = [&joint1, &joint2, &joint3, &joint4, &target];
+        let mut equations = Vec::new();
+        for constraint in constraints {
+            equations.extend(constraint.equations());
+        }
+        let compiled = Compiler::compile(&equations).expect("IK constraints must compile");
+
+        let joint_variables = [&joint1.vars, &joint2.vars, &joint3.vars, &joint4.vars];
+        let mut solve_variable_names = Vec::with_capacity(joint_variables.len() * 2);
+        for variables in joint_variables {
+            solve_variable_names.extend(variables.var_names.iter().cloned());
+        }
+        let solve_variable_refs: Vec<&str> =
+            solve_variable_names.iter().map(String::as_str).collect();
+
+        // Minimum-norm Newton corrections preserve the previous frame's local
+        // null-space component, keeping underdetermined chain motion continuous.
+        let solver = NewtonRaphsonSolver::new_with_variables(compiled, &solve_variable_refs)
+            .expect("all selected IK variables belong to the compiled system");
+
+        Self {
+            joints: [joint1, joint2, joint3, joint4],
+            target,
+            solver,
+        }
+    }
+
+    /// Solve one target update from the previous valid pose.
+    ///
+    /// A successful result contains every joint coordinate. Solver failures and
+    /// an impossible missing-coordinate invariant are both converted to the
+    /// graphical example's existing displayable error channel.
+    fn solve_pose(&self, current: &IkState, target_position: &Vec2d) -> Result<IkState, String> {
+        // Seed joint variables from the previous frame for continuity and add
+        // the requested target as the two fixed parameters referenced by the
+        // final constraints.
+        let mut initial = HashMap::with_capacity(10);
+        let current_positions = [
+            &current.joint1,
+            &current.joint2,
+            &current.joint3,
+            &current.effector,
+        ];
+        for (joint, value) in self.joints.iter().zip(current_positions) {
+            joint.vars.insert_values(&mut initial, value);
+        }
+        self.target
+            .vars
+            .insert_values(&mut initial, target_position);
+
+        let solution = self
+            .solver
+            .solve(initial)
+            .map_err(|error| error.to_string())?;
+        let missing_coordinate =
+            || "successful IK solve omitted one or more compiled joint coordinates".to_string();
+        let read_joint = |index: usize| {
+            self.joints[index]
+                .vars
+                .read_values(&solution.values)
+                .ok_or_else(missing_coordinate)
+        };
+
+        // Translate the public name-keyed result back into the compact state
+        // consumed by rendering and by the independent geometric assertions.
+        Ok(IkState {
+            joint1: read_joint(0)?,
+            joint2: read_joint(1)?,
+            joint3: read_joint(2)?,
+            effector: read_joint(3)?,
+        })
     }
 }
 
@@ -444,6 +537,55 @@ mod tests {
             assert!((*actual - expected).abs() < 1e-6);
         }
     }
+
+    /// Execute the compiled IK model without a display and independently check
+    /// its returned target and link-length geometry.
+    #[test]
+    fn ik_model_solves_reachable_target_end_to_end() {
+        let model = IkModel::new();
+
+        // Build an exact, non-singular starting pose from four absolute link
+        // angles. Avoiding a straight chain ensures the test exercises ordinary
+        // nonlinear corrections rather than depending on a degenerate tangent.
+        let extend = |parent: &Vec2d, length: f64, angle: f64| {
+            vec2(
+                parent.x + length * angle.cos(),
+                parent.y + length * angle.sin(),
+            )
+        };
+        let angles: [f64; 4] = [0.25, 0.65, -0.35, 0.9];
+        let origin = vec2(0.0, 0.0);
+        let joint1 = extend(&origin, LINK_1, angles[0]);
+        let joint2 = extend(&joint1, LINK_2, angles[1]);
+        let joint3 = extend(&joint2, LINK_3, angles[2]);
+        let effector = extend(&joint3, LINK_4, angles[3]);
+        let initial = IkState {
+            joint1,
+            joint2,
+            joint3,
+            effector,
+        };
+        let target = vec2(initial.effector.x - 12.0, initial.effector.y + 9.0);
+
+        let solved = model
+            .solve_pose(&initial, &target)
+            .expect("a nearby reachable target must produce a complete pose");
+
+        // Target coordinates are direct residuals, while link checks are an
+        // independent geometric oracle over the returned joint positions.
+        assert!((solved.effector.x - target.x).abs() < 1e-8);
+        assert!((solved.effector.y - target.y).abs() < 1e-8);
+        let links = [
+            (&origin, &solved.joint1, LINK_1),
+            (&solved.joint1, &solved.joint2, LINK_2),
+            (&solved.joint2, &solved.joint3, LINK_3),
+            (&solved.joint3, &solved.effector, LINK_4),
+        ];
+        for (parent, child, expected_length) in links {
+            let offset = vec2(child.x - parent.x, child.y - parent.y);
+            assert!((vec2_len(&offset) - expected_length).abs() < 1e-8);
+        }
+    }
 }
 
 fn main() {
@@ -480,33 +622,9 @@ fn main() {
         gl.clear_color(0.06, 0.07, 0.09, 1.0);
     }
 
-    // Build the IK chain as constraint objects.
-    let origin = PointExpr::constant(0.0, 0.0);
-    let joint1 = Joint::new("j1", origin.clone(), LINK_1);
-    let joint2 = Joint::new("j2", PointExpr::from_vars(&joint1.vars), LINK_2);
-    let joint3 = Joint::new("j3", PointExpr::from_vars(&joint2.vars), LINK_3);
-    let joint4 = Joint::new("j4", PointExpr::from_vars(&joint3.vars), LINK_4);
-    let target = Target::new("t", PointExpr::from_vars(&joint4.vars));
-
-    // Collect equations and compile them into the solver.
-    let constraints: [&dyn IKConstraint; 5] = [&joint1, &joint2, &joint3, &joint4, &target];
-    let mut equations = Vec::new();
-    for constraint in constraints {
-        equations.extend(constraint.equations());
-    }
-
-    let compiled = Compiler::compile(&equations).expect("compile");
-    // Only the joints are solved for; the target is provided as a parameter.
-    let joints: [&dyn IKConstraint; 4] = [&joint1, &joint2, &joint3, &joint4];
-    let mut solve_var_names = Vec::with_capacity(joints.len() * 2);
-    for joint in joints {
-        solve_var_names.extend(joint.variables().iter().cloned());
-    }
-    let solve_var_refs: Vec<&str> = solve_var_names.iter().map(|s| s.as_str()).collect();
-    // Minimum-norm Newton corrections preserve the previous frame's local
-    // null-space component, keeping underdetermined chain motion continuous.
-    let solver =
-        NewtonRaphsonSolver::new_with_variables(compiled, &solve_var_refs).expect("solver");
+    // Compile the reusable constraint graph independently of window state so
+    // every frame and the headless regression share one model implementation.
+    let ik_model = IkModel::new();
 
     // Initial pose: straight chain along +X axis.
     let mut state = IkState {
@@ -550,49 +668,21 @@ fn main() {
         let lengths = [LINK_1, LINK_2, LINK_3, LINK_4];
         let (clamped_target, was_clamped) = clamp_target(&raw_target, &lengths);
 
-        // Provide current state + target as the solver initial guess.
-        let mut initial = HashMap::with_capacity(10);
-        let joint_values = [
-            (&joint1, &state.joint1),
-            (&joint2, &state.joint2),
-            (&joint3, &state.joint3),
-            (&joint4, &state.effector),
-        ];
-        for (joint, value) in joint_values {
-            joint.vars.insert_values(&mut initial, value);
-        }
-        target.vars.insert_values(&mut initial, &clamped_target);
-
         // Solve for joint positions and retain the last valid pose whenever a
         // frame cannot be solved. Failures remain visible without making the
         // graphical example terminate on a transient numerical condition.
-        match solver.solve(initial) {
-            Ok(solution) => {
-                if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
-                    joint1.vars.read_values(&solution.values),
-                    joint2.vars.read_values(&solution.values),
-                    joint3.vars.read_values(&solution.values),
-                    joint4.vars.read_values(&solution.values),
-                ) {
-                    state.joint1 = j1;
-                    state.joint2 = j2;
-                    state.joint3 = j3;
-                    state.effector = j4;
+        match ik_model.solve_pose(&state, &clamped_target) {
+            Ok(solved_state) => {
+                state = solved_state;
 
-                    // Report recovery once when a valid complete pose follows a
-                    // previously surfaced error.
-                    if last_solver_error.take().is_some() {
-                        eprintln!("IK solver recovered");
-                    }
-                } else {
-                    report_changed_solver_error(
-                        &mut last_solver_error,
-                        "successful solve omitted one or more joint coordinates".to_string(),
-                    );
+                // Report recovery once when a valid complete pose follows a
+                // previously surfaced error.
+                if last_solver_error.take().is_some() {
+                    eprintln!("IK solver recovered");
                 }
             }
-            Err(error) => {
-                report_changed_solver_error(&mut last_solver_error, error.to_string());
+            Err(message) => {
+                report_changed_solver_error(&mut last_solver_error, message);
             }
         }
 

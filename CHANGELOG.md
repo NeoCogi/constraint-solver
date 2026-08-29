@@ -24,8 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added executable crate documentation, compiled README examples, complete
   public API documentation, and the `missing_docs` lint.
 - Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
-  builds, RustSec advisories, formatting, Clippy, tests, headless examples,
-  documentation tests, benchmark compilation, and package verification.
+  builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
+  headless examples, documentation tests, benchmark compilation, and package
+  verification.
 
 ### Changed
 
@@ -59,6 +60,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Corrected the documented `f64` scalar scope, factorization allocation
+  behavior, underdetermined policy, line-search example, and LU pivot scale.
+- Replaced self-comparison in randomized Jacobian coverage with an analytical
+  oracle and added a headless end-to-end solve for the graphical IK model.
 - Preserved structured `MatrixError` values through `SolverError` and retained
   already-computed gradient measures in every `NoConvergence` diagnostic.
 - Prevented norm, column-scaled stationarity, and line-search slope calculations
