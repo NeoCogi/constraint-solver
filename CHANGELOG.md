@@ -57,6 +57,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   augmented ridge fallback as rectangular systems, replacing the unrelated
   direct diagonal shift and allowing consistent rank-deficient square systems
   to solve without regularization.
+- Cached simplified symbolic Jacobian expressions when constructing a solver,
+  so repeated solve calls allocate fresh numerical workspaces without cloning
+  and differentiating the entire equation system again.
 - Checked matrix element products, including multiplication output shapes
   derived from independently valid zero-sized operands, and augmented row sums
   before allocation.

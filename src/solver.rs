@@ -25,7 +25,7 @@ SOFTWARE.
 //! Damped Newton-Raphson iteration, line search, regularized least squares,
 //! convergence results, and structured failure diagnostics.
 
-use crate::compiler::{CompiledExp, CompiledSystem, EvaluationError, VarId, VarTable};
+use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
 use crate::mode::{Mode, build_thread_pool};
@@ -178,8 +178,11 @@ pub enum UnderdeterminedPolicy {
 ///
 /// The solver uses adaptive damping and regularization for numerical stability.
 pub struct NewtonRaphsonSolver {
-    /// The system of equations to solve (each equation should equal zero)
-    equations: Vec<CompiledExp>,
+    /// Residual expressions and their simplified symbolic partial derivatives.
+    ///
+    /// Keeping this cache on the reusable solver avoids repeating symbolic
+    /// differentiation every time `solve` or `solve_with_line_search` is called.
+    jacobian: Jacobian,
     /// Variable IDs that correspond to unknowns in the system
     variables: Vec<VarId>,
     /// Registry of all variables referenced by the compiled system
@@ -416,8 +419,14 @@ impl NewtonRaphsonSolver {
         // We'll use least squares to solve them
         let is_over_constrained = compiled.equations.len() > variables.len();
 
+        // Symbolic differentiation depends only on the compiled equations and
+        // selected solve variables, both of which are immutable for the
+        // solver's lifetime. Construct and simplify every derivative here so
+        // repeated numerical solves share the result.
+        let jacobian = Jacobian::new(compiled.equations, variables.clone());
+
         NewtonRaphsonSolver {
-            equations: compiled.equations,
+            jacobian,
             variables,
             var_table: compiled.var_table,
             // Over-constrained systems are harder to converge, so give them more iterations
@@ -494,11 +503,11 @@ impl NewtonRaphsonSolver {
         // Exact cardinality preserves the positional equation-to-trace mapping;
         // accepting arbitrary entries for an empty system would create metadata
         // that could never appear in a residual diagnostic.
-        if traces.len() != self.equations.len() {
+        if traces.len() != self.jacobian.equation_count() {
             return Err(SolverError::InvalidInput(format!(
                 "Equation trace length ({}) does not match number of equations ({})",
                 traces.len(),
-                self.equations.len()
+                self.jacobian.equation_count()
             )));
         }
         self.equation_traces = traces;
@@ -609,8 +618,9 @@ impl NewtonRaphsonSolver {
         // This internal entry point owns the validated map, so move it directly
         // into mutable solver state instead of cloning every variable entry.
         let mut vars = initial_guess;
-        let jacobian = Jacobian::new(self.equations.clone(), self.variables.clone());
-        // Cache Jacobian storage to avoid per-iteration allocations.
+        // Borrow the construction-time symbolic cache and allocate only the
+        // mutable numerical derivative storage owned by this solve invocation.
+        let jacobian = &self.jacobian;
         let mut jacobian_workspace = jacobian.workspace();
         // Store the initial residual plus at most one residual for every
         // accepted update.
@@ -621,7 +631,7 @@ impl NewtonRaphsonSolver {
         let mut damping = self.damping_factor;
         let mut last_error: Option<f64> = None;
 
-        let num_equations = self.equations.len();
+        let num_equations = jacobian.equation_count();
         let num_variables = self.variables.len();
 
         let mut f_vals = Matrix::new(num_equations, 1);
@@ -899,7 +909,7 @@ impl NewtonRaphsonSolver {
                     iter,
                 )?;
                 self.line_search(LineSearchContext {
-                    jacobian: &jacobian,
+                    jacobian,
                     vars: &vars,
                     delta: &delta,
                     current_residual_norm: error,
@@ -1981,6 +1991,42 @@ mod tests {
             let y_sol = solution.values.get("y").copied().unwrap();
             assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
             assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
+        }
+    }
+
+    /// Exercise one solver across multiple runs so its cached symbolic
+    /// derivatives are shared while each run retains independent numeric state.
+    #[test]
+    fn test_reused_solver_handles_distinct_initial_guesses() {
+        for mode in test_modes() {
+            // The two initial guesses converge to opposite roots of the same
+            // nonlinear equation. Reusing the solver proves that caching the
+            // derivative does not retain values from the first numeric run.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_tolerance(1e-12)
+                .with_max_iterations(20);
+
+            // Both calls borrow the same construction-time symbolic Jacobian
+            // but allocate their own residual and derivative matrices.
+            let positive_solution = solver
+                .solve(HashMap::from([("x".to_string(), 3.0)]))
+                .expect("positive initial guess should converge");
+            let negative_solution = solver
+                .solve(HashMap::from([("x".to_string(), -3.0)]))
+                .expect("negative initial guess should converge");
+
+            assert_eq!(
+                positive_solution.reason,
+                ConvergenceReason::ResidualTolerance
+            );
+            assert_eq!(
+                negative_solution.reason,
+                ConvergenceReason::ResidualTolerance
+            );
+            assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
+            assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
         }
     }
 

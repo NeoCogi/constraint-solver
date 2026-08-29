@@ -98,7 +98,20 @@ impl Jacobian {
             symbolic_jacobian,
         }
     }
+
+    /// Return the number of scalar residual expressions represented by this
+    /// symbolic Jacobian.
+    pub(crate) fn equation_count(&self) -> usize {
+        // Each stored expression owns exactly one row of cached partial
+        // derivatives, so the expression count is the authoritative row count.
+        self.expressions.len()
+    }
+
+    /// Allocate numerical derivative storage with the cached symbolic
+    /// Jacobian's equation-by-variable shape.
     pub(crate) fn workspace(&self) -> JacobianWorkspace {
+        // The symbolic cache is immutable; each solve receives independent
+        // mutable numeric storage so a reusable solver remains thread-safe.
         JacobianWorkspace::new(self.expressions.len(), self.variables.len())
     }
 
