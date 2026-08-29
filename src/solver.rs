@@ -57,8 +57,12 @@ struct LineSearchContext<'a> {
     delta: &'a Matrix,
     /// Residual norm at the current accepted point.
     current_error: f64,
-    /// One-based Newton iteration number for failure diagnostics.
-    iteration: usize,
+    /// Number of Newton updates accepted before this line search began.
+    ///
+    /// Keeping this as an accepted-update count, rather than a one-based attempt
+    /// number, preserves the public `SolverRunDiagnostic::iterations` contract
+    /// when every candidate is rejected and the current point is left unchanged.
+    accepted_updates: usize,
     /// Residual vector at the current accepted point.
     current_residuals: &'a Matrix,
     /// Reusable output storage for candidate residual evaluations.
@@ -635,7 +639,7 @@ impl NewtonRaphsonSolver {
                                     iter + 1,
                                     error
                                 ),
-                                iter + 1,
+                                iter,
                                 &vars,
                                 &f_vals,
                             );
@@ -685,7 +689,7 @@ impl NewtonRaphsonSolver {
                                         format!(
                                             "Matrix is singular even with regularization: {e}"
                                         ),
-                                        iter + 1,
+                                        iter,
                                         &vars,
                                         &f_vals,
                                     );
@@ -729,7 +733,7 @@ impl NewtonRaphsonSolver {
                                 format!(
                                     "Least squares system is singular (unregularized_qr_error: {unregularized_qr_error}; regularized_qr_error: {regularized_qr_error})"
                                 ),
-                                iter + 1,
+                                iter,
                                 &vars,
                                 &f_vals,
                             );
@@ -742,7 +746,7 @@ impl NewtonRaphsonSolver {
             if !delta.all_finite() {
                 return Err(self.non_finite_evaluation_error(
                     "Linear solve produced a non-finite Newton correction",
-                    iter + 1,
+                    iter,
                     &vars,
                     &f_vals,
                 ));
@@ -759,7 +763,7 @@ impl NewtonRaphsonSolver {
                     vars: &vars,
                     delta: &delta,
                     current_error: error,
-                    iteration: iter + 1,
+                    accepted_updates: iter,
                     current_residuals: &f_vals,
                     candidate_residuals: &mut line_search_f_vals,
                 })?
@@ -1307,7 +1311,7 @@ impl NewtonRaphsonSolver {
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
     /// * `current_error` - Current function error |f(x)|
-    /// * `iteration` - One-based iteration number used in failure diagnostics
+    /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
     /// * `candidate_residuals` - Reusable storage for each trial point
     ///
@@ -1324,7 +1328,7 @@ impl NewtonRaphsonSolver {
             vars,
             delta,
             current_error,
-            iteration,
+            accepted_updates,
             current_residuals,
             candidate_residuals,
         } = context;
@@ -1381,7 +1385,7 @@ impl NewtonRaphsonSolver {
             format!(
                 "Line search failed after {attempted_trials} rejected trial steps; smallest tested step was {alpha:.2e}"
             ),
-            iteration,
+            accepted_updates,
             vars,
             current_residuals,
         );
@@ -1925,6 +1929,10 @@ mod tests {
                 .expect_err("a constant residual has no acceptable descent step");
             match error {
                 SolverError::NoConvergence(diagnostic) => {
+                    // Every trial was rejected, so the public count must describe
+                    // the unchanged initial state rather than the first attempted
+                    // Newton update.
+                    assert_eq!(diagnostic.iterations, 0);
                     assert!(diagnostic.message.contains("Line search failed"));
                     assert_eq!(diagnostic.values["x"], 0.0);
                     assert_eq!(diagnostic.error, 1.0);
@@ -2280,7 +2288,14 @@ mod tests {
                 let serial = serial_error.as_ref().expect("serial error missing");
                 assert_error_matches(serial, &err);
             }
-            assert!(matches!(err, SolverError::SingularMatrix(_)), "{:?}", err);
+            match err {
+                SolverError::SingularMatrix(diagnostic) => {
+                    // QR failed before any candidate values were applied. The
+                    // diagnostic therefore represents zero accepted updates.
+                    assert_eq!(diagnostic.iterations, 0);
+                }
+                other => panic!("expected singular matrix error, got {other:?}"),
+            }
         }
     }
 
