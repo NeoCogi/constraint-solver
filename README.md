@@ -22,9 +22,12 @@ constraint-solver = "0.3"
 ## Toolchain support
 
 `constraint-solver` requires Rust 1.86 or newer. Rust 1.86 is the crate's
-minimum supported Rust version (MSRV) because the crate uses Rust 2024 edition
-semantics. CI compiles and tests every ordinary target with that exact compiler
-in addition to validating the repository with the current stable toolchain.
+minimum supported Rust version (MSRV) for the complete locked repository graph,
+including development dependencies. Rust 2024 edition syntax itself is
+available in Rust 1.85; the 1.86 floor reflects the graph this project actually
+builds and tests, not the edition alone. CI runs `cargo test --locked
+--all-targets` with Rust 1.86 in addition to validating the repository with the
+current stable toolchain.
 
 ## System Types (Square, Under-, Over-Constrained)
 
