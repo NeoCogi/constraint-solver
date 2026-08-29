@@ -111,41 +111,6 @@ let solution = solver.solve(initial).expect("solve failed");
 assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
-### Example: solve a simple system
-
-```rust
-use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
-use std::collections::HashMap;
-
-fn main() {
-    // System:
-    // f1 = x^2 + y^2 - 1
-    // f2 = x*y - 0.25
-    let x = Exp::var("x");
-    let y = Exp::var("y");
-
-    let f1 = Exp::sub(
-        Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
-        Exp::val(1.0),
-    );
-    let f2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
-
-    let compiled = Compiler::compile(&[f1, f2]).expect("compile failed");
-    let solver = NewtonRaphsonSolver::new(compiled);
-
-    let mut initial = HashMap::new();
-    initial.insert("x".to_string(), 0.5);
-    initial.insert("y".to_string(), 0.866);
-
-    let solution = solver.solve(initial).expect("solve failed");
-    assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
-
-    let x_sol = solution.values.get("x").copied().unwrap();
-    let y_sol = solution.values.get("y").copied().unwrap();
-    println!("x={:.6}, y={:.6}", x_sol, y_sol);
-}
-```
-
 ### Line search and regularization
 
 ```rust
