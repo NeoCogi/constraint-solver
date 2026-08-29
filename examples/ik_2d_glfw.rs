@@ -375,6 +375,77 @@ impl IKConstraint for Target {
     }
 }
 
+/// Headless checks for the graphical example's pure geometry helpers.
+///
+/// Window creation and OpenGL context lifetime remain compile-tested on CI,
+/// while these tests execute the numerical decisions that can be isolated from
+/// a display server.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert two double-precision points agree within the tolerance needed by
+    /// the example's screen-space geometry.
+    fn assert_point_close(actual: &Vec2d, expected: &Vec2d) {
+        // Check coordinates separately so a failure identifies which screen
+        // axis produced the unexpected result.
+        assert!((actual.x - expected.x).abs() < 1e-12);
+        assert!((actual.y - expected.y).abs() < 1e-12);
+    }
+
+    /// Verify that targets beyond maximum extension retain their direction and
+    /// land exactly on the reachable outer radius.
+    #[test]
+    fn target_beyond_outer_radius_is_clamped_radially() {
+        // A 3-4-5 target clamped to a chain of total length three must scale to
+        // the analytically known point (1.8, 2.4).
+        let (clamped, changed) = clamp_target(&vec2(3.0, 4.0), &[2.0, 1.0]);
+
+        assert!(changed);
+        assert_point_close(&clamped, &vec2(1.8, 2.4));
+    }
+
+    /// Verify that a chain dominated by one link pushes an origin target to a
+    /// deterministic point on the inner reachable radius.
+    #[test]
+    fn origin_inside_inner_radius_uses_positive_x_fallback() {
+        // Lengths five and one can reach radii only in [4, 6]. At the origin no
+        // incoming direction exists, so the helper deliberately chooses +X.
+        let (clamped, changed) = clamp_target(&vec2(0.0, 0.0), &[5.0, 1.0]);
+
+        assert!(changed);
+        assert_point_close(&clamped, &vec2(4.0, 0.0));
+    }
+
+    /// Verify that an already reachable target is copied without reporting a
+    /// clamp operation.
+    #[test]
+    fn reachable_target_is_preserved() {
+        // Radius sqrt(2) lies between the inner radius one and outer radius five
+        // for a three-plus-two link chain.
+        let target = vec2(1.0, -1.0);
+        let (clamped, changed) = clamp_target(&target, &[3.0, 2.0]);
+
+        assert!(!changed);
+        assert_point_close(&clamped, &target);
+    }
+
+    /// Verify circle tessellation emits one interleaved x/y pair per requested
+    /// segment and places the four cardinal samples correctly.
+    #[test]
+    fn circle_vertices_generate_cardinal_points() {
+        // Four segments sample angles 0, pi/2, pi, and 3pi/2 around a translated
+        // circle. Casting through f32 requires an appropriately relaxed check.
+        let vertices = circle_vertices(2.0, -1.0, 3.0, 4);
+        let expected = [5.0_f32, -1.0, 2.0, 2.0, -1.0, -1.0, 2.0, -4.0];
+
+        assert_eq!(vertices.len(), expected.len());
+        for (actual, expected) in vertices.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1e-6);
+        }
+    }
+}
+
 fn main() {
     let mut glfw = glfw::init(glfw::fail_on_errors).expect("failed to init glfw");
     glfw.window_hint(glfw::WindowHint::ContextVersion(2, 1));
