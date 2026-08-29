@@ -44,7 +44,8 @@ The solver supports all three system shapes:
   `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
 
 Every system shape has the same success contract: `Ok(Solution)` means the
-returned residual norm satisfies `SolverOptions::residual_tolerance`. A
+returned residual norm is less than or equal to
+`SolverOptions::residual_tolerance`. A
 first-order stationary point whose residual remains too large is an error even
 for a square or under-constrained system.
 

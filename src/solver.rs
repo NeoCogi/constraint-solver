@@ -197,7 +197,7 @@ pub enum UnderdeterminedPolicy {
 pub struct SolverOptions {
     /// Maximum number of accepted Newton updates before `NoConvergence`.
     pub max_iterations: usize,
-    /// Euclidean residual norm required for a successful `Solution`.
+    /// Inclusive maximum Euclidean residual norm for a successful `Solution`.
     pub residual_tolerance: f64,
     /// Maximum residual/Jacobian-column cosine used for `StationaryNonRoot`.
     pub stationarity_tolerance: f64,
@@ -284,7 +284,7 @@ pub struct NewtonRaphsonSolver {
 
 /// Successful solver result with values and explicit convergence diagnostics.
 ///
-/// Constructing this value certifies that the Euclidean residual norm satisfied
+/// Constructing this value certifies that the Euclidean residual norm is at most
 /// the configured root tolerance. Stationary non-roots are returned through
 /// [`SolverError::StationaryNonRoot`] and can never produce `Solution`.
 #[derive(Debug, Clone)]
@@ -895,7 +895,7 @@ impl NewtonRaphsonSolver {
 
             // A successful result requires the actual constraints to satisfy
             // the residual threshold, independently of system shape.
-            if error < self.options.residual_tolerance {
+            if error <= self.options.residual_tolerance {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
@@ -1094,7 +1094,7 @@ impl NewtonRaphsonSolver {
             }
             let updated_error = f_vals.norm();
 
-            if updated_error < self.options.residual_tolerance {
+            if updated_error <= self.options.residual_tolerance {
                 // A terminating candidate belongs in the history even though a
                 // subsequent loop iteration will not push it.
                 convergence_history.push(updated_error);
@@ -1131,7 +1131,7 @@ impl NewtonRaphsonSolver {
             ));
         }
         let final_error = residuals.norm();
-        if final_error < self.options.residual_tolerance {
+        if final_error <= self.options.residual_tolerance {
             // A minimum-norm null-space projection can consume the final allowed
             // update and land directly on a root. There is no following loop
             // iteration to run the ordinary residual check, so accept that final
@@ -3348,6 +3348,53 @@ mod tests {
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.convergence_history, vec![0.0]);
             assert_eq!(solution.last_linear_solve, None);
+        }
+    }
+
+    /// Enforce the documented inclusive residual threshold both before and
+    /// after a Newton correction.
+    #[test]
+    fn test_residual_tolerance_boundary_is_successful() {
+        for mode in test_modes() {
+            for use_line_search in [false, true] {
+                // The initial residual norm is exactly one. Equality with the
+                // configured tolerance must certify this point without a linear
+                // solve or an accepted update.
+                let x = Exp::var("x");
+                let solver =
+                    solver_for_mode(vec![x.clone()], mode.clone()).with_residual_tolerance(1.0);
+                let initial = HashMap::from([("x".to_string(), 1.0)]);
+                let solution = if use_line_search {
+                    solver.solve_with_line_search(initial)
+                } else {
+                    solver.solve(initial)
+                }
+                .expect("a residual equal to tolerance must be successful");
+
+                assert_eq!(solution.error, 1.0);
+                assert_eq!(solution.iterations, 0);
+                assert_eq!(solution.last_linear_solve, None);
+
+                // Starting at residual two with a half-sized Newton step lands
+                // exactly on the same boundary. The post-update check must use
+                // the identical inclusive contract and report one accepted
+                // correction rather than iteration exhaustion.
+                let solver = solver_for_mode(vec![x], mode.clone())
+                    .with_residual_tolerance(1.0)
+                    .with_damping(0.5)
+                    .with_max_iterations(1);
+                let initial = HashMap::from([("x".to_string(), 2.0)]);
+                let solution = if use_line_search {
+                    solver.solve_with_line_search(initial)
+                } else {
+                    solver.solve(initial)
+                }
+                .expect("an accepted update on the tolerance boundary must succeed");
+
+                assert_eq!(solution.values["x"], 1.0);
+                assert_eq!(solution.error, 1.0);
+                assert_eq!(solution.iterations, 1);
+            }
         }
     }
 
