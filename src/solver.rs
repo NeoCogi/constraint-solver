@@ -506,8 +506,19 @@ impl NewtonRaphsonSolver {
 
             // Step 4: Determine step size (damping or line search)
             let step_size = if use_line_search {
-                // Use backtracking line search to find optimal step size
-                self.line_search(&jacobian, &vars, &delta, error, &mut line_search_f_vals)?
+                // Use backtracking line search to find a step that has actually
+                // demonstrated sufficient residual reduction. Passing the
+                // current residuals lets an exhausted search report the state
+                // at which it failed rather than the final rejected candidate.
+                self.line_search(
+                    &jacobian,
+                    &vars,
+                    &delta,
+                    error,
+                    iter + 1,
+                    &f_vals,
+                    &mut line_search_f_vals,
+                )?
             } else {
                 // Use current damping factor as step size
                 damping
@@ -775,46 +786,81 @@ impl NewtonRaphsonSolver {
     /// * `vars` - Current variable values
     /// * `delta` - Newton step direction
     /// * `current_error` - Current function error |f(x)|
+    /// * `iteration` - One-based iteration number used in failure diagnostics
+    /// * `current_residuals` - Residual vector at the unmodified current point
+    /// * `candidate_residuals` - Reusable storage for each trial point
     ///
     /// # Returns
-    /// Optimal step size alpha such that x_new = x + alpha * delta reduces error
+    /// An accepted step size alpha such that `x_new = x + alpha * delta`
+    /// satisfies the sufficient-decrease condition. If no tested step is
+    /// acceptable, the method returns `NoConvergence`; it never substitutes an
+    /// untested or previously rejected fallback step.
     fn line_search(
         &self,
         jacobian: &Jacobian,
         vars: &HashMap<VarId, f64>,
         delta: &Matrix,
         current_error: f64,
-        f_vals: &mut Matrix,
+        iteration: usize,
+        current_residuals: &Matrix,
+        candidate_residuals: &mut Matrix,
     ) -> Result<f64, SolverError> {
-        let mut alpha = 1.0; // Start with full Newton step
-        let mut new_vars = vars.clone();
+        // A difficult but recoverable Newton direction can require far more
+        // than twenty halvings. Sixty-four trials cover the useful binary range
+        // down to the explicit minimum without making the search unbounded.
+        const MAX_LINE_SEARCH_TRIALS: usize = 64;
+        const MIN_LINE_SEARCH_STEP: f64 = 1e-12;
+        const SUFFICIENT_DECREASE_FRACTION: f64 = 0.5;
 
-        // Try up to 20 different step sizes
-        for _ in 0..20 {
+        // Begin with the full Newton step and reuse a cloned variable map for
+        // all candidates so fixed parameters remain present on every trial.
+        let mut alpha = 1.0;
+        let mut new_vars = vars.clone();
+        let mut attempted_trials = 0;
+
+        for _ in 0..MAX_LINE_SEARCH_TRIALS {
+            attempted_trials += 1;
             new_vars.clone_from(vars);
-            // Compute new variable values: x_new = x + alpha * delta
+
+            // Compute the candidate values without mutating the accepted solver
+            // state. Only solve variables move; fixed parameters are copied.
             for (i, &var_id) in self.variables.iter().enumerate() {
                 new_vars.insert(var_id, vars[&var_id] + alpha * delta[(i, 0)]);
             }
 
-            // Check if this step size reduces the error sufficiently
-            jacobian.evaluate_functions_checked_into(&new_vars, f_vals)?;
-            let new_error = f_vals.norm();
-            // Armijo condition: require sufficient decrease
-            if new_error < current_error * (1.0 - 0.5 * alpha) {
+            // Non-finite candidate residuals are rejected by the finite Armijo
+            // comparison and backtracked just like any other unusable trial.
+            // This permits a large exponential step to recover at a smaller
+            // alpha instead of aborting at its first overflow.
+            jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
+            let new_error = candidate_residuals.norm();
+            let required_error =
+                current_error * (1.0 - SUFFICIENT_DECREASE_FRACTION * alpha);
+            if new_error.is_finite() && new_error < required_error {
                 return Ok(alpha);
             }
-            // Reduce step size and try again
-            alpha *= 0.5;
 
-            // Give up if step size becomes too small
-            if alpha < 1e-10 {
+            // Stop only after the current minimum-sized candidate has actually
+            // been tested and rejected. This ensures every returned success is
+            // backed by an evaluated candidate.
+            if alpha <= MIN_LINE_SEARCH_STEP {
                 break;
             }
+            alpha = (alpha * 0.5).max(MIN_LINE_SEARCH_STEP);
         }
 
-        // Return at least the minimum damping to avoid complete stagnation
-        Ok(alpha.max(self.min_damping))
+        // Applying any rejected fallback could increase the residual or leave
+        // the expression domain. Preserve the current point and provide a
+        // diagnostic that identifies line-search exhaustion instead.
+        let diagnostic = self.build_diagnostic(
+            format!(
+                "Line search failed after {attempted_trials} rejected trial steps; smallest tested step was {alpha:.2e}"
+            ),
+            iteration,
+            vars,
+            current_residuals,
+        );
+        Err(SolverError::NoConvergence(diagnostic))
     }
 
     /// Solve the system using Newton-Raphson with line search
@@ -1131,6 +1177,65 @@ mod tests {
             }
             assert!(solution.converged);
             assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
+        }
+    }
+
+    /// Exercise a recoverable exponential Newton step that needs more than the
+    /// former twenty backtracking trials.
+    #[test]
+    fn test_line_search_can_backtrack_beyond_twenty_trials() {
+        let mut serial_solution: Option<Solution> = None;
+        for mode in test_modes() {
+            let is_serial = matches!(mode, Mode::Serial);
+
+            // At x=-20, exp(x)-1 has a Newton step of roughly 4.85e8. Steps as
+            // large as 2^-19 overflow or increase the residual, while a step of
+            // roughly 2^-25 enters a useful region and must be accepted.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_max_iterations(100)
+                .with_tolerance(1e-10);
+            let initial = HashMap::from([("x".to_string(), -20.0)]);
+
+            let solution = solver
+                .solve_with_line_search(initial)
+                .expect("deep backtracking should recover a finite step");
+
+            if is_serial {
+                serial_solution = Some(solution.clone());
+            } else {
+                let serial = serial_solution.as_ref().expect("serial solution missing");
+                assert_solution_close(serial, &solution, 1e-8);
+            }
+            assert!(solution.error < 1e-10);
+            assert!(solution.values["x"].abs() < 1e-8);
+        }
+    }
+
+    /// Verify that exhaustion preserves the current state and reports failure
+    /// instead of applying an untested minimum-damping fallback.
+    #[test]
+    fn test_line_search_rejects_every_step_for_constant_residual() {
+        for mode in test_modes() {
+            // Multiplying x by zero registers it as a solve variable while the
+            // residual remains exactly one for every possible candidate.
+            let x = Exp::var("x");
+            let equation = Exp::add(Exp::mul(x, Exp::val(0.0)), Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode).with_max_iterations(2);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve_with_line_search(initial)
+                .expect_err("a constant residual has no acceptable descent step");
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert!(diagnostic.message.contains("Line search failed"));
+                    assert_eq!(diagnostic.values["x"], 0.0);
+                    assert_eq!(diagnostic.error, 1.0);
+                }
+                other => panic!("expected line-search NoConvergence, got {other:?}"),
+            }
         }
     }
 
