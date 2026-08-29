@@ -116,12 +116,12 @@ jobs:
       # Compile every feature and target, including examples and the opt-in
       # Criterion harness, while promoting all warnings to failures.
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # The benchmark feature is intentionally absent so Criterion is not
       # executed as part of the correctness suite.
       - name: Run unit and example tests
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
       # `cargo test --all-targets` builds example harnesses but does not execute
       # their `main` functions. Run every headless example so solver failures and
@@ -135,10 +135,10 @@ jobs:
           cargo run --locked --example circuit_voltage_divider
 
       - name: Run documentation tests
-        run: cargo test --doc
+        run: cargo test --locked --doc
 
       - name: Compile benchmark harness
-        run: cargo check --bench linear_algebra --features benchmarks
+        run: cargo check --locked --bench linear_algebra --features benchmarks
 
       # Package verification catches missing files and manifest metadata errors
       # using the same locked dependency graph as the preceding checks.
