@@ -604,9 +604,8 @@ impl NewtonRaphsonSolver {
     /// # Algorithm
     /// 1. Evaluate f(x) and check for convergence
     /// 2. Compute Jacobian J = df/dx
-    /// 3. Solve linear system: J * delta = -f(x)
-    ///    - Square systems: Direct LU decomposition
-    ///    - Under/over-constrained: QR/SVD least squares (with adaptive regularization if needed)
+    /// 3. Solve `J * delta = -f(x)` with condition-aware QR/SVD least squares
+    ///    and adaptive regularization when requested
     /// 4. Update: x_new = x_old + damping * delta
     /// 5. Adapt damping based on error change
     fn solve_modified_internal(
@@ -648,12 +647,11 @@ impl NewtonRaphsonSolver {
 
         let mut line_search_f_vals = Matrix::new(num_equations, 1);
 
-        let mut least_squares_workspace =
-            if self.regularization > 0.0 && num_equations != num_variables {
-                Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
-            } else {
-                None
-            };
+        let mut least_squares_workspace = if self.regularization > 0.0 {
+            Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
+        } else {
+            None
+        };
         let parallel = self.parallel_enabled();
 
         for iter in 0..self.max_iterations {
@@ -831,39 +829,25 @@ impl NewtonRaphsonSolver {
             // diagnostics do not diverge between square and rectangular paths.
             let delta_result = {
                 let j_matrix = jacobian_workspace.jacobian();
-                // Handle different system types with appropriate solving methods
-                if j_matrix.rows() == j_matrix.cols() {
-                    // Preserve partial-pivoting LU as the efficient ordinary
-                    // square-system path. Any LU failure is retried through the
-                    // same QR/SVD pseudoinverse and augmented regularization
-                    // machinery used by rectangular Jacobians.
-                    self.solve_square_newton_delta(
+                // Wide systems need an explicit null-space policy. Square and
+                // tall systems share the same condition-aware QR/SVD dispatch,
+                // eliminating shape-dependent numerical classifications.
+                if j_matrix.rows() < j_matrix.cols() {
+                    self.solve_underdetermined_delta(
                         j_matrix,
+                        &f_vals,
                         &f_neg,
-                        &mut least_squares_workspace,
+                        &vars,
+                        least_squares_workspace.as_mut(),
                         parallel,
                     )
                 } else {
-                    // Wide systems need an explicit null-space policy; tall
-                    // systems always solve the ordinary least-squares Newton
-                    // correction.
-                    if j_matrix.rows() < j_matrix.cols() {
-                        self.solve_underdetermined_delta(
-                            j_matrix,
-                            &f_vals,
-                            &f_neg,
-                            &vars,
-                            least_squares_workspace.as_mut(),
-                            parallel,
-                        )
-                    } else {
-                        self.solve_least_squares_system(
-                            j_matrix,
-                            &f_neg,
-                            least_squares_workspace.as_mut(),
-                            parallel,
-                        )
-                    }
+                    self.solve_least_squares_system(
+                        j_matrix,
+                        &f_neg,
+                        least_squares_workspace.as_mut(),
+                        parallel,
+                    )
                 }
             };
 
@@ -1098,65 +1082,6 @@ impl NewtonRaphsonSolver {
                 next_values
                     .try_sub(&current_values)
                     .map_err(LeastSquaresSolveError::InvalidInput)
-            }
-        }
-    }
-
-    /// Solve a square Newton system with LU first and the common
-    /// least-squares/pseudoinverse policy as a numerical fallback.
-    ///
-    /// LU remains preferable for ordinary nonsingular square Jacobians because
-    /// it is cheaper than QR. A failed LU factorization does not prove that the
-    /// linearized correction is unusable, however: a rank-deficient but
-    /// consistent Jacobian still has a Moore-Penrose solution, and an
-    /// ill-conditioned full-rank Jacobian can use the same augmented ridge system
-    /// as a rectangular solve.
-    fn solve_square_newton_delta(
-        &self,
-        jacobian: &Matrix,
-        negative_residuals: &Matrix,
-        workspace: &mut Option<LeastSquaresWorkspace>,
-        parallel: bool,
-    ) -> Result<Matrix, LeastSquaresSolveError> {
-        // Keep the common and fastest square path allocation-free beyond LU's
-        // own factor matrices.
-        match jacobian.solve_lu(negative_residuals) {
-            Ok(delta) => Ok(delta),
-            Err(lu_error) => {
-                // Allocate the augmented workspace lazily. Most square solves
-                // never leave LU, while a repeatedly singular nonlinear solve can
-                // reuse this storage after its first fallback.
-                if self.regularization > 0.0 && workspace.is_none() {
-                    *workspace = Some(
-                        LeastSquaresWorkspace::new(jacobian.rows(), jacobian.cols())
-                            .map_err(LeastSquaresSolveError::InvalidInput)?,
-                    );
-                }
-
-                let fallback = self.solve_least_squares_system(
-                    jacobian,
-                    negative_residuals,
-                    workspace.as_mut(),
-                    parallel,
-                );
-
-                // Preserve the LU failure in a terminal diagnostic while
-                // allowing a successful QR/SVD fallback to remain transparent to
-                // callers.
-                fallback.map_err(|error| match error {
-                    LeastSquaresSolveError::InvalidInput(error) => {
-                        LeastSquaresSolveError::InvalidInput(error)
-                    }
-                    LeastSquaresSolveError::Singular {
-                        unregularized_error,
-                        regularized_error,
-                    } => LeastSquaresSolveError::Singular {
-                        unregularized_error: format!(
-                            "LU failed ({lu_error}); least-squares fallback failed ({unregularized_error})"
-                        ),
-                        regularized_error,
-                    },
-                })
             }
         }
     }
@@ -3106,6 +3031,41 @@ mod tests {
             assert!(solution.error < 1e-12);
             assert!((solution.values["x"] - 0.5).abs() < 1e-10);
             assert!((solution.values["y"] - 0.5).abs() < 1e-10);
+        }
+    }
+
+    /// Confirm that a full-rank but ill-conditioned square Jacobian receives the
+    /// same regularization policy as a rectangular Jacobian.
+    #[test]
+    fn test_ill_conditioned_square_system_uses_regularized_least_squares() {
+        for mode in test_modes() {
+            // This upper-triangular Jacobian has unit diagonal pivots but a
+            // condition estimate around 1e16. LU previously accepted it and
+            // jumped to the exact root, bypassing the configured ridge policy.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let first_equation = Exp::sub(
+                Exp::add(x, Exp::mul(Exp::val(1e8), y.clone())),
+                Exp::val(1e8 + 1.0),
+            );
+            let second_equation = Exp::sub(y, Exp::val(1.0));
+            let solver = solver_for_mode(vec![first_equation, second_equation], mode)
+                .with_tolerance(1e-12)
+                .with_max_iterations(1);
+            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("one regularized update should not masquerade as an exact root");
+
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert_eq!(diagnostic.iterations, 1);
+                    assert!(diagnostic.values["x"].abs() < 0.1);
+                    assert!(diagnostic.error > 1e-12);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
+            }
         }
     }
 

@@ -559,6 +559,16 @@ impl Matrix {
         let mut u = self.clone();
         let mut pivot = (0..n).collect::<Vec<_>>();
 
+        // Use one factorization-wide reference scale for every pivot. Comparing
+        // a pivot only with its own trailing row makes the last non-zero pivot
+        // pass for every tolerance below one, even when it is negligible next
+        // to the rest of the coefficient matrix.
+        let matrix_scale = self
+            .data
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        let singular_threshold = singular_relative_epsilon * matrix_scale;
+
         for k in 0..n {
             let mut max_val = 0.0;
             let mut max_row = k;
@@ -570,12 +580,7 @@ impl Matrix {
                 }
             }
 
-            let mut row_norm: f64 = 0.0;
-            for j in k..n {
-                row_norm = row_norm.max(u[(max_row, j)].abs());
-            }
-
-            if max_val <= singular_relative_epsilon * row_norm {
+            if max_val <= singular_threshold {
                 return Err(MatrixError::Singular {
                     operation: "lu_decomposition",
                 });
@@ -2245,6 +2250,26 @@ mod tests {
         let x_scaled = a_scaled.solve_lu(&b_scaled).unwrap();
         assert!((x_scaled[(0, 0)] - x[(0, 0)]).abs() < 1e-8);
         assert!((x_scaled[(1, 0)] - x[(1, 0)]).abs() < 1e-8);
+    }
+
+    /// Verify that the caller's LU tolerance applies to every pivot relative to
+    /// the complete coefficient scale, including the final diagonal.
+    #[test]
+    fn test_lu_tolerance_rejects_small_final_pivot() {
+        // The old trailing-row comparison divided the last pivot by itself, so
+        // this matrix was accepted for every epsilon below one despite its
+        // twenty-order diagonal scale separation.
+        let matrix = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-20], 2, 2).unwrap();
+        let error = matrix
+            .lu_decomposition_with_tolerance(0.5)
+            .expect_err("the final pivot is small relative to the matrix scale");
+
+        assert_eq!(
+            error,
+            MatrixError::Singular {
+                operation: "lu_decomposition",
+            }
+        );
     }
 
     #[test]
