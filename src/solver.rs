@@ -626,9 +626,10 @@ impl NewtonRaphsonSolver {
         // mutable numerical derivative storage owned by this solve invocation.
         let jacobian = &self.jacobian;
         let mut jacobian_workspace = jacobian.workspace();
-        // Store the initial residual plus at most one residual for every
-        // accepted update.
-        let mut convergence_history = Vec::with_capacity(self.max_iterations.saturating_add(1));
+        // Grow history with actual progress instead of reserving the caller's
+        // entire theoretical update budget. A very large valid budget must not
+        // panic before an already-solved initial point can be inspected.
+        let mut convergence_history = Vec::new();
         // Standard solves begin with exactly the configured damping factor. A
         // previous residual is optional so the first iteration cannot pretend
         // it observed an improvement from an artificial infinity sentinel.
@@ -2792,6 +2793,27 @@ mod tests {
             let solution = solver.solve(initial).expect("initial point is a root");
 
             assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert_eq!(solution.iterations, 0);
+            assert_eq!(solution.convergence_history, vec![0.0]);
+        }
+    }
+
+    /// Ensure an intentionally unbounded-looking iteration budget does not
+    /// become an eager allocation request before convergence is evaluated.
+    #[test]
+    fn test_large_iteration_budget_does_not_preallocate_history() {
+        for mode in test_modes() {
+            // The initial point is an exact root, so only one history entry is
+            // required regardless of the permitted maximum number of updates.
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode).with_max_iterations(usize::MAX);
+            let initial = HashMap::from([("x".to_string(), 1.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("an exact root must not reserve the full update budget");
+
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.convergence_history, vec![0.0]);
         }
