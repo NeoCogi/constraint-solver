@@ -92,18 +92,38 @@ pub struct NewtonRaphsonSolver {
     pool: Option<ThreadPool>,
 }
 
-/// Solution result containing the solved variable values and convergence info
+/// Describes the mathematical condition that caused a successful solve to
+/// terminate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceReason {
+    /// The Euclidean residual norm satisfied the requested root tolerance.
+    ResidualTolerance,
+    /// An overdetermined system reached first-order least-squares stationarity
+    /// with a small step, even though its residual could not be driven to zero.
+    LeastSquaresStationary,
+}
+
+/// Successful solver result with values and explicit convergence diagnostics.
+///
+/// The solver returns failures as `SolverError`, so there is no redundant
+/// boolean success field. Callers can inspect `reason` to distinguish an
+/// approximate root from a stationary overdetermined least-squares result.
 #[derive(Debug, Clone)]
 pub struct Solution {
-    /// Final values of all variables (variable name -> value)
+    /// Final values of every compiled variable, including fixed parameters.
     pub values: HashMap<String, f64>,
-    /// Number of iterations taken to converge
+    /// Number of accepted Newton updates. An already-solved initial guess
+    /// therefore reports zero iterations.
     pub iterations: usize,
-    /// Final residual error |f(x)|
+    /// Residual norm evaluated at exactly the values returned in `values`.
     pub error: f64,
-    /// Whether the solver successfully converged
-    pub converged: bool,
-    /// History of error values throughout the iteration process
+    /// Norm of `J^T f` at the returned values, measuring first-order
+    /// least-squares stationarity.
+    pub gradient_norm: f64,
+    /// Mathematical convergence test that accepted the returned values.
+    pub reason: ConvergenceReason,
+    /// Residual norms for the initial point and each accepted update through the
+    /// returned point.
     pub convergence_history: Vec<f64>,
 }
 
@@ -368,7 +388,10 @@ impl NewtonRaphsonSolver {
         let jacobian = Jacobian::new(self.equations.clone(), self.variables.clone());
         // Cache Jacobian storage to avoid per-iteration allocations.
         let mut jacobian_workspace = jacobian.workspace();
-        let mut convergence_history = Vec::with_capacity(self.max_iterations);
+        // Store the initial residual plus at most one residual for every
+        // accepted update.
+        let mut convergence_history =
+            Vec::with_capacity(self.max_iterations.saturating_add(1));
         // Start with configured damping factor, will be adapted during iterations
         let mut damping = self.damping_factor;
         let mut last_error = f64::INFINITY;
@@ -402,13 +425,22 @@ impl NewtonRaphsonSolver {
 
             // Check for convergence: |f(x)| < tolerance
             if error < self.tolerance {
-                return Ok(Solution {
-                    values: self.values_by_name(&vars),
-                    iterations: iter + 1,
+                // The Jacobian workspace already corresponds to `vars`, so the
+                // reported gradient norm is evaluated at the same point as the
+                // residual and returned values.
+                let gradient_norm = self.residual_gradient_norm(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    parallel,
+                )?;
+                return Ok(self.build_solution(
+                    &vars,
+                    iter,
                     error,
-                    converged: true,
+                    gradient_norm,
+                    ConvergenceReason::ResidualTolerance,
                     convergence_history,
-                });
+                ));
             }
 
             // Check for stagnation (error not decreasing significantly)
@@ -524,24 +556,69 @@ impl NewtonRaphsonSolver {
                 damping
             };
 
-            // Step 5: Update variables: x_new = x_old + step_size * delta
+            // Step 5: Update variables: x_new = x_old + step_size * delta.
+            // Retain the applied step norm before refreshing numerical state so
+            // a tiny update can be diagnosed without being treated as success
+            // on its own.
+            let applied_step_norm = delta.norm() * step_size;
             for (i, &var_id) in self.variables.iter().enumerate() {
                 vars.insert(var_id, vars[&var_id] + step_size * delta[(i, 0)]);
             }
 
-            // Additional convergence check: small step size indicates convergence
-            if delta.norm() * step_size < self.tolerance {
-                return Ok(Solution {
-                    values: self.values_by_name(&vars),
-                    iterations: iter + 1,
-                    error,
-                    converged: true,
-                    convergence_history,
-                });
-            }
-
-            // Refresh Jacobian for next iteration
+            // Refresh both the residual and Jacobian at the accepted point.
+            // Any convergence result below must describe this new state, not
+            // the residual that preceded the update.
+            jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
             jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+            let updated_error = f_vals.norm();
+
+            if updated_error < self.tolerance || applied_step_norm < self.tolerance {
+                // A terminating candidate belongs in the history even though a
+                // subsequent loop iteration will not push it.
+                convergence_history.push(updated_error);
+                let gradient_norm = self.residual_gradient_norm(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    parallel,
+                )?;
+
+                if updated_error < self.tolerance {
+                    return Ok(self.build_solution(
+                        &vars,
+                        iter + 1,
+                        updated_error,
+                        gradient_norm,
+                        ConvergenceReason::ResidualTolerance,
+                        convergence_history,
+                    ));
+                }
+
+                // A non-zero least-squares residual is an expected outcome only
+                // for overdetermined systems. Require both a small accepted step
+                // and a small J^T f norm so regularization or poor scaling alone
+                // cannot manufacture convergence.
+                if num_equations > num_variables && gradient_norm < self.tolerance {
+                    return Ok(self.build_solution(
+                        &vars,
+                        iter + 1,
+                        updated_error,
+                        gradient_norm,
+                        ConvergenceReason::LeastSquaresStationary,
+                        convergence_history,
+                    ));
+                }
+
+                let diagnostic = self.build_diagnostic(
+                    format!(
+                        "Newton step fell below tolerance at iteration {} without satisfying residual or least-squares stationarity criteria",
+                        iter + 1
+                    ),
+                    iter + 1,
+                    &vars,
+                    &f_vals,
+                );
+                return Err(SolverError::NoConvergence(diagnostic));
+            }
         }
 
         // Failed to converge within max iterations
@@ -753,6 +830,51 @@ impl NewtonRaphsonSolver {
             }
         }
         values
+    }
+
+    /// Construct a successful result from numerical quantities that have all
+    /// been evaluated at the same accepted variable state.
+    ///
+    /// Centralizing result construction prevents future convergence branches
+    /// from accidentally pairing updated variables with stale residual data.
+    fn build_solution(
+        &self,
+        vars: &HashMap<VarId, f64>,
+        iterations: usize,
+        error: f64,
+        gradient_norm: f64,
+        reason: ConvergenceReason,
+        convergence_history: Vec<f64>,
+    ) -> Solution {
+        // Convert internal IDs only after all numerical convergence checks have
+        // succeeded, keeping the hot iteration path in its compact ID form.
+        Solution {
+            values: self.values_by_name(vars),
+            iterations,
+            error,
+            gradient_norm,
+            reason,
+            convergence_history,
+        }
+    }
+
+    /// Compute the first-order least-squares optimality measure `||J^T f||`.
+    ///
+    /// A small Newton step is not sufficient evidence of convergence: it can
+    /// also result from regularization, scaling, or numerical cancellation.
+    /// The residual gradient supplies the additional stationarity condition
+    /// needed for a non-zero overdetermined least-squares residual.
+    fn residual_gradient_norm(
+        &self,
+        jacobian: &Matrix,
+        residuals: &Matrix,
+        parallel: bool,
+    ) -> Result<f64, SolverError> {
+        // Form J^T using the same execution policy as the surrounding solve,
+        // then multiply it by the current residual column vector.
+        let jacobian_transpose = jacobian.transpose_with_parallel(parallel);
+        let gradient = jacobian_transpose.try_mul_with_parallel(residuals, parallel)?;
+        Ok(gradient.norm())
     }
 
     fn build_diagnostic(
@@ -997,7 +1119,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert!(solution.converged);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!(solution.error < 1e-10);
 
             let x_sol = solution.values.get("x").copied().unwrap();
@@ -1038,7 +1160,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert!(solution.converged);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             let x_sol = solution.values.get("x").copied().unwrap();
             let y_sol = solution.values.get("y").copied().unwrap();
             assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
@@ -1175,7 +1297,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert!(solution.converged);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
         }
     }
@@ -1239,6 +1361,75 @@ mod tests {
         }
     }
 
+    /// Confirm that a tiny Newton update reports diagnostics from the returned
+    /// point rather than retaining the residual from before the update.
+    #[test]
+    fn test_small_step_convergence_recomputes_returned_residual() {
+        for mode in test_modes() {
+            // The exact update is only 1e-20, below the default tolerance, but
+            // it moves x from residual one to the exact root.
+            let x = Exp::var("x");
+            let equation = Exp::add(Exp::mul(Exp::val(1e20), x), Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver.solve(initial).expect("scaled linear root should solve");
+
+            let returned_residual = 1e20 * solution.values["x"] + 1.0;
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert_eq!(solution.iterations, 1);
+            assert_eq!(solution.error, returned_residual.abs());
+            assert_eq!(solution.error, 0.0);
+            assert_eq!(solution.convergence_history.last(), Some(&0.0));
+        }
+    }
+
+    /// Distinguish a non-zero stationary least-squares result from an
+    /// approximate root in an inconsistent overdetermined system.
+    #[test]
+    fn test_inconsistent_overdetermined_system_reports_stationarity() {
+        for mode in test_modes() {
+            // No x satisfies both equations. Their least-squares objective is
+            // stationary at x=0 with residual norm sqrt(2).
+            let x = Exp::var("x");
+            let equations = vec![
+                Exp::sub(x.clone(), Exp::val(1.0)),
+                Exp::add(x, Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("stationary least-squares result should be explicit");
+
+            assert_eq!(
+                solution.reason,
+                ConvergenceReason::LeastSquaresStationary
+            );
+            assert!((solution.error - 2.0_f64.sqrt()).abs() < 1e-12);
+            assert!(solution.gradient_norm < 1e-10);
+        }
+    }
+
+    /// Verify that the iteration count measures accepted updates rather than
+    /// residual evaluations.
+    #[test]
+    fn test_exact_initial_root_reports_zero_iterations() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode);
+            let initial = HashMap::from([("x".to_string(), 1.0)]);
+
+            let solution = solver.solve(initial).expect("initial point is a root");
+
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
+            assert_eq!(solution.iterations, 0);
+            assert_eq!(solution.convergence_history, vec![0.0]);
+        }
+    }
+
     #[test]
     fn test_least_squares_qr_handles_ill_conditioned_overdetermined_system_without_regularization()
     {
@@ -1286,7 +1477,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert!(solution.converged, "{:?}", solution);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
             assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
         }
@@ -1318,7 +1509,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert!(solution.converged, "{:?}", solution);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
             assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
         }
@@ -1359,7 +1550,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert!(solution.converged, "{:?}", solution);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
             assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
         }
@@ -1428,7 +1619,7 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-10);
             }
-            assert!(solution.converged, "{:?}", solution);
+            assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
         }
     }

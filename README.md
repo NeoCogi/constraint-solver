@@ -27,7 +27,7 @@ The solver supports all three system shapes:
 ### Square system example
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -47,13 +47,13 @@ initial.insert("x".to_string(), 0.5);
 initial.insert("y".to_string(), 0.866);
 
 let solution = solver.solve(initial).expect("solve failed");
-assert!(solution.converged);
+assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
 ### Under-constrained example (minimum-norm)
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -68,13 +68,13 @@ let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.0);
 initial.insert("y".to_string(), 0.0);
 let solution = solver.solve(initial).expect("solve failed");
-assert!(solution.converged);
+assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
 ### Over-constrained example (least squares)
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -89,13 +89,13 @@ let solver = NewtonRaphsonSolver::new(compiled);
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.0);
 let solution = solver.solve(initial).expect("solve failed");
-assert!(solution.converged);
+assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
 ### Example: solve a simple system
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 fn main() {
@@ -119,7 +119,7 @@ fn main() {
     initial.insert("y".to_string(), 0.866);
 
     let solution = solver.solve(initial).expect("solve failed");
-    assert!(solution.converged);
+    assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 
     let x_sol = solution.values.get("x").copied().unwrap();
     let y_sol = solution.values.get("y").copied().unwrap();
@@ -130,7 +130,7 @@ fn main() {
 ### Line search and regularization
 
 ```rust
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, ConvergenceReason, Exp, NewtonRaphsonSolver};
 use std::collections::HashMap;
 
 let x = Exp::var("x");
@@ -151,7 +151,7 @@ initial.insert("y".to_string(), 0.25);
 let solution = solver
     .solve_with_line_search(initial)
     .expect("solve failed");
-assert!(solution.converged);
+assert_eq!(solution.reason, ConvergenceReason::ResidualTolerance);
 ```
 
 ### Execution mode (serial vs parallel)

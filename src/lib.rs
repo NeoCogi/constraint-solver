@@ -37,5 +37,6 @@ pub use exp::{Exp, MissingVarError};
 pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
 pub use mode::Mode;
 pub use solver::{
-    EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverRunDiagnostic,
+    ConvergenceReason, EquationTrace, NewtonRaphsonSolver, Solution, SolverError,
+    SolverRunDiagnostic,
 };

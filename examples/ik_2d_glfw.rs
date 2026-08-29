@@ -450,18 +450,19 @@ fn main() {
 
         // Solve for the joint positions.
         if let Ok(solution) = solver.solve(initial) {
-            if solution.converged {
-                if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
-                    joint1.vars.read_values(&solution.values),
-                    joint2.vars.read_values(&solution.values),
-                    joint3.vars.read_values(&solution.values),
-                    joint4.vars.read_values(&solution.values),
-                ) {
-                    state.joint1 = j1;
-                    state.joint2 = j2;
-                    state.joint3 = j3;
-                    state.effector = j4;
-                }
+            // Every successful result now carries an explicit convergence reason;
+            // failures are represented only by `Err`, so no redundant boolean
+            // success check is needed here.
+            if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
+                joint1.vars.read_values(&solution.values),
+                joint2.vars.read_values(&solution.values),
+                joint3.vars.read_values(&solution.values),
+                joint4.vars.read_values(&solution.values),
+            ) {
+                state.joint1 = j1;
+                state.joint2 = j2;
+                state.joint3 = j3;
+                state.effector = j4;
             }
         }
 
