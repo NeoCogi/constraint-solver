@@ -70,6 +70,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   machine-specific timing tables from the README.
 - Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
   and required CI builds to use the committed dependency graph.
+- Extended the Rust 1.86 all-target gate to Windows and macOS so the MSRV claim
+  covers platform-specific examples and development dependencies rather than a
+  Linux-only repository graph.
 
 ### Fixed
 

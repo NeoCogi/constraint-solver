@@ -27,8 +27,8 @@ minimum supported Rust version (MSRV) for the complete locked repository graph,
 including development dependencies. Rust 2024 edition syntax itself is
 available in Rust 1.85; the 1.86 floor reflects the graph this project actually
 builds and tests, not the edition alone. CI runs `cargo test --locked
---all-targets` with Rust 1.86 in addition to validating the repository with the
-current stable toolchain.
+--all-targets` with Rust 1.86 on Linux, Windows, and macOS in addition to
+validating the repository with the current stable toolchain.
 
 ## System Types (Square, Under-, Over-Constrained)
 

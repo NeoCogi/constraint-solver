@@ -75,8 +75,8 @@ jobs:
       - name: Test all targets at the MSRV
         run: cargo test --locked --all-targets
 
-  portable-library:
-    name: Check library on ${{ matrix.os }}
+  portable-msrv:
+    name: Test all targets on ${{ matrix.os }} with Rust 1.86
     runs-on: ${{ matrix.os }}
     strategy:
       # Report every supported host result even if one platform fails first.
@@ -89,21 +89,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      # Portability tracks the current stable toolchain; the separate Linux job
-      # above owns the lower-bound compiler contract.
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      # Exercise the declared compiler floor on every supported host instead of
+      # assuming Linux-only MSRV coverage proves platform-specific development
+      # dependencies and examples remain compatible.
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
 
       # Toolchain and target metadata keep artifacts isolated across the two
       # operating-system matrix entries.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # Check only the distributable library. GUI development dependencies and
-      # the X11-based interactive example are validated in the Linux all-target
-      # job and are not part of the crate's portable runtime surface.
-      - name: Check locked library
-        run: cargo check --locked --lib
+      # Match the Linux MSRV command so the complete locked developer graph and
+      # every platform-specific example/test target compile at the claimed
+      # minimum. Windows and macOS use glfw's prebuilt native libraries.
+      - name: Test all targets at the MSRV
+        run: cargo test --locked --all-targets
 
   validate:
     name: Format, lint, test, and package
