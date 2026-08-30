@@ -140,7 +140,7 @@ impl ResidualGradientMeasure {
         // A zero residual is handled by the root-success checks before
         // stationarity is queried. Every non-root therefore has a defined
         // column-scaled measure, including the zero-Jacobian case.
-        self.relative_norm.is_some_and(|norm| norm < tolerance)
+        self.relative_norm.is_some_and(|norm| norm <= tolerance)
     }
 }
 
@@ -1805,6 +1805,28 @@ mod tests {
     use crate::Mode;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
+
+    /// Apply the documented inclusive maximum at the exact dimensionless
+    /// stationarity boundary.
+    #[test]
+    fn test_stationarity_tolerance_boundary_is_inclusive() {
+        let boundary_measure = ResidualGradientMeasure {
+            absolute_norm: 1.0,
+            relative_norm: Some(0.25),
+        };
+
+        assert!(boundary_measure.is_stationary(0.25));
+        assert!(!boundary_measure.is_stationary(0.25 - f64::EPSILON));
+
+        // An exact root has no residual direction and is handled by the root
+        // check before stationarity; absence must never become stationary by
+        // comparison alone.
+        let root_measure = ResidualGradientMeasure {
+            absolute_norm: 0.0,
+            relative_norm: None,
+        };
+        assert!(!root_measure.is_stationary(1.0));
+    }
 
     struct TestRng {
         state: u64,

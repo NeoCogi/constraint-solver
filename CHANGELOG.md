@@ -105,6 +105,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
   algebraically independent small-coefficient directions above factorization
   roundoff, preventing repeated zero corrections on solvable systems.
+- Made the documented maximum stationarity tolerance inclusive, matching the
+  residual-tolerance boundary instead of consuming another iteration when the
+  measured cosine is exactly equal to the configured threshold.
 - Applied equation and variable scaling consistently to residual success,
   stationarity, Armijo acceptance, rank and condition diagnostics, the
   linearized correction, and explicit ridge regularization. Failure diagnostics
