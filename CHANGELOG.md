@@ -19,6 +19,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Armijo, and explicit regularization policy.
 - Added structured equation diagnostics and optional caller-provided equation
   traces to make failed constraints identifiable without parsing messages.
+- Added explicit positive equation and variable characteristic scales. Equation
+  scales define dimensionless residual weighting and success, while variable
+  scales normalize Jacobian columns, corrections, and ridge penalties without
+  changing caller-visible values.
 - Added structured matrix errors for invalid shapes and tolerances, overflowing
   dimensions, allocation failure, non-finite states, and failed convergence.
 - Added executable crate documentation, compiled README examples, complete
@@ -52,8 +56,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Applied one numerical default policy to square, tall, and wide systems instead
   of silently changing iteration, step-size, and regularization defaults based
   on Jacobian shape.
-- Changed Armijo line search to operate directly on the residual norm with the
-  scale-safe directional derivative `(f / ||f||)^T (J delta)`.
+- Changed Armijo line search to operate directly on the scaled residual norm
+  with a scale-safe directional derivative in normalized coordinates.
 - Removed origin-based point projection from nonlinear iteration; every wide
   system now uses one minimum-norm Newton correction per accepted update.
 - Cached simplified symbolic derivatives at solver construction while keeping
@@ -80,6 +84,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
   algebraically independent small-coefficient directions above factorization
   roundoff, preventing repeated zero corrections on solvable systems.
+- Applied equation and variable scaling consistently to residual success,
+  stationarity, Armijo acceptance, rank and condition diagnostics, the
+  linearized correction, and explicit ridge regularization. Failure diagnostics
+  retain both raw and scaled per-equation residuals.
 - Corrected Householder reflector scaling and triangular condition estimation,
   including off-diagonal growth and uniform matrix rescaling.
 - Corrected LU pivot classification so every pivot, including the final one,

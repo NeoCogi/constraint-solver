@@ -46,10 +46,54 @@ The solver supports all three system shapes:
   `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
 
 Every system shape has the same success contract: `Ok(Solution)` means the
-returned residual norm is less than or equal to
-`SolverOptions::residual_tolerance`. A
-first-order stationary point whose residual remains too large is an error even
-for a square or under-constrained system.
+returned equation-scale-normalized residual norm is less than or equal to
+`SolverOptions::residual_tolerance`. All scales default to one, so this is the
+ordinary residual norm unless scaling is explicitly configured. A first-order
+stationary point whose scaled residual remains too large is an error even for a
+square or under-constrained system.
+
+## Scaling and units
+
+Use positive characteristic scales when equations or variables use different
+physical units. For equation scale `s_i` and variable scale `t_j`, the solver
+uses
+
+```text
+f_scaled[i]    = f[i] / s_i
+J_scaled[i,j]  = J[i,j] * t_j / s_i
+delta_x[j]     = t_j * delta_scaled[j]
+```
+
+The scaled residual controls convergence, stationarity, Armijo acceptance, and
+least-squares weighting. A larger equation scale therefore reduces that
+equation's weight. Variable scaling changes numerical coordinates without
+changing caller-visible values. Explicit ridge regularization penalizes the
+normalized `delta_scaled`, so its meaning is stable across variable units.
+
+```rust
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use std::collections::HashMap;
+
+let x = Exp::var("x");
+let current = Exp::var("current");
+let equations = vec![
+    Exp::sub(x, Exp::val(5.0)),
+    Exp::sub(Exp::mul(Exp::val(1e-3), current), Exp::val(1.0)),
+];
+let compiled = Compiler::compile(&equations).expect("compile failed");
+let solver = NewtonRaphsonSolver::new(compiled)
+    .with_equation_scales(vec![5.0, 1.0])
+    .expect("one positive scale per equation")
+    .with_variable_scales(HashMap::from([("current".to_string(), 1e3)]))
+    .expect("current is a solve variable");
+
+let initial = HashMap::from([
+    ("x".to_string(), 0.0),
+    ("current".to_string(), 0.0),
+]);
+let solution = solver.solve(initial).expect("solve failed");
+assert!((solution.values["current"] - 1e3).abs() < 1e-8);
+```
 
 ### Square system example
 
@@ -164,8 +208,8 @@ let _solver = NewtonRaphsonSolver::new_with_mode(compiled, Mode::Parallel { thre
 `CompiledSystem` exposes equation counts and stable variable names before it is
 moved into a solver. Optional equation traces are positional and must include
 exactly one entry per equation; attaching them is fallible. On failure,
-`SolverRunDiagnostic::equations` pairs every signed residual with its equation
-index and optional trace. Successful solutions and run diagnostics also expose
+`SolverRunDiagnostic::equations` pairs every raw and scaled signed residual with
+its equation index and optional trace. Successful solutions and run diagnostics also expose
 `last_linear_solve`, which reports the effective QR/SVD rank and condition
 estimate and whether the caller explicitly selected ridge regularization.
 
@@ -248,11 +292,11 @@ decisions.
   to zero: zero solves the original Jacobian once, while a positive value solves
   one augmented system using exactly that ridge strength. Condition estimates
   are diagnostic and never silently replace the requested linear problem.
-- Line search applies a slope-based Armijo condition directly to the residual
-  norm `||f||`. It evaluates the equivalent scale-safe directional derivative
-  `(f / ||f||)^T (J delta)` without first forming the potentially overflowing
-  dot product `f^T J delta`, and reports failure without counting rejected
-  candidates as accepted solver updates.
+- Line search applies a slope-based Armijo condition directly to the scaled
+  residual norm `||f_scaled||`. It evaluates the equivalent scale-safe
+  directional derivative without first forming a potentially overflowing raw
+  dot product, and reports failure without counting rejected candidates as
+  accepted solver updates.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.

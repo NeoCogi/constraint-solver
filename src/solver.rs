@@ -48,14 +48,14 @@ struct LineSearchContext<'a> {
     candidate_vars: &'a mut HashMap<VarId, f64>,
     /// Newton correction direction whose scalar multiplier is being searched.
     delta: &'a Matrix,
-    /// Residual norm at the current accepted point.
+    /// Equation-scale-normalized residual norm at the current accepted point.
     current_residual_norm: f64,
-    /// Directional derivative of `||f||_2` along `delta`.
+    /// Directional derivative of `||f_scaled||_2` along normalized `delta`.
     ///
     /// For non-zero residual vector `f`, Jacobian `J`, and candidate direction
-    /// `p`, this value is `(f / ||f||_2)^T J p`. Computing this normalized form
-    /// directly avoids overflowing the equivalent expression
-    /// `(f^T J p) / ||f||_2` before the division can reduce its scale.
+    /// `p`, this value is `(f_scaled / ||f_scaled||_2)^T J_scaled p`.
+    /// Computing this normalized form directly avoids overflowing the equivalent
+    /// unnormalized dot product before division can reduce its scale.
     residual_norm_directional_derivative: f64,
     /// Number of Newton updates accepted before this line search began.
     ///
@@ -69,6 +69,27 @@ struct LineSearchContext<'a> {
     gradient: ResidualGradientMeasure,
     /// Reusable output storage for candidate residual evaluations.
     candidate_residuals: &'a mut Matrix,
+    /// Reusable output storage for scaled candidate residuals used by Armijo.
+    candidate_scaled_residuals: &'a mut Matrix,
+}
+
+/// Borrowed normalized state used to compute one Armijo slope while retaining
+/// raw residuals for any caller-facing failure diagnostic.
+struct DirectionalDerivativeContext<'a> {
+    /// Equation- and variable-scaled Jacobian at the current accepted point.
+    jacobian: &'a Matrix,
+    /// Equation-scaled residual vector at the same point.
+    scaled_residuals: &'a Matrix,
+    /// Newton correction expressed in normalized variable coordinates.
+    direction: &'a Matrix,
+    /// Whether matrix multiplication may use the configured Rayon pool.
+    parallel: bool,
+    /// Accepted variables preserved for a possible numerical failure report.
+    vars: &'a HashMap<VarId, f64>,
+    /// Raw residuals preserved for per-equation diagnostics.
+    diagnostic_residuals: &'a Matrix,
+    /// Number of corrections accepted before this slope calculation.
+    accepted_updates: usize,
 }
 
 /// Metadata for a candidate that satisfied the solver's acceptance policy.
@@ -77,7 +98,7 @@ struct LineSearchContext<'a> {
 /// [`NewtonRaphsonSolver::line_search`]. Keeping only scalar metadata here makes
 /// acceptance explicit without allocating or copying a second owned state.
 struct AcceptedStep {
-    /// Residual norm evaluated at the accepted candidate variables.
+    /// Scaled residual norm evaluated at the accepted candidate variables.
     residual_norm: f64,
 }
 
@@ -89,7 +110,7 @@ struct AcceptedStep {
 /// report a differently evaluated quantity.
 #[derive(Debug, Clone, Copy)]
 struct ResidualGradientMeasure {
-    /// Euclidean norm of the raw gradient `J^T f` in caller-provided units.
+    /// Euclidean norm of `J_scaled^T f_scaled` in normalized variable units.
     absolute_norm: f64,
     /// Largest absolute cosine between `f` and a non-zero column of `J`.
     ///
@@ -130,13 +151,15 @@ impl ResidualGradientMeasure {
 pub struct SolverOptions {
     /// Maximum number of accepted Newton updates before `NoConvergence`.
     pub max_iterations: usize,
-    /// Inclusive maximum Euclidean residual norm for a successful `Solution`.
+    /// Inclusive maximum norm of equation-scale-normalized residuals for a
+    /// successful [`Solution`].
     pub residual_tolerance: f64,
     /// Maximum residual/Jacobian-column cosine used for `StationaryNonRoot`.
     pub stationarity_tolerance: f64,
     /// First and largest step multiplier tested for each Newton correction.
     pub initial_step_size: f64,
-    /// Explicit ridge parameter; zero selects the unregularized QR/SVD solve.
+    /// Explicit ridge parameter on the normalized variable correction; zero
+    /// selects the unregularized QR/SVD solve.
     pub regularization: f64,
     /// Armijo sufficient-decrease coefficient for every accepted update.
     pub armijo_coefficient: f64,
@@ -172,7 +195,7 @@ impl Default for SolverOptions {
 /// - Over-constrained systems (equations > variables) - uses least squares
 ///
 /// Every correction is accepted transactionally by Armijo backtracking, and
-/// ill-conditioned linearized systems may use bounded ridge regularization.
+/// callers may explicitly select ridge regularization in normalized units.
 pub struct NewtonRaphsonSolver {
     /// Residual expressions and their simplified symbolic partial derivatives.
     ///
@@ -183,6 +206,19 @@ pub struct NewtonRaphsonSolver {
     variables: Vec<VarId>,
     /// Registry of all variables referenced by the compiled system
     var_table: VarTable,
+    /// Positive characteristic magnitude for each residual equation.
+    ///
+    /// Entry order matches compiled equations. The solver divides residual row
+    /// `i` and Jacobian row `i` by this value, so larger scales reduce an
+    /// equation's weight in convergence, stationarity, Armijo, and least
+    /// squares without changing raw diagnostic residuals.
+    equation_scales: Vec<f64>,
+    /// Positive characteristic magnitude for each solve variable.
+    ///
+    /// Entry order matches `variables`. Jacobian column `j` is multiplied by
+    /// this value, and accepted normalized corrections are converted back to
+    /// caller units with the same factor.
+    variable_scales: Vec<f64>,
     /// Numerical policy validated for the selected path at each solve boundary.
     options: SolverOptions,
     /// Optional metadata describing the source of each equation in the system
@@ -195,8 +231,8 @@ pub struct NewtonRaphsonSolver {
 
 /// Successful solver result with values and explicit convergence diagnostics.
 ///
-/// Constructing this value certifies that the Euclidean residual norm is at most
-/// the configured root tolerance. Stationary non-roots are returned through
+/// Constructing this value certifies that the scaled Euclidean residual norm is
+/// at most the configured root tolerance. Stationary non-roots are returned through
 /// [`SolverError::StationaryNonRoot`] and can never produce `Solution`.
 #[derive(Debug, Clone)]
 pub struct Solution {
@@ -206,10 +242,11 @@ pub struct Solution {
     /// Number of accepted Newton updates. An already-solved initial guess
     /// therefore reports zero iterations.
     pub iterations: usize,
-    /// Residual norm evaluated at exactly the values returned in `values`.
+    /// Euclidean norm of `raw_residual_i / equation_scale_i`, evaluated at
+    /// exactly the values returned in `values`.
     pub error: f64,
-    /// Norm of `J^T f` at the returned values, measuring first-order
-    /// least-squares stationarity.
+    /// Norm of the normalized gradient `J_scaled^T f_scaled` at the returned
+    /// values, measuring first-order least-squares stationarity.
     pub gradient_norm: f64,
     /// Largest absolute cosine between the residual and a Jacobian column.
     ///
@@ -219,8 +256,8 @@ pub struct Solution {
     /// Last linearized correction solve, or `None` when the initial point already
     /// satisfied the residual tolerance and no factorization was needed.
     pub last_linear_solve: Option<LinearSolveDiagnostic>,
-    /// Residual norms for the initial point and each accepted update through the
-    /// returned point.
+    /// Scaled residual norms for the initial point and each accepted update
+    /// through the returned point.
     pub convergence_history: Vec<f64>,
 }
 
@@ -241,6 +278,9 @@ pub struct EquationDiagnostic {
     pub equation_index: usize,
     /// Signed scalar residual evaluated at the diagnostic's `values`.
     pub residual: f64,
+    /// Dimensionless residual `residual / equation_scale` used by convergence,
+    /// stationarity, Armijo acceptance, and the linearized solve.
+    pub scaled_residual: f64,
     /// Caller-provided source metadata, or `None` when no trace was attached for
     /// this equation.
     pub trace: Option<EquationTrace>,
@@ -249,8 +289,8 @@ pub struct EquationDiagnostic {
 /// Numerical provenance for one accepted nonlinear correction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
-    /// Rank, condition estimate, and QR/SVD method that produced the correction
-    /// actually used by the nonlinear solver.
+    /// Rank, condition estimate, and QR/SVD method for the equation- and
+    /// variable-scaled Jacobian that produced the normalized correction.
     pub effective: LeastSquaresInfo,
     /// Explicit ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or
     /// `None` when the direct Jacobian was solved.
@@ -264,9 +304,10 @@ pub struct SolverRunDiagnostic {
     pub message: String,
     /// Number of accepted Newton updates represented by the diagnostic state.
     pub iterations: usize,
-    /// Euclidean norm of all entries in `equations`.
+    /// Euclidean norm of all `EquationDiagnostic::scaled_residual` entries.
     pub error: f64,
-    /// Norm of `J^T f` when the terminating path evaluated stationarity.
+    /// Norm of `J_scaled^T f_scaled` when the terminating path evaluated
+    /// stationarity.
     ///
     /// Other failures report `None` because computing a fresh Jacobian merely
     /// for diagnostics could itself fail or obscure the original error.
@@ -439,11 +480,18 @@ impl NewtonRaphsonSolver {
         // solver's lifetime. Construct and simplify every derivative here so
         // repeated numerical solves share the result.
         let jacobian = Jacobian::new(compiled.equations, variables.clone());
+        let equation_scales = vec![1.0; jacobian.equation_count()];
+        let variable_scales = vec![1.0; variables.len()];
 
         NewtonRaphsonSolver {
             jacobian,
             variables,
             var_table: compiled.var_table,
+            // Unit scales preserve historical unscaled equations and variable
+            // coordinates until a caller explicitly supplies characteristic
+            // magnitudes.
+            equation_scales,
+            variable_scales,
             // One numerical policy applies to square, tall, and wide systems.
             // Shape-specific hidden defaults would make otherwise identical
             // APIs change iteration budgets and regularization unexpectedly.
@@ -488,6 +536,91 @@ impl NewtonRaphsonSolver {
         // fields that can affect its selected numerical path.
         self.options = options;
         self
+    }
+
+    /// Set one positive characteristic scale per compiled residual equation.
+    ///
+    /// Residual `f_i` is normalized as `f_i / scale_i`. Consequently the
+    /// configured residual tolerance is dimensionless, and choosing a larger
+    /// characteristic scale gives that equation less least-squares weight. The
+    /// vector must follow compilation order and contain exactly one entry per
+    /// equation.
+    pub fn with_equation_scales(mut self, scales: Vec<f64>) -> Result<Self, SolverError> {
+        if scales.len() != self.jacobian.equation_count() {
+            return Err(SolverError::InvalidInput(format!(
+                "Equation scale length ({}) does not match number of equations ({})",
+                scales.len(),
+                self.jacobian.equation_count()
+            )));
+        }
+        if let Some((index, _)) = scales
+            .iter()
+            .enumerate()
+            .find(|(_, scale)| !scale.is_finite() || **scale <= 0.0)
+        {
+            return Err(SolverError::InvalidInput(format!(
+                "Equation scale at index {index} must be finite and greater than zero"
+            )));
+        }
+        self.equation_scales = scales;
+        Ok(self)
+    }
+
+    /// Override characteristic scales for named solve variables.
+    ///
+    /// Variable `x_j` is normalized as `x_j / scale_j`, so the linearized
+    /// Jacobian column is multiplied by `scale_j` and a normalized correction is
+    /// multiplied by the same value before updating caller-visible variables.
+    /// Names omitted from the map retain their current scale, initially one.
+    /// Unknown names and fixed parameters are rejected rather than ignored.
+    pub fn with_variable_scales(
+        mut self,
+        scales: HashMap<String, f64>,
+    ) -> Result<Self, SolverError> {
+        // Sort the caller's unordered map so the first reported invalid entry is
+        // deterministic across processes and hash seeds.
+        let mut entries: Vec<_> = scales.into_iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (name, scale) in entries {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(SolverError::InvalidInput(format!(
+                    "Variable scale for '{name}' must be finite and greater than zero"
+                )));
+            }
+            let variable_id = self.var_table.get_id(&name).ok_or_else(|| {
+                SolverError::InvalidInput(format!("Unknown variable scale name '{name}'"))
+            })?;
+            let column = self
+                .variables
+                .iter()
+                .position(|candidate| *candidate == variable_id)
+                .ok_or_else(|| {
+                    SolverError::InvalidInput(format!(
+                        "Variable scale '{name}' refers to a fixed parameter, not a solve variable"
+                    ))
+                })?;
+            self.variable_scales[column] = scale;
+        }
+        Ok(self)
+    }
+
+    /// Borrow equation characteristic scales in compilation order.
+    pub fn equation_scales(&self) -> &[f64] {
+        &self.equation_scales
+    }
+
+    /// Return the characteristic scale of a named solve variable.
+    ///
+    /// `None` indicates that the name is unknown or belongs to a fixed
+    /// parameter rather than a Jacobian column.
+    pub fn variable_scale(&self, name: &str) -> Option<f64> {
+        let variable_id = self.var_table.get_id(name)?;
+        let column = self
+            .variables
+            .iter()
+            .position(|candidate| *candidate == variable_id)?;
+        Some(self.variable_scales[column])
     }
 
     fn set_mode(&mut self, mode: Mode) -> Result<(), SolverError> {
@@ -559,7 +692,7 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the positive, finite residual norm required for success.
+    /// Override the positive, finite scaled residual norm required for success.
     ///
     /// The solver deliberately does not treat a small applied update as
     /// convergence because backtracking can make a useful correction
@@ -646,18 +779,23 @@ impl NewtonRaphsonSolver {
 
         let num_equations = jacobian.equation_count();
         let mut f_vals = Matrix::new(num_equations, 1);
+        let mut scaled_f_vals = Matrix::new(num_equations, 1);
         let mut f_neg = Matrix::new(num_equations, 1);
+        let mut scaled_jacobian = Matrix::new(num_equations, self.variables.len());
         // Populate the complete initial accepted state once. Subsequent
         // residuals arrive from successful line-search candidates, while each
         // newly accepted point receives exactly one Jacobian evaluation.
         jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
         jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+        self.scale_residuals_into(&f_vals, &mut scaled_f_vals);
+        self.scale_jacobian_into(jacobian_workspace.jacobian(), &mut scaled_jacobian);
 
         // Candidate buffers are separate from accepted state until Armijo
         // succeeds. Swapping them on acceptance avoids both rollback logic and
         // reevaluation of an already-tested residual vector.
         let mut candidate_vars = vars.clone();
         let mut candidate_f_vals = Matrix::new(num_equations, 1);
+        let mut candidate_scaled_f_vals = Matrix::new(num_equations, 1);
 
         let parallel = self.parallel_enabled();
 
@@ -677,14 +815,22 @@ impl NewtonRaphsonSolver {
                 &f_vals,
             ));
         }
-        convergence_history.push(f_vals.norm());
+        if !scaled_f_vals.all_finite() || !scaled_jacobian.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Equation or variable scaling produced NaN or infinity",
+                0,
+                &vars,
+                &f_vals,
+            ));
+        }
+        convergence_history.push(scaled_f_vals.norm());
 
         // The current state is always fully evaluated at loop entry. A mutable
         // accepted-update count lets the budget-exhausted state receive the same
         // root and stationarity checks without a special final evaluation path.
         let mut iter = 0;
         loop {
-            let error = f_vals.norm();
+            let error = scaled_f_vals.norm();
 
             // A successful result requires the actual constraints to satisfy
             // the residual threshold before any mutation is attempted. Every
@@ -694,8 +840,7 @@ impl NewtonRaphsonSolver {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
-                let gradient =
-                    Self::residual_gradient_measure(jacobian_workspace.jacobian(), &f_vals);
+                let gradient = Self::residual_gradient_measure(&scaled_jacobian, &scaled_f_vals);
                 return Ok(self.build_solution(
                     &vars,
                     iter,
@@ -710,7 +855,7 @@ impl NewtonRaphsonSolver {
             // a root, particularly after rank truncation or regularization.
             // Detect it before damping or another identical linear solve and
             // return a non-success result with the exact stationary state.
-            let gradient = Self::residual_gradient_measure(jacobian_workspace.jacobian(), &f_vals);
+            let gradient = Self::residual_gradient_measure(&scaled_jacobian, &scaled_f_vals);
             if gradient.is_stationary(self.options.stationarity_tolerance) {
                 return Err(self.stationary_non_root_error(
                     iter,
@@ -740,7 +885,7 @@ impl NewtonRaphsonSolver {
             }
 
             for i in 0..num_equations {
-                f_neg[(i, 0)] = -f_vals[(i, 0)];
+                f_neg[(i, 0)] = -scaled_f_vals[(i, 0)];
             }
 
             // Step 2: Solve J * delta = -f(x) through one shape-independent
@@ -749,7 +894,7 @@ impl NewtonRaphsonSolver {
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
             let linear_solve =
-                self.solve_least_squares_system(jacobian_workspace.jacobian(), &f_neg, parallel)?;
+                self.solve_least_squares_system(&scaled_jacobian, &f_neg, parallel)?;
             last_linear_solve = Some(linear_solve.diagnostic.clone());
             let delta = linear_solve.solution;
 
@@ -769,14 +914,15 @@ impl NewtonRaphsonSolver {
             // untouched while populating candidate buffers, so failure cannot
             // require rollback or consume an update count.
             let residual_norm_directional_derivative = self
-                .residual_norm_directional_derivative(
-                    jacobian_workspace.jacobian(),
-                    &f_vals,
-                    &delta,
+                .residual_norm_directional_derivative(DirectionalDerivativeContext {
+                    jacobian: &scaled_jacobian,
+                    scaled_residuals: &scaled_f_vals,
+                    direction: &delta,
                     parallel,
-                    &vars,
-                    iter,
-                )
+                    vars: &vars,
+                    diagnostic_residuals: &f_vals,
+                    accepted_updates: iter,
+                })
                 .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
             let accepted_step = self
                 .line_search(LineSearchContext {
@@ -790,6 +936,7 @@ impl NewtonRaphsonSolver {
                     current_residuals: &f_vals,
                     gradient,
                     candidate_residuals: &mut candidate_f_vals,
+                    candidate_scaled_residuals: &mut candidate_scaled_f_vals,
                 })
                 .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
 
@@ -798,6 +945,7 @@ impl NewtonRaphsonSolver {
             // become one atomic accepted state without evaluating f(x) again.
             std::mem::swap(&mut vars, &mut candidate_vars);
             std::mem::swap(&mut f_vals, &mut candidate_f_vals);
+            std::mem::swap(&mut scaled_f_vals, &mut candidate_scaled_f_vals);
 
             // Only the Jacobian was not needed by candidate acceptance. Evaluate
             // it once for the newly committed state and retain it through the
@@ -807,6 +955,18 @@ impl NewtonRaphsonSolver {
                 return Err(Self::attach_linear_solve(
                     self.non_finite_evaluation_error(
                         "Accepted Newton update produced a non-finite Jacobian",
+                        iter + 1,
+                        &vars,
+                        &f_vals,
+                    ),
+                    last_linear_solve,
+                ));
+            }
+            self.scale_jacobian_into(jacobian_workspace.jacobian(), &mut scaled_jacobian);
+            if !scaled_jacobian.all_finite() {
+                return Err(Self::attach_linear_solve(
+                    self.non_finite_evaluation_error(
+                        "Variable or equation scaling produced a non-finite Jacobian",
                         iter + 1,
                         &vars,
                         &f_vals,
@@ -1017,13 +1177,80 @@ impl NewtonRaphsonSolver {
         values
     }
 
-    /// Apply one correction atomically when every proposed variable value is
-    /// finite.
+    /// Normalize raw residuals by their positive equation characteristic scales.
+    fn scale_residuals_into(&self, raw: &Matrix, scaled: &mut Matrix) {
+        if scaled.rows() != raw.rows() || scaled.cols() != 1 {
+            *scaled = Matrix::new(raw.rows(), 1);
+        }
+        for row in 0..raw.rows() {
+            scaled[(row, 0)] = raw[(row, 0)] / self.equation_scales[row];
+        }
+    }
+
+    /// Return the norm used by convergence and failure diagnostics without
+    /// allocating a temporary scaled residual vector.
+    fn scaled_residual_norm(&self, raw: &Matrix) -> f64 {
+        let mut norm = 0.0_f64;
+        for row in 0..raw.rows() {
+            norm = norm.hypot(raw[(row, 0)] / self.equation_scales[row]);
+        }
+        norm
+    }
+
+    /// Normalize a raw Jacobian for equation and variable characteristic scales.
+    ///
+    /// The normalized derivative is `J_ij * variable_scale_j /
+    /// equation_scale_i`. Multiplication order avoids manufacturing `0 * inf`
+    /// when the scale ratio itself exceeds `f64`, while callers subsequently
+    /// reject any genuinely non-finite normalized derivative.
+    fn scale_jacobian_into(&self, raw: &Matrix, scaled: &mut Matrix) {
+        if scaled.rows() != raw.rows() || scaled.cols() != raw.cols() {
+            *scaled = Matrix::new(raw.rows(), raw.cols());
+        }
+        for row in 0..raw.rows() {
+            let equation_scale = self.equation_scales[row];
+            for column in 0..raw.cols() {
+                let variable_scale = self.variable_scales[column];
+                let derivative = raw[(row, column)];
+                scaled[(row, column)] = if variable_scale <= equation_scale {
+                    derivative * (variable_scale / equation_scale)
+                } else {
+                    (derivative / equation_scale) * variable_scale
+                };
+            }
+        }
+    }
+
+    /// Multiply a normalized correction by its step and variable scale without
+    /// committing to one fragile floating-point association.
+    ///
+    /// Damping first can underflow a tiny normalized correction that a large
+    /// variable scale would recover; scaling first can overflow a large
+    /// correction that a small step would recover. Evaluate both associations
+    /// and prefer a finite non-zero representation when either one preserves the
+    /// mathematically representable result.
+    fn scaled_update_component(delta: f64, step_size: f64, variable_scale: f64) -> f64 {
+        let damped_then_scaled = (delta * step_size) * variable_scale;
+        let scaled_then_damped = (delta * variable_scale) * step_size;
+
+        if damped_then_scaled.is_finite()
+            && (damped_then_scaled != 0.0 || scaled_then_damped == 0.0)
+        {
+            damped_then_scaled
+        } else {
+            scaled_then_damped
+        }
+    }
+
+    /// Apply one normalized correction atomically in caller variable units.
     ///
     /// The first pass validates the complete candidate without changing
     /// `vars`. The second pass commits the same arithmetic only after success,
     /// so a failure cannot leave a mixture of old and partially updated values.
-    /// Fixed parameters are absent from `self.variables` and remain untouched.
+    /// Testing both multiplication associations lets backtracking and variable
+    /// scaling recover representable updates that one fixed order could
+    /// overflow or underflow. Fixed parameters are absent from `self.variables`
+    /// and remain untouched.
     fn apply_finite_step(
         &self,
         vars: &mut HashMap<VarId, f64>,
@@ -1036,7 +1263,12 @@ impl NewtonRaphsonSolver {
             .copied()
             .enumerate()
             .any(|(index, var_id)| {
-                let value = vars[&var_id] + step_size * delta[(index, 0)];
+                let update = Self::scaled_update_component(
+                    delta[(index, 0)],
+                    step_size,
+                    self.variable_scales[index],
+                );
+                let value = vars[&var_id] + update;
                 !value.is_finite()
             })
         {
@@ -1044,7 +1276,12 @@ impl NewtonRaphsonSolver {
         }
 
         for (index, &var_id) in self.variables.iter().enumerate() {
-            let value = vars[&var_id] + step_size * delta[(index, 0)];
+            let update = Self::scaled_update_component(
+                delta[(index, 0)],
+                step_size,
+                self.variable_scales[index],
+            );
+            let value = vars[&var_id] + update;
             vars.insert(var_id, value);
         }
         true
@@ -1093,7 +1330,7 @@ impl NewtonRaphsonSolver {
         let diagnostic = self.build_diagnostic(
             format!(
                 "Residual norm {:.2e} exceeds tolerance {:.2e}, while the normalized residual gradient satisfies stationarity tolerance {:.2e}",
-                residuals.norm(),
+                self.scaled_residual_norm(residuals),
                 self.options.residual_tolerance,
                 self.options.stationarity_tolerance,
             ),
@@ -1127,7 +1364,7 @@ impl NewtonRaphsonSolver {
         error
     }
 
-    /// Compute the raw least-squares gradient norm and its column-scaled
+    /// Compute the normalized least-squares gradient norm and its column-scaled
     /// first-order stationarity measure.
     ///
     /// The decision quantity is `max_j |J_j^T f| / (||J_j||_2 ||f||_2)`, the
@@ -1165,7 +1402,7 @@ impl NewtonRaphsonSolver {
                 .map(|row| jacobian[(row, column)].abs())
                 .fold(0.0_f64, f64::max);
             if column_scale == 0.0 {
-                // A zero column contributes neither a raw gradient component nor
+                // A zero column contributes neither a gradient component nor
                 // a residual alignment. An entirely zero Jacobian consequently
                 // yields the mathematically stationary value `Some(0.0)`.
                 continue;
@@ -1196,16 +1433,16 @@ impl NewtonRaphsonSolver {
             let cosine = (scaled_dot.abs() / scaled_column_norm / scaled_residual_norm).min(1.0);
             maximum_cosine = maximum_cosine.max(cosine);
 
-            // Reconstruct the raw component only for diagnostics, multiplying
-            // by the smaller scale first to avoid needless overflow. An infinite
-            // raw norm is valid when its mathematical magnitude exceeds `f64`;
-            // it does not affect the finite cosine used for classification.
-            let raw_component = if column_scale < residual_scale {
+            // Reconstruct the normalized gradient component for diagnostics,
+            // multiplying by the smaller internal scale first to avoid needless
+            // overflow. An infinite norm remains valid when its mathematical
+            // magnitude exceeds `f64`; it does not affect the finite cosine.
+            let gradient_component = if column_scale < residual_scale {
                 (scaled_dot * column_scale) * residual_scale
             } else {
                 (scaled_dot * residual_scale) * column_scale
             };
-            absolute_norm = absolute_norm.hypot(raw_component);
+            absolute_norm = absolute_norm.hypot(gradient_component);
         }
 
         ResidualGradientMeasure {
@@ -1214,22 +1451,27 @@ impl NewtonRaphsonSolver {
         }
     }
 
-    /// Compute the directional derivative of the residual norm along a proposed
-    /// solver direction.
+    /// Compute the directional derivative of the scaled residual norm along a
+    /// proposed normalized solver direction.
     ///
-    /// Away from a root the derivative is `(f / ||f||_2)^T J p`, where `p` is
-    /// the Newton or Gauss-Newton correction. Normalizing `f` before the dot
-    /// product prevents large finite residuals and velocities from overflowing
-    /// the mathematically equivalent `f^T J p / ||f||_2` expression.
+    /// Away from a root the derivative is
+    /// `(f_scaled / ||f_scaled||_2)^T J_scaled p`. Normalizing the residual
+    /// before the dot product prevents large finite values and velocities from
+    /// overflowing the mathematically equivalent unnormalized expression.
     fn residual_norm_directional_derivative(
         &self,
-        jacobian: &Matrix,
-        residuals: &Matrix,
-        direction: &Matrix,
-        parallel: bool,
-        vars: &HashMap<VarId, f64>,
-        accepted_updates: usize,
+        context: DirectionalDerivativeContext<'_>,
     ) -> Result<f64, SolverError> {
+        let DirectionalDerivativeContext {
+            jacobian,
+            scaled_residuals,
+            direction,
+            parallel,
+            vars,
+            diagnostic_residuals,
+            accepted_updates,
+        } = context;
+
         // Multiplying J by the candidate direction produces the residual-space
         // velocity used by the chain rule. The multiplication honors the
         // solver's selected execution mode and retains structured shape errors.
@@ -1239,20 +1481,20 @@ impl NewtonRaphsonSolver {
                 "Line-search directional derivative produced NaN or infinity",
                 accepted_updates,
                 vars,
-                residuals,
+                diagnostic_residuals,
             ));
         }
 
         // The iteration requests a slope only for non-roots, so a positive
         // finite norm must exist. Rejecting an unexpected zero or non-finite
         // norm here keeps this private helper safe if future call sites change.
-        let residual_norm = residuals.norm();
+        let residual_norm = scaled_residuals.norm();
         if !residual_norm.is_finite() || residual_norm <= 0.0 {
             return Err(self.non_finite_evaluation_error(
                 "Line-search residual norm was zero or non-finite",
                 accepted_updates,
                 vars,
-                residuals,
+                diagnostic_residuals,
             ));
         }
 
@@ -1261,15 +1503,15 @@ impl NewtonRaphsonSolver {
         // cases where the old raw residual-times-velocity product overflowed.
         let mut sum = 0.0;
         let mut compensation = 0.0;
-        for row in 0..residuals.rows() {
-            let normalized_residual = residuals[(row, 0)] / residual_norm;
+        for row in 0..scaled_residuals.rows() {
+            let normalized_residual = scaled_residuals[(row, 0)] / residual_norm;
             let product = normalized_residual * residual_velocity[(row, 0)];
             if !product.is_finite() {
                 return Err(self.non_finite_evaluation_error(
                     "Line-search residual-norm slope overflowed",
                     accepted_updates,
                     vars,
-                    residuals,
+                    diagnostic_residuals,
                 ));
             }
 
@@ -1288,7 +1530,7 @@ impl NewtonRaphsonSolver {
                 "Line-search residual-norm slope accumulation overflowed",
                 accepted_updates,
                 vars,
-                residuals,
+                diagnostic_residuals,
             ));
         }
         Ok(residual_norm_derivative)
@@ -1339,6 +1581,8 @@ impl NewtonRaphsonSolver {
             equations.push(EquationDiagnostic {
                 equation_index,
                 residual: residuals_matrix[(equation_index, 0)],
+                scaled_residual: residuals_matrix[(equation_index, 0)]
+                    / self.equation_scales[equation_index],
                 trace: self.trace_for_equation(equation_index).cloned(),
             });
         }
@@ -1346,7 +1590,7 @@ impl NewtonRaphsonSolver {
         SolverRunDiagnostic {
             message,
             iterations,
-            error: residuals_matrix.norm(),
+            error: self.scaled_residual_norm(residuals_matrix),
             gradient_norm: gradient.map(|measure| measure.absolute_norm),
             relative_gradient_norm: gradient.and_then(|measure| measure.relative_norm),
             last_linear_solve,
@@ -1366,13 +1610,14 @@ impl NewtonRaphsonSolver {
     /// * `vars` - Current variable values
     /// * `candidate_vars` - Reusable transaction buffer for proposed values
     /// * `delta` - Newton step direction
-    /// * `current_residual_norm` - Current function error `||f(x)||`
+    /// * `current_residual_norm` - Current scaled error `||f_scaled(x)||`
     /// * `residual_norm_directional_derivative` - Scale-safe value of
-    ///   `(f / ||f||)^T J delta`
+    ///   `(f_scaled / ||f_scaled||)^T J_scaled delta`
     /// * `accepted_updates` - Number of updates accepted before the search began
     /// * `current_residuals` - Residual vector at the unmodified current point
     /// * `gradient` - Gradient measures at that same current point
     /// * `candidate_residuals` - Reusable storage for each trial point
+    /// * `candidate_scaled_residuals` - Reusable normalized candidate residuals
     ///
     /// # Returns
     /// Metadata for an accepted candidate whose variables and residuals remain
@@ -1393,6 +1638,7 @@ impl NewtonRaphsonSolver {
             current_residuals,
             gradient,
             candidate_residuals,
+            candidate_scaled_residuals,
         } = context;
 
         // A non-negative derivative means the proposed correction is not a
@@ -1460,7 +1706,8 @@ impl NewtonRaphsonSolver {
                 // comparison. This permits a large exponential step to recover at
                 // a smaller alpha without accepting an invalid candidate.
                 jacobian.evaluate_functions_checked_into(candidate_vars, candidate_residuals)?;
-                let new_error = candidate_residuals.norm();
+                self.scale_residuals_into(candidate_residuals, candidate_scaled_residuals);
+                let new_error = candidate_scaled_residuals.norm();
                 let required_error = current_residual_norm
                     + self.options.armijo_coefficient
                         * alpha
@@ -1933,6 +2180,72 @@ mod tests {
         }
     }
 
+    /// Reject malformed physical scaling at the builder boundary where names
+    /// and equation cardinality are still available for precise diagnostics.
+    #[test]
+    fn test_solver_rejects_invalid_scales() {
+        let x = Exp::var("x");
+        let equation = Exp::sub(x.clone(), Exp::val(1.0));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_equation_scales(Vec::new())
+            .err()
+            .expect("one equation requires one scale");
+        assert!(matches!(error, SolverError::InvalidInput(message) if message.contains("length")));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_equation_scales(vec![0.0])
+            .err()
+            .expect("zero cannot be a characteristic scale");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("greater than zero"))
+        );
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_variable_scales(HashMap::from([("unknown".to_string(), 1.0)]))
+            .err()
+            .expect("unknown variable scale names must be rejected");
+        assert!(matches!(error, SolverError::InvalidInput(message) if message.contains("Unknown")));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(&[equation]).expect("equation should compile"),
+        );
+        let error = solver
+            .with_variable_scales(HashMap::from([("x".to_string(), f64::NAN)]))
+            .err()
+            .expect("non-finite variable scales must be rejected");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("greater than zero"))
+        );
+
+        // A compiled variable can be a fixed parameter rather than a Jacobian
+        // column. Scaling it would have no mathematical effect and is therefore
+        // rejected instead of silently stored.
+        let parameter = Exp::var("a");
+        let parameterized = Exp::sub(x, parameter);
+        let solver = NewtonRaphsonSolver::new_with_variables(
+            Compiler::compile(&[parameterized]).expect("equation should compile"),
+            &["x"],
+        )
+        .expect("x is a solve variable");
+        let error = solver
+            .with_variable_scales(HashMap::from([("a".to_string(), 1.0)]))
+            .err()
+            .expect("fixed parameter scales must be rejected");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("fixed parameter"))
+        );
+    }
+
     /// Reject NaN and infinity in the caller's initial map before expression
     /// evaluation can obscure their origin.
     #[test]
@@ -2160,11 +2473,13 @@ mod tests {
             EquationDiagnostic {
                 equation_index: 0,
                 residual: -1.0,
+                scaled_residual: -1.0,
                 trace: Some(trace),
             }
         );
         assert_eq!(diagnostic.equations[1].equation_index, 1);
         assert_eq!(diagnostic.equations[1].residual, -2.0);
+        assert_eq!(diagnostic.equations[1].scaled_residual, -2.0);
         assert_eq!(diagnostic.equations[1].trace, None);
     }
 
@@ -2809,6 +3124,92 @@ mod tests {
                     .rank,
                 2
             );
+        }
+    }
+
+    /// Normalize variable coordinates so condition diagnostics and optional
+    /// ridge penalties do not depend on the caller's chosen units.
+    #[test]
+    fn test_variable_scales_normalize_jacobian_columns() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let equations = vec![
+                Exp::sub(x, Exp::val(1.0)),
+                Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode)
+                .with_variable_scales(HashMap::from([("y".to_string(), 1e13)]))
+                .expect("y has a positive finite characteristic scale");
+            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("normalized variable coordinates should solve");
+            let linear = solution
+                .last_linear_solve
+                .expect("one correction must report its scaled factorization");
+
+            assert_eq!(solution.values["x"], 1.0);
+            assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+            assert_eq!(linear.effective.rank, 2);
+            assert!((linear.effective.cond_est - 1.0).abs() < 1e-12);
+            assert_eq!(solver.variable_scale("x"), Some(1.0));
+            assert_eq!(solver.variable_scale("y"), Some(1e13));
+        }
+    }
+
+    /// Preserve finite caller-unit corrections across both extreme scale and
+    /// backtracking associations.
+    #[test]
+    fn test_scaled_update_chooses_representable_multiplication_order() {
+        // Damping first underflows 1e-320 * 1e-12, while applying the large
+        // variable scale first preserves the finite result near 1e-24.
+        let recovered_from_underflow =
+            NewtonRaphsonSolver::scaled_update_component(1e-320, 1e-12, 1e308);
+        assert!(recovered_from_underflow.is_finite());
+        assert!(recovered_from_underflow > 0.0);
+        assert!((recovered_from_underflow.log10() + 24.0).abs() < 0.01);
+
+        // Scaling first overflows 1e308 * 10, while damping first preserves the
+        // finite result 1e307.
+        let recovered_from_overflow =
+            NewtonRaphsonSolver::scaled_update_component(1e308, 1e-2, 10.0);
+        assert!(recovered_from_overflow.is_finite());
+        assert!((recovered_from_overflow / 1e307 - 1.0).abs() < 1e-12);
+    }
+
+    /// Use equation characteristic scales consistently for least-squares
+    /// weighting, convergence, stationarity, Armijo, and diagnostics.
+    #[test]
+    fn test_equation_scales_define_dimensionless_residual_objective() {
+        for mode in test_modes() {
+            // Raw least squares would let the second equation's factor 1000
+            // dominate and place x near two. Dividing it by its characteristic
+            // scale gives both physical constraints equal dimensionless weight,
+            // whose stationary point is x=1.5.
+            let x = Exp::var("x");
+            let equations = vec![
+                Exp::sub(x.clone(), Exp::val(1.0)),
+                Exp::mul(Exp::val(1000.0), Exp::sub(x, Exp::val(2.0))),
+            ];
+            let solver = solver_for_mode(equations, mode)
+                .with_equation_scales(vec![1.0, 1000.0])
+                .expect("one positive scale is supplied per equation");
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("the equally weighted equations are inconsistent");
+            let diagnostic = expect_stationary_non_root(error);
+
+            assert!((diagnostic.values["x"] - 1.5).abs() < 1e-12);
+            assert!((diagnostic.error - 0.5_f64.sqrt()).abs() < 1e-12);
+            assert!((diagnostic.equations[0].residual - 0.5).abs() < 1e-12);
+            assert!((diagnostic.equations[0].scaled_residual - 0.5).abs() < 1e-12);
+            assert!((diagnostic.equations[1].residual + 500.0).abs() < 1e-9);
+            assert!((diagnostic.equations[1].scaled_residual + 0.5).abs() < 1e-12);
+            assert_eq!(solver.equation_scales(), &[1.0, 1000.0]);
         }
     }
 
