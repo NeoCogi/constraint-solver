@@ -105,6 +105,24 @@ struct AcceptedStep {
     residual_norm: f64,
 }
 
+/// Counts why candidates were rejected during one exhausted line search.
+///
+/// The categories stay private implementation detail because callers already
+/// receive the complete accepted state through `SolverRunDiagnostic`. Keeping
+/// the small summary here adds actionable failure context without expanding the
+/// public error hierarchy or retaining every rejected candidate.
+#[derive(Default)]
+struct LineSearchRejections {
+    /// Candidates whose scaled update made at least one variable non-finite.
+    non_finite_updates: usize,
+    /// Finite variable candidates whose scaled residual norm was NaN or infinite.
+    non_finite_residuals: usize,
+    /// Finite candidates that failed the Armijo sufficient-decrease inequality.
+    insufficient_decrease: usize,
+    /// Residual norm of the last finite candidate evaluated by the search.
+    last_finite_residual: Option<f64>,
+}
+
 /// Absolute and column-scaled measures of the nonlinear least-squares gradient
 /// at one accepted solver state.
 ///
@@ -1729,6 +1747,9 @@ impl NewtonRaphsonSolver {
         // parameters remain present and rejected values never leak forward.
         let mut alpha = self.options.initial_step_size;
         let mut attempted_trials = 0;
+        // Retain only aggregate rejection evidence. Candidate vectors and
+        // residuals continue to use the existing reusable transaction buffers.
+        let mut rejections = LineSearchRejections::default();
 
         for _ in 0..self.options.line_search_max_trials {
             attempted_trials += 1;
@@ -1766,11 +1787,24 @@ impl NewtonRaphsonSolver {
                     + self.options.armijo_coefficient
                         * alpha
                         * residual_norm_directional_derivative;
-                if new_error.is_finite() && new_error <= required_error {
+                if !new_error.is_finite() {
+                    // A smaller candidate may return to the expression domain,
+                    // so record the cause and continue backtracking.
+                    rejections.non_finite_residuals += 1;
+                } else if new_error <= required_error {
                     return Ok(AcceptedStep {
                         residual_norm: new_error,
                     });
+                } else {
+                    // Preserve the final finite norm to show how close the last
+                    // admissible trial came to improving the accepted state.
+                    rejections.insufficient_decrease += 1;
+                    rejections.last_finite_residual = Some(new_error);
                 }
+            } else {
+                // Candidate construction failed before residual evaluation
+                // because at least one physical variable update overflowed.
+                rejections.non_finite_updates += 1;
             }
 
             // Stop only after the current minimum-sized candidate has actually
@@ -1785,9 +1819,17 @@ impl NewtonRaphsonSolver {
         // Applying any rejected fallback could increase the residual or leave
         // the expression domain. Preserve the current point and provide a
         // diagnostic that identifies line-search exhaustion instead.
+        // Format the optional scalar only on failure. Successful searches add no
+        // allocation and return immediately from the candidate loop above.
+        let last_finite_residual = rejections
+            .last_finite_residual
+            .map_or_else(|| "none".to_string(), |value| format!("{value:.2e}"));
         let diagnostic = self.build_diagnostic(
             format!(
-                "Line search failed after {attempted_trials} rejected trial steps; smallest tested step was {alpha:.2e}"
+                "Line search failed after {attempted_trials} rejected trial steps; smallest tested step was {alpha:.2e}; rejections: non-finite updates {}, non-finite residuals {}, insufficient Armijo decrease {}; last finite candidate residual {last_finite_residual}",
+                rejections.non_finite_updates,
+                rejections.non_finite_residuals,
+                rejections.insufficient_decrease,
             ),
             accepted_updates,
             vars,
@@ -2416,6 +2458,18 @@ mod tests {
             match error {
                 SolverError::NoConvergence(diagnostic) => {
                     assert!(diagnostic.message.contains("Line search failed"));
+                    assert!(diagnostic.message.contains("non-finite updates 1"));
+                    assert!(diagnostic.message.contains("non-finite residuals 0"));
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("insufficient Armijo decrease 0")
+                    );
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("last finite candidate residual none")
+                    );
                     assert_eq!(diagnostic.iterations, 0);
                     assert_eq!(diagnostic.values["x"], 1e308);
                     assert!(diagnostic.values.values().all(|value| value.is_finite()));
@@ -2690,6 +2744,18 @@ mod tests {
                 SolverError::NoConvergence(diagnostic) => {
                     assert_eq!(diagnostic.iterations, 0);
                     assert!(diagnostic.message.contains("after 1 rejected trial steps"));
+                    assert!(diagnostic.message.contains("non-finite updates 0"));
+                    assert!(diagnostic.message.contains("non-finite residuals 1"));
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("insufficient Armijo decrease 0")
+                    );
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("last finite candidate residual none")
+                    );
                     assert_eq!(diagnostic.values["x"], -20.0);
                     assert!(diagnostic.gradient_norm.is_some());
                     assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
@@ -2699,6 +2765,46 @@ mod tests {
                         .expect("the rejected candidate still followed a successful SVD attempt");
                     assert_eq!(attempt.effective.rank, 1);
                     assert_eq!(attempt.regularization, None);
+                }
+                other => panic!("expected NoConvergence, got {other:?}"),
+            }
+        }
+    }
+
+    /// Distinguish a finite but unhelpful trial from overflow and expression
+    /// domain failures in line-search exhaustion diagnostics.
+    #[test]
+    fn test_line_search_reports_insufficient_finite_decrease() {
+        for mode in test_modes() {
+            // At x=0.1, Newton's full correction for x^3-1 is about 33.3. The
+            // candidate remains finite but increases the residual substantially,
+            // so a one-trial budget must classify it as insufficient decrease.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::power(x, 3.0), Exp::val(1.0));
+            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
+                options.line_search_max_trials = 1
+            });
+            let initial = HashMap::from([("x".to_string(), 0.1)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("the finite full step must fail Armijo decrease");
+            match error {
+                SolverError::NoConvergence(diagnostic) => {
+                    assert!(diagnostic.message.contains("non-finite updates 0"));
+                    assert!(diagnostic.message.contains("non-finite residuals 0"));
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("insufficient Armijo decrease 1")
+                    );
+                    assert!(
+                        !diagnostic
+                            .message
+                            .contains("last finite candidate residual none")
+                    );
+                    assert_eq!(diagnostic.iterations, 0);
+                    assert_eq!(diagnostic.values["x"], 0.1);
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
