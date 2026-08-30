@@ -6,7 +6,8 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 - A symbolic expression tree (`Exp`) with ordinary arithmetic operators for
   building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
-- A dense matrix type with checked LU and Jacobi-SVD least squares (`Matrix`).
+- A dense matrix type with checked arithmetic and canonical Jacobi-SVD least
+  squares (`Matrix`).
 - A Newton-Raphson solver with transactional Armijo backtracking and explicit
   regularization (`NewtonRaphsonSolver`).
 

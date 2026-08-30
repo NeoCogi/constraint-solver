@@ -22,8 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Checked dense matrix operations, LU factorization, and permutation-invariant
-//! Jacobi-SVD least-squares solving.
+//! Checked dense matrix operations and permutation-invariant Jacobi-SVD
+//! least-squares solving.
 
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
@@ -141,19 +141,6 @@ pub enum MatrixError {
         /// Second dimension participating in the overflowing addition.
         right: usize,
     },
-    /// An algorithm that requires a square coefficient matrix received a
-    /// rectangular matrix.
-    NonSquare {
-        /// Stable name of the rejecting operation.
-        operation: &'static str,
-        /// Actual matrix shape as `(rows, columns)`.
-        matrix: (usize, usize),
-    },
-    /// A numerical tolerance was negative, NaN, or infinite.
-    InvalidTolerance {
-        /// Stable name of the operation whose tolerance was invalid.
-        operation: &'static str,
-    },
     /// A coefficient or right-hand-side input contained NaN or infinity before
     /// factorization began.
     NonFiniteInput {
@@ -161,12 +148,6 @@ pub enum MatrixError {
         operation: &'static str,
         /// Operand in which the invalid value was observed.
         operand: MatrixOperand,
-    },
-    /// A factorization encountered a pivot too small relative to its complete
-    /// coefficient-matrix scale to support a stable solve.
-    Singular {
-        /// Stable name of the factorization or solve that detected singularity.
-        operation: &'static str,
     },
     /// Factorization arithmetic produced or encountered a non-finite diagonal
     /// value.
@@ -252,19 +233,8 @@ impl fmt::Display for MatrixError {
                 f,
                 "Matrix dimension addition overflow during {operation}: {left} + {right}"
             ),
-            MatrixError::NonSquare { operation, matrix } => write!(
-                f,
-                "Matrix must be square for {operation}: received {}x{}",
-                matrix.0, matrix.1
-            ),
-            MatrixError::InvalidTolerance { operation } => {
-                write!(f, "Invalid numerical tolerance for {operation}")
-            }
             MatrixError::NonFiniteInput { operation, operand } => {
                 write!(f, "Non-finite {operand} supplied to {operation}")
-            }
-            MatrixError::Singular { operation } => {
-                write!(f, "Matrix is singular during {operation}")
             }
             MatrixError::NonFiniteFactor { operation } => {
                 write!(f, "Non-finite factor encountered during {operation}")
@@ -464,168 +434,6 @@ impl Matrix {
             }
         }
         result
-    }
-
-    /// Compute a partial-pivoting LU factorization using the default relative
-    /// singularity threshold.
-    pub fn lu_decomposition(&self) -> Result<(Matrix, Matrix, Vec<usize>), MatrixError> {
-        self.lu_decomposition_with_tolerance(1e-12)
-    }
-
-    /// Compute a partial-pivoting LU factorization with a caller-selected
-    /// non-negative finite relative pivot threshold.
-    pub fn lu_decomposition_with_tolerance(
-        &self,
-        singular_relative_epsilon: f64,
-    ) -> Result<(Matrix, Matrix, Vec<usize>), MatrixError> {
-        if self.rows != self.cols {
-            return Err(MatrixError::NonSquare {
-                operation: "lu_decomposition",
-                matrix: (self.rows, self.cols),
-            });
-        }
-        if !singular_relative_epsilon.is_finite() || singular_relative_epsilon < 0.0 {
-            return Err(MatrixError::InvalidTolerance {
-                operation: "lu_decomposition",
-            });
-        }
-        if !self.all_finite() {
-            return Err(MatrixError::NonFiniteInput {
-                operation: "lu_decomposition",
-                operand: MatrixOperand::CoefficientMatrix,
-            });
-        }
-
-        let n = self.rows;
-        let mut l = Matrix::identity(n);
-        let mut u = self.clone();
-        let mut pivot = (0..n).collect::<Vec<_>>();
-
-        // Use one factorization-wide reference scale for every pivot. Comparing
-        // a pivot only with its own trailing row makes the last non-zero pivot
-        // pass for every tolerance below one, even when it is negligible next
-        // to the rest of the coefficient matrix.
-        let matrix_scale = self
-            .data
-            .iter()
-            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
-        let singular_threshold = singular_relative_epsilon * matrix_scale;
-
-        for k in 0..n {
-            let mut max_val = 0.0;
-            let mut max_row = k;
-            for i in k..n {
-                let val = u[(i, k)].abs();
-                if val > max_val {
-                    max_val = val;
-                    max_row = i;
-                }
-            }
-
-            if max_val <= singular_threshold {
-                return Err(MatrixError::Singular {
-                    operation: "lu_decomposition",
-                });
-            }
-
-            if max_row != k {
-                pivot.swap(k, max_row);
-                for j in 0..n {
-                    let temp = u[(k, j)];
-                    u[(k, j)] = u[(max_row, j)];
-                    u[(max_row, j)] = temp;
-                }
-                for j in 0..k {
-                    let temp = l[(k, j)];
-                    l[(k, j)] = l[(max_row, j)];
-                    l[(max_row, j)] = temp;
-                }
-            }
-
-            for i in (k + 1)..n {
-                l[(i, k)] = u[(i, k)] / u[(k, k)];
-                if !l[(i, k)].is_finite() {
-                    return Err(MatrixError::NonFiniteFactor {
-                        operation: "lu_decomposition",
-                    });
-                }
-                for j in k..n {
-                    u[(i, j)] -= l[(i, k)] * u[(k, j)];
-                    if !u[(i, j)].is_finite() {
-                        return Err(MatrixError::NonFiniteFactor {
-                            operation: "lu_decomposition",
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok((l, u, pivot))
-    }
-
-    /// Solve a square system with partial-pivoting LU and the default relative
-    /// singularity threshold.
-    pub fn solve_lu(&self, b: &Matrix) -> Result<Matrix, MatrixError> {
-        self.solve_lu_with_tolerance(b, 1e-12)
-    }
-
-    /// Solve a square system against one column-vector right-hand side using a
-    /// caller-selected non-negative finite relative pivot threshold.
-    pub fn solve_lu_with_tolerance(
-        &self,
-        b: &Matrix,
-        singular_relative_epsilon: f64,
-    ) -> Result<Matrix, MatrixError> {
-        if self.rows != self.cols {
-            return Err(MatrixError::NonSquare {
-                operation: "solve_lu",
-                matrix: (self.rows, self.cols),
-            });
-        }
-        if b.rows != self.rows || b.cols != 1 {
-            return Err(MatrixError::DimensionMismatch {
-                operation: "solve_lu",
-                left: (self.rows, 1),
-                right: (b.rows, b.cols),
-            });
-        }
-        if !b.all_finite() {
-            return Err(MatrixError::NonFiniteInput {
-                operation: "solve_lu",
-                operand: MatrixOperand::RightHandSide,
-            });
-        }
-
-        let (l, u, pivot) = self.lu_decomposition_with_tolerance(singular_relative_epsilon)?;
-
-        let mut pb = Matrix::new(b.rows, 1);
-        for i in 0..b.rows {
-            pb[(i, 0)] = b[(pivot[i], 0)];
-        }
-
-        let mut y = Matrix::new(self.rows, 1);
-        for i in 0..self.rows {
-            y[(i, 0)] = pb[(i, 0)];
-            for j in 0..i {
-                y[(i, 0)] -= l[(i, j)] * y[(j, 0)];
-            }
-        }
-
-        let mut x = Matrix::new(self.rows, 1);
-        for i in (0..self.rows).rev() {
-            x[(i, 0)] = y[(i, 0)];
-            for j in (i + 1)..self.rows {
-                x[(i, 0)] -= u[(i, j)] * x[(j, 0)];
-            }
-            x[(i, 0)] /= u[(i, i)];
-            if !x[(i, 0)].is_finite() {
-                return Err(MatrixError::NonFiniteResult {
-                    operation: "solve_lu",
-                });
-            }
-        }
-
-        Ok(x)
     }
 
     /// Solve a possibly rectangular least-squares problem by canonical SVD.
@@ -1430,20 +1238,13 @@ mod tests {
         assert!(!with_infinity.all_finite());
     }
 
-    /// Ensure checked factorization APIs reject invalid operands through their
-    /// error channel rather than returning successful matrices containing NaN.
+    /// Ensure the checked factorization API rejects invalid operands through
+    /// its error channel rather than returning a solution containing NaN.
     #[test]
-    fn test_linear_solvers_reject_non_finite_inputs() {
+    fn test_least_squares_rejects_non_finite_inputs() {
         let identity = Matrix::identity(2);
         let nan_rhs = Matrix::from_vec(vec![f64::NAN, 1.0], 2, 1).unwrap();
 
-        assert_eq!(
-            identity.solve_lu(&nan_rhs).unwrap_err(),
-            MatrixError::NonFiniteInput {
-                operation: "solve_lu",
-                operand: MatrixOperand::RightHandSide,
-            }
-        );
         assert_eq!(
             identity.solve_least_squares(&nan_rhs).unwrap_err(),
             MatrixError::NonFiniteInput {
@@ -1454,13 +1255,6 @@ mod tests {
 
         let nan_coefficient = Matrix::from_vec(vec![1.0, f64::NAN, 0.0, 1.0], 2, 2).unwrap();
         let finite_rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
-        assert_eq!(
-            nan_coefficient.solve_lu(&finite_rhs).unwrap_err(),
-            MatrixError::NonFiniteInput {
-                operation: "lu_decomposition",
-                operand: MatrixOperand::CoefficientMatrix,
-            }
-        );
         assert_eq!(
             nan_coefficient
                 .solve_least_squares(&finite_rhs)
@@ -1475,18 +1269,10 @@ mod tests {
     /// Confirm that arithmetic overflow from otherwise finite solve operands is
     /// reported explicitly instead of escaping inside an `Ok(Matrix)` value.
     #[test]
-    fn test_linear_solvers_reject_non_finite_results() {
+    fn test_least_squares_rejects_non_finite_results() {
         let tiny_coefficient = Matrix::from_vec(vec![1e-308], 1, 1).unwrap();
         let huge_rhs = Matrix::from_vec(vec![f64::MAX], 1, 1).unwrap();
 
-        assert_eq!(
-            tiny_coefficient
-                .solve_lu_with_tolerance(&huge_rhs, 0.0)
-                .unwrap_err(),
-            MatrixError::NonFiniteResult {
-                operation: "solve_lu",
-            }
-        );
         assert_eq!(
             tiny_coefficient.solve_least_squares(&huge_rhs).unwrap_err(),
             MatrixError::NonFiniteResult {
@@ -1619,84 +1405,6 @@ mod tests {
         let t_serial = a.transpose_with_parallel(false);
         let t_parallel = a.transpose_with_parallel(true);
         assert_matrix_close(&t_serial, &t_parallel, 0.0);
-    }
-
-    /// Verify that LU performs a row interchange when the leading pivot is
-    /// zero and reconstructs the right-hand side in either execution mode.
-    #[test]
-    fn test_lu_solve() {
-        // A zero leading coefficient makes a row interchange mandatory before
-        // elimination can proceed.
-        let a = Matrix::from_vec(vec![0.0, 1.0, 1.0, 0.0], 2, 2).unwrap();
-        let b = Matrix::from_vec(vec![2.0, 1.0], 2, 1).unwrap();
-
-        let x = a.solve_lu(&b).unwrap();
-
-        // Check the known coordinates before reconstructing b so compensating
-        // errors cannot satisfy only the product assertion.
-        assert!((x[(0, 0)] - 1.0).abs() < 1e-10);
-        assert!((x[(1, 0)] - 2.0).abs() < 1e-10);
-        let verify_serial = a.try_mul_with_parallel(&x, false).unwrap();
-        let verify_parallel = a.try_mul_with_parallel(&x, true).unwrap();
-        assert_matrix_close(&verify_serial, &verify_parallel, 0.0);
-
-        assert!((verify_serial[(0, 0)] - b[(0, 0)]).abs() < 1e-10);
-        assert!((verify_serial[(1, 0)] - b[(1, 0)]).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_lu_solve_is_scale_invariant() {
-        let a = Matrix::from_vec(vec![2.0, 1.0, 3.0, 4.0], 2, 2).unwrap();
-        let b = Matrix::from_vec(vec![5.0, 11.0], 2, 1).unwrap();
-
-        let x = a.solve_lu(&b).unwrap();
-
-        let scale = 1e-12;
-        let a_scaled = &a * scale;
-        let b_scaled = &b * scale;
-
-        let x_scaled = a_scaled.solve_lu(&b_scaled).unwrap();
-        assert!((x_scaled[(0, 0)] - x[(0, 0)]).abs() < 1e-8);
-        assert!((x_scaled[(1, 0)] - x[(1, 0)]).abs() < 1e-8);
-    }
-
-    /// Accept a non-zero final pivot when it remains above the default
-    /// matrix-relative LU threshold.
-    #[test]
-    fn test_lu_solves_nearly_singular_system_above_tolerance() {
-        // Construct b from the exact solution [1, 1]. The small determinant
-        // exercises tolerance handling without asking LU to classify the
-        // matrix as singular under its documented default.
-        let a = Matrix::from_vec(vec![1.0, 1.0, 1.0, 1.0 + 1e-12], 2, 2).unwrap();
-        let b = Matrix::from_vec(vec![2.0, 2.0 + 1e-12], 2, 1).unwrap();
-        let x = a
-            .solve_lu(&b)
-            .expect("a finite pivot above the relative threshold is solvable");
-
-        assert!((x[(0, 0)] - 1.0).abs() < 1e-6);
-        assert!((x[(1, 0)] - 1.0).abs() < 1e-6);
-        let reconstructed = a.try_mul(&x).expect("matrix shapes are compatible");
-        assert_matrix_close(&reconstructed, &b, 1e-12);
-    }
-
-    /// Verify that the caller's LU tolerance applies to every pivot relative to
-    /// the complete coefficient scale, including the final diagonal.
-    #[test]
-    fn test_lu_tolerance_rejects_small_final_pivot() {
-        // The old trailing-row comparison divided the last pivot by itself, so
-        // this matrix was accepted for every epsilon below one despite its
-        // twenty-order diagonal scale separation.
-        let matrix = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-20], 2, 2).unwrap();
-        let error = matrix
-            .lu_decomposition_with_tolerance(0.5)
-            .expect_err("the final pivot is small relative to the matrix scale");
-
-        assert_eq!(
-            error,
-            MatrixError::Singular {
-                operation: "lu_decomposition",
-            }
-        );
     }
 
     #[test]
@@ -2207,37 +1915,5 @@ mod tests {
         }));
         assert!(mutation.is_err());
         assert_eq!(matrix[(1, 0)], 3.0);
-    }
-
-    /// Confirm that LU shape, tolerance, and singularity failures use distinct
-    /// structured variants rather than unrelated error strings.
-    #[test]
-    fn test_lu_reports_structured_errors() {
-        let rectangular = Matrix::new(2, 3);
-        assert_eq!(
-            rectangular.lu_decomposition().unwrap_err(),
-            MatrixError::NonSquare {
-                operation: "lu_decomposition",
-                matrix: (2, 3),
-            }
-        );
-
-        let identity = Matrix::identity(2);
-        assert_eq!(
-            identity
-                .lu_decomposition_with_tolerance(f64::NAN)
-                .unwrap_err(),
-            MatrixError::InvalidTolerance {
-                operation: "lu_decomposition",
-            }
-        );
-
-        let singular = Matrix::from_vec(vec![1.0, 2.0, 2.0, 4.0], 2, 2).unwrap();
-        assert_eq!(
-            singular.lu_decomposition().unwrap_err(),
-            MatrixError::Singular {
-                operation: "lu_decomposition",
-            }
-        );
     }
 }

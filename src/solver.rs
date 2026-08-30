@@ -3525,8 +3525,8 @@ mod tests {
             let is_serial = matches!(mode, Mode::Serial);
 
             // Both equations describe the same line. Their 2-by-2 Jacobian is
-            // exactly rank one, so LU must reject it while the Moore-Penrose
-            // correction selects x = y = 1/2 from the zero initial point.
+            // exactly rank one, so the Moore-Penrose correction selects
+            // x = y = 1/2 from the zero initial point.
             let x = Exp::var("x");
             let y = Exp::var("y");
             let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
@@ -3569,8 +3569,8 @@ mod tests {
     fn test_ill_conditioned_square_system_uses_regularized_least_squares() {
         for mode in test_modes() {
             // This upper-triangular Jacobian has unit diagonal pivots but a
-            // condition estimate around 1e16. LU previously accepted it and
-            // jumped to the exact root, bypassing the configured ridge policy.
+            // condition estimate around 1e16. A direct square solve would jump
+            // to the exact root and bypass the configured ridge policy.
             let x = Exp::var("x");
             let y = Exp::var("y");
             let first_equation = Exp::sub(

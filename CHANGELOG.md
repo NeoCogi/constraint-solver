@@ -93,7 +93,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Corrected the documented `f64` scalar scope, factorization allocation
-  behavior, underdetermined policy, line-search example, and LU pivot scale.
+  behavior, underdetermined policy, and line-search example.
 - Replaced self-comparison in randomized Jacobian coverage with an analytical
   oracle and added a headless end-to-end solve for the graphical IK model.
 - Preserved structured `MatrixError` values through contextual
@@ -121,8 +121,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   coefficient normalization also prevents finite extreme-scale systems from
   overflowing during factorization, including cases whose unscaled largest
   singular value exceeds `f64::MAX` while the final solution remains finite.
-- Corrected LU pivot classification so every pivot, including the final one,
-  is compared against the complete coefficient-matrix scale.
 - Returned `MatrixError::AllocationFailed` from fallible construction instead
   of panicking when an otherwise valid shape cannot reserve storage.
 - Stopped preallocating convergence history from an untrusted iteration limit;
