@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.3.0] - 2026-08-29
 
 ### Added
@@ -24,8 +26,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scales define dimensionless residual weighting and success, while variable
   scales normalize Jacobian columns, corrections, and ridge penalties without
   changing caller-visible values.
-- Added structured matrix errors for invalid shapes and tolerances, overflowing
-  dimensions, allocation failure, non-finite states, and failed convergence.
+- Added structured matrix errors for invalid shapes, overflowing dimensions,
+  allocation failure, non-finite states, and failed convergence.
 - Added executable crate documentation, compiled README examples, complete
   public API documentation, and the `missing_docs` lint.
 - Added an explicit package allowlist so repository workflows, ignore rules,
@@ -50,6 +52,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dispatcher with one canonical `solve_least_squares` SVD operation returning a
   diagnostic result. Compatibility aliases from the pre-alpha API were
   intentionally removed.
+- Removed the standalone LU decomposition and solve API together with its
+  exclusive error variants and tests. Canonical Jacobi SVD is now the only
+  maintained matrix factorization policy.
 - Unified nonlinear Jacobian correction policy across every shape and rank.
   The SVD pseudoinverse supplies direct corrections, while ridge regularization
   remains explicitly caller-selected.
