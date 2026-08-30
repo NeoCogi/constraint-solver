@@ -25,9 +25,11 @@ SOFTWARE.
 //! Time-varying electronic systems built on the shared smooth MNA device layer.
 
 mod common;
+#[path = "common/electronics.rs"]
+mod electronics;
 
-use common::electronics::{BjtModel, Circuit, DiodeModel, MosSwitchModel, Trace};
-use common::{TRANSIENT_STEPS, sample_time};
+use common::{TRANSIENT_STEPS, Trace, sample_time};
+use electronics::{BjtModel, Circuit, DiodeModel, MosSwitchModel};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 

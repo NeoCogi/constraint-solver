@@ -26,6 +26,7 @@ SOFTWARE.
 //! tests. These models favor smooth, deterministic solver validation over the
 //! exhaustive device behavior of a production circuit simulator.
 
+use crate::common::Sample;
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError};
 use std::collections::{BTreeMap, HashMap};
 
@@ -364,104 +365,6 @@ impl CircuitSimulation {
         self.state.extend(parameters);
         let solution = self.solver.solve(self.state.clone())?;
         self.state = solution.values.clone();
-        Ok(Sample {
-            time,
-            values: solution.values,
-        })
-    }
-}
-
-/// One accepted operating point in a transient validation trace.
-pub struct Sample {
-    /// Simulation time in seconds.
-    pub time: f64,
-    /// Known source values and solved node voltages at this time.
-    values: HashMap<String, f64>,
-}
-
-impl Sample {
-    /// Return one named voltage or known source value from this sample.
-    pub fn value(&self, name: &str) -> f64 {
-        // Test fixtures use only compiled names, so a missing value identifies
-        // a malformed trace immediately rather than returning an optional value.
-        self.values[name]
-    }
-}
-
-/// Ordered collection of accepted transient samples.
-#[derive(Default)]
-pub struct Trace {
-    /// Samples in monotonically increasing simulation-time order.
-    samples: Vec<Sample>,
-}
-
-impl Trace {
-    /// Append one accepted operating point.
-    pub fn push(&mut self, sample: Sample) {
-        // Callers generate time monotonically; preserving insertion order keeps
-        // waveform inspection and covariance calculations straightforward.
-        self.samples.push(sample);
-    }
-
-    /// Borrow every sample in chronological order.
-    pub fn samples(&self) -> &[Sample] {
-        // Expose immutable samples so assertions cannot invalidate trace order.
-        &self.samples
-    }
-
-    /// Return the peak-to-peak range of one named waveform.
-    pub fn span(&self, name: &str) -> f64 {
-        // The real-world tests always produce 100 points, so infinities are
-        // safe initial extrema and make an accidental empty trace conspicuous.
-        let minimum = self
-            .samples
-            .iter()
-            .map(|sample| sample.value(name))
-            .fold(f64::INFINITY, f64::min);
-        let maximum = self
-            .samples
-            .iter()
-            .map(|sample| sample.value(name))
-            .fold(f64::NEG_INFINITY, f64::max);
-        maximum - minimum
-    }
-
-    /// Return the ordinary covariance between two sampled waveforms.
-    pub fn covariance(&self, first: &str, second: &str) -> f64 {
-        // Covariance sign provides a robust phase-polarity assertion without
-        // depending on the exact compact-model gain at an individual sample.
-        let count = self.samples.len() as f64;
-        let first_mean = self
-            .samples
-            .iter()
-            .map(|sample| sample.value(first))
-            .sum::<f64>()
-            / count;
-        let second_mean = self
-            .samples
-            .iter()
-            .map(|sample| sample.value(second))
-            .sum::<f64>()
-            / count;
-        self.samples
-            .iter()
-            .map(|sample| (sample.value(first) - first_mean) * (sample.value(second) - second_mean))
-            .sum::<f64>()
-            / count
-    }
-
-    /// Print every requested waveform as CSV when tests run with output shown.
-    pub fn print(&self, label: &str, names: &[&str]) {
-        // Successful test output is captured by default; `-- --show-output`
-        // turns these traces into directly inspectable 100-step simulations.
-        println!("{label}: time,{}", names.join(","));
-        for sample in &self.samples {
-            let values = names
-                .iter()
-                .map(|name| format!("{:.9}", sample.value(name)))
-                .collect::<Vec<_>>()
-                .join(",");
-            println!("{:.9},{values}", sample.time);
-        }
+        Ok(Sample::new(time, solution.values))
     }
 }
