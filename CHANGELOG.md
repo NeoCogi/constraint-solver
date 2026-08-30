@@ -110,11 +110,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   residual, gradient, equation-trace, iteration, and prior-attempt state.
   Already-computed gradient measures are also retained in every
   `NoConvergence` diagnostic.
-- Prevented norm, column-scaled stationarity, line-search slope, Jacobian
-  normalization, physical update, and SVD scale-restoration calculations from
-  overflowing or underflowing at extreme finite scales. Products and quotients
-  now share one exponent-scaled arithmetic policy instead of choosing ad-hoc
-  source-code associations.
+- Prevented avoidable intermediate range failures in norms, column-scaled
+  stationarity, line-search slopes, Jacobian normalization, physical updates,
+  matrix products, and SVD projection and reconstruction when their completed
+  `f64` results are representable. Products, quotients, and critical reductions
+  now share one exponent-scaled compensated policy; ordinary `f64` rounding is
+  retained rather than claiming arbitrary-precision cancellation.
 - Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
   algebraically independent small-coefficient directions above factorization
   roundoff, preventing repeated zero corrections on solvable systems.

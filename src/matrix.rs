@@ -129,7 +129,7 @@ pub enum MatrixError {
         /// Operand in which the invalid value was observed.
         operand: MatrixOperand,
     },
-    /// Factorization arithmetic produced or encountered a non-finite diagonal
+    /// Factorization arithmetic produced or encountered a non-finite internal
     /// value.
     NonFiniteFactor {
         /// Stable name of the factorization or solve that detected the value.

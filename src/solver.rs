@@ -277,8 +277,9 @@ pub struct Solution {
     /// Successful linearized solve attempt that produced the most recent
     /// accepted update represented by this solution.
     ///
-    /// `None` means the initial point required no factorization or the first
-    /// attempted factorization failed before producing diagnostics.
+    /// `None` means the initial point already satisfied the root tolerance and
+    /// therefore required no linearized solve. A failed factorization returns a
+    /// [`SolverError`] and cannot produce `Solution`.
     pub last_linear_attempt: Option<LinearSolveDiagnostic>,
     /// Scaled residual norms for the initial point and each accepted update
     /// through the returned point.
@@ -313,8 +314,9 @@ pub struct EquationDiagnostic {
 /// Numerical provenance for one successful linearized solve attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
-    /// Rank and condition estimate from the SVD of the equation- and variable-
-    /// scaled Jacobian that produced the normalized correction.
+    /// Rank and condition estimate from the matrix actually factorized to
+    /// produce the normalized correction: either the equation- and variable-
+    /// scaled Jacobian or its augmented `[J; sqrt(lambda) I]` ridge system.
     pub effective: LeastSquaresInfo,
     /// Explicit ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or
     /// `None` when the direct Jacobian was solved.
