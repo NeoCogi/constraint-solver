@@ -26,8 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scales define dimensionless residual weighting and success, while variable
   scales normalize Jacobian columns, corrections, and ridge penalties without
   changing caller-visible values.
-- Added structured matrix errors for invalid shapes, overflowing dimensions,
-  allocation failure, non-finite states, and failed convergence.
+- Added structured matrix errors for recoverable operand-shape mismatches,
+  non-finite states, and failed convergence. Fatal dimension or allocation
+  failures panic with the requested matrix shape.
 - Added executable crate documentation, compiled README examples, complete
   public API documentation, and the `missing_docs` lint.
 - Added an explicit package allowlist so repository workflows, ignore rules,
@@ -132,12 +133,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Scaled right-hand sides before compensated singular-vector projection so
   large intermediate terms cannot overflow when cancellation leaves a finite
   least-squares solution.
-- Returned `MatrixError::AllocationFailed` from fallible construction instead
-  of panicking when an otherwise valid shape cannot reserve storage.
 - Stopped preallocating convergence history from an untrusted iteration limit;
   history now grows only as accepted updates are observed.
 - Checked all derived matrix element counts and augmented-system row counts
-  before allocation, including products involving zero-sized operands.
+  before allocation, with explicit fatal diagnostics for impossible shapes.
 - Returned immediately from transpose and multiplication when their checked
   result has zero storage, so valid shapes such as `usize::MAX x 0` do not loop
   over logical dimensions that contain no elements.
@@ -157,9 +156,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Documented exact symbolic differentiation at domain boundaries and added a
   regression distinguishing a non-finite written derivative from a safe
   algebraic rewrite; no hidden finite-difference fallback is performed.
-- Corrected the Matrix documentation to distinguish shape and allocation checks
-  in general arithmetic from the stricter finite-value contract enforced by
-  factorization and solver boundaries.
+- Corrected the Matrix documentation to distinguish recoverable operand-shape
+  errors, fatal resource failures, general arithmetic, and the stricter
+  finite-value contract enforced by factorization and solver boundaries.
 - Made every headless example assert its known numerical outcome and removed a
   duplicated legacy matrix-test module with stale nonlinear-LU assumptions.
 - Hardened the GLFW inverse-kinematics example's failure reporting, recovery,

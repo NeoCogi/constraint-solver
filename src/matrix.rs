@@ -22,14 +22,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Dense matrix operations with checked shapes and allocations, plus
+//! Dense matrix operations with checked recoverable shapes and
 //! permutation-invariant Jacobi-SVD least-squares solving.
 //!
 //! General arithmetic follows ordinary IEEE-754 `f64` semantics and can
-//! therefore produce NaN or infinity. Its fallible methods report structural
-//! and allocation failures; callers that require finite arithmetic results can
-//! verify them with [`Matrix::all_finite`]. The least-squares solver enforces a
-//! stricter contract and rejects non-finite inputs, factors, and results.
+//! therefore produce NaN or infinity. Its fallible methods report recoverable
+//! operand mismatches; impossible dimensions and allocation exhaustion are
+//! fatal and panic with the requested shape. Callers that require finite
+//! arithmetic results can verify them with [`Matrix::all_finite`]. The
+//! least-squares solver enforces a stricter contract and rejects non-finite
+//! inputs, factors, and results.
 
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
@@ -91,8 +93,8 @@ fn numerical_rank_relative_tolerance(rows: usize, cols: usize) -> f64 {
     f64::EPSILON * rows.max(cols) as f64
 }
 
-/// Structured failure returned by all fallible matrix construction and linear
-/// algebra operations.
+/// Structured recoverable failure returned by matrix and linear-algebra
+/// operations.
 ///
 /// Variants retain machine-readable dimensions and operation names so callers
 /// no longer need to parse unrelated ad-hoc strings from factorization routines.
@@ -118,34 +120,6 @@ pub enum MatrixError {
         expected: usize,
         /// Actual number of supplied elements.
         actual: usize,
-    },
-    /// Multiplying the requested dimensions overflowed `usize`, so the shape
-    /// cannot be represented by the contiguous matrix storage.
-    ElementCountOverflow {
-        /// Requested row count.
-        rows: usize,
-        /// Requested column count.
-        cols: usize,
-    },
-    /// The element count fit in `usize`, but contiguous storage could not be
-    /// reserved for the requested matrix.
-    AllocationFailed {
-        /// Requested row count.
-        rows: usize,
-        /// Requested column count.
-        cols: usize,
-        /// Number of `f64` elements that the allocation would contain.
-        elements: usize,
-    },
-    /// Adding logical dimensions overflowed `usize` before a matrix shape could
-    /// be constructed.
-    DimensionSumOverflow {
-        /// Stable name of the operation assembling the combined dimension.
-        operation: &'static str,
-        /// First dimension participating in the overflowing addition.
-        left: usize,
-        /// Second dimension participating in the overflowing addition.
-        right: usize,
     },
     /// A coefficient or right-hand-side input contained NaN or infinity before
     /// factorization began.
@@ -218,26 +192,6 @@ impl fmt::Display for MatrixError {
             } => write!(
                 f,
                 "Matrix data length mismatch for shape {rows}x{cols}: expected {expected}, got {actual}"
-            ),
-            MatrixError::ElementCountOverflow { rows, cols } => write!(
-                f,
-                "Matrix shape {rows}x{cols} exceeds the addressable element count"
-            ),
-            MatrixError::AllocationFailed {
-                rows,
-                cols,
-                elements,
-            } => write!(
-                f,
-                "Could not allocate {elements} elements for matrix shape {rows}x{cols}"
-            ),
-            MatrixError::DimensionSumOverflow {
-                operation,
-                left,
-                right,
-            } => write!(
-                f,
-                "Matrix dimension addition overflow during {operation}: {left} + {right}"
             ),
             MatrixError::NonFiniteInput { operation, operand } => {
                 write!(f, "Non-finite {operand} supplied to {operation}")
@@ -320,52 +274,49 @@ impl Matrix {
     ///
     /// # Panics
     ///
-    /// Panics if `rows * cols` cannot be represented by `usize`, or if the
-    /// allocator cannot satisfy the resulting request.
+    /// Panics with the requested shape if `rows * cols` cannot be represented by
+    /// `usize` or contiguous storage cannot be reserved. Such failures are fatal
+    /// resource errors rather than recoverable numerical outcomes.
+    #[track_caller]
     pub fn new(rows: usize, cols: usize) -> Self {
-        // Preserve the convenient infallible constructor for statically known
-        // internal shapes while routing all validation through `try_new`.
-        // Callers handling untrusted dimensions can use the fallible API below.
-        Self::try_new(rows, cols).unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    /// Allocate a zero-filled matrix with a fully validated shape.
-    ///
-    /// Unlike [`Matrix::new`], this constructor reports both dimension overflow
-    /// and storage-reservation failure as structured errors.
-    pub fn try_new(rows: usize, cols: usize) -> Result<Self, MatrixError> {
-        // Detect dimension arithmetic overflow explicitly; allowing release-mode
-        // wrapping would create storage inconsistent with the public shape.
+        // Check the logical shape before touching the allocator so the panic
+        // explains the caller's dimensions instead of reporting a later vector
+        // capacity failure without matrix context.
         let element_count = rows
             .checked_mul(cols)
-            .ok_or(MatrixError::ElementCountOverflow { rows, cols })?;
+            .unwrap_or_else(|| panic!("matrix shape {rows}x{cols} overflows usize element count"));
 
-        // Reserve fallibly before initializing elements. `vec![value; len]`
-        // uses an infallible capacity path and therefore panics for shapes such
-        // as `usize::MAX x 1`, even though their element-count multiplication
-        // itself does not overflow.
+        // Use `try_reserve_exact` only to replace opaque allocator diagnostics
+        // with the requested shape and concrete reservation cause. The public
+        // operation still panics because no useful matrix result exists.
         let mut data = Vec::new();
         data.try_reserve_exact(element_count)
-            .map_err(|_| MatrixError::AllocationFailed {
-                rows,
-                cols,
-                elements: element_count,
-            })?;
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot allocate {element_count} f64 elements for matrix shape {rows}x{cols}: {error}"
+                )
+            });
         // The exact reservation above guarantees that zero initialization does
         // not need another allocation attempt.
         data.resize(element_count, 0.0);
 
-        Ok(Matrix { data, rows, cols })
+        Matrix { data, rows, cols }
     }
 
     /// Construct a row-major matrix from an owned element buffer.
     ///
-    /// Returns structured errors when the requested element count overflows or
-    /// the supplied buffer length does not exactly match the shape.
+    /// Returns a structured error when the supplied buffer length does not
+    /// exactly match the shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `rows * cols` overflows `usize`. The owned buffer cannot
+    /// represent such a logical shape, so there is no recoverable matrix value.
+    #[track_caller]
     pub fn from_vec(data: Vec<f64>, rows: usize, cols: usize) -> Result<Self, MatrixError> {
         let expected = rows
             .checked_mul(cols)
-            .ok_or(MatrixError::ElementCountOverflow { rows, cols })?;
+            .unwrap_or_else(|| panic!("matrix shape {rows}x{cols} overflows usize element count"));
         if data.len() != expected {
             return Err(MatrixError::InvalidDataLength {
                 rows,
@@ -378,6 +329,12 @@ impl Matrix {
     }
 
     /// Construct a square identity matrix of the requested size.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the requested square shape when its element count or storage
+    /// cannot be represented.
+    #[track_caller]
     pub fn identity(size: usize) -> Self {
         // Begin with zero storage, then set exactly the main diagonal to one.
         let mut m = Matrix::new(size, size);
@@ -401,6 +358,12 @@ impl Matrix {
     }
 
     /// Return a serially computed transpose of this matrix.
+    ///
+    /// # Panics
+    ///
+    /// Panics when storage for a second matrix of the same element count cannot
+    /// be reserved.
+    #[track_caller]
     pub fn transpose(&self) -> Matrix {
         // Route through the mode-aware implementation so the two paths share
         // allocation, indexing, and empty-shape semantics.
@@ -409,6 +372,12 @@ impl Matrix {
 
     /// Return the transpose while optionally parallelizing a sufficiently large
     /// element copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when storage for a second matrix of the same element count cannot
+    /// be reserved.
+    #[track_caller]
     pub fn transpose_with_parallel(&self, parallel: bool) -> Matrix {
         // The transposed shape reverses the logical dimensions while preserving
         // the same total element count.
@@ -450,6 +419,13 @@ impl Matrix {
     /// and solution makes rank invariant under column permutation and avoids a
     /// competing factorization policy whose intermediate arithmetic could fail
     /// on otherwise representable systems.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the requested workspace or result shape if its dimensions or
+    /// storage cannot be represented. Numerical and operand-shape failures are
+    /// returned through [`MatrixError`].
+    #[track_caller]
     pub fn solve_least_squares(&self, b: &Matrix) -> Result<LeastSquaresSolution, MatrixError> {
         // Validate the vector shape before the factorization reads it. The
         // solve API intentionally accepts one right-hand side so its
@@ -497,7 +473,7 @@ impl Matrix {
         // rows, so preserve the fallible solve contract while allocating it.
         if n == 0 || m == 0 {
             return Ok(LeastSquaresSolution {
-                solution: Matrix::try_new(n, 1)?,
+                solution: Matrix::new(n, 1),
                 info: LeastSquaresInfo {
                     rank: 0,
                     cond_est: f64::INFINITY,
@@ -559,13 +535,13 @@ impl Matrix {
 
         // Decomposing A^T for a wide system keeps the Jacobi kernel compact and
         // avoids manufacturing zero singular columns merely to make A tall.
-        // Build either orientation through the checked constructor instead of
-        // using `Clone` or the infallible public transpose operation: every
-        // allocation beneath this `Result`-returning API must remain observable
-        // as `MatrixError::AllocationFailed`.
+        // Build either orientation directly instead of cloning or invoking the
+        // public transpose, keeping normalization and orientation in one pass.
+        // Fatal storage exhaustion is reported by `Matrix::new` with this
+        // requested factor shape.
         let factor_rows = rows.max(cols);
         let factor_cols = rows.min(cols);
-        let mut factor_input = Matrix::try_new(factor_rows, factor_cols)?;
+        let mut factor_input = Matrix::new(factor_rows, factor_cols);
         if tall_orientation {
             // Combine the copy and coefficient normalization into one pass so
             // the owned Jacobi workspace is the only duplicate of A.
@@ -610,24 +586,16 @@ impl Matrix {
         } else {
             max_singular_value / min_retained_singular_value
         };
-        // Allocate the public result through the same checked path as every
-        // factorization workspace so memory failure cannot escape by panic.
-        let mut solution = Matrix::try_new(cols, 1)?;
+        // Allocate the public result once. Fatal storage failure includes this
+        // exact output shape in the constructor's caller-aware panic.
+        let mut solution = Matrix::new(cols, 1);
 
         // Project the right-hand side onto every retained singular direction
         // without converting those intermediate coordinates back to `f64`.
         // A projection may exceed the scalar exponent range even when division
         // by its singular value and reconstruction produce finite variables.
         let component_count = decomposition.singular_values.len();
-        let mut projections = Vec::new();
-        projections
-            .try_reserve_exact(component_count)
-            .map_err(|_| MatrixError::AllocationFailed {
-                rows: component_count,
-                cols: 1,
-                elements: component_count,
-            })?;
-        projections.resize(component_count, ScaledValue::ZERO);
+        let mut projections = vec![ScaledValue::ZERO; component_count];
         for (component, projection) in projections.iter_mut().enumerate() {
             let singular_value = decomposition.singular_values[component];
             if singular_value <= rank_tolerance {
@@ -717,11 +685,11 @@ impl Matrix {
 
         // Take ownership of the normalized factor input so the Jacobi kernel
         // can rotate it in place without a second full-matrix clone. The right
-        // singular-vector basis is also allocated fallibly because an existing
-        // source matrix does not guarantee enough memory for another workspace.
+        // singular-vector basis is a required factorization workspace; fatal
+        // allocation failure reports its square shape through `Matrix::new`.
         let row_count = orthogonal_columns.rows;
         let column_count = orthogonal_columns.cols;
-        let mut right_vectors = Matrix::try_new(column_count, column_count)?;
+        let mut right_vectors = Matrix::new(column_count, column_count);
         for diagonal in 0..column_count {
             right_vectors[(diagonal, diagonal)] = 1.0;
         }
@@ -871,18 +839,10 @@ impl Matrix {
 
         // Column norms are the singular values after orthogonalization. Repeated
         // `hypot` calls avoid overflow and underflow in the sum of squares.
-        // A `Vec::with_capacity` panic would violate the surrounding fallible
-        // factorization contract. Reserve the compact singular-value buffer
-        // explicitly and map any capacity or allocator failure to the same
-        // structured matrix allocation error used by dense workspaces.
-        let mut singular_values = Vec::new();
-        singular_values
-            .try_reserve_exact(column_count)
-            .map_err(|_| MatrixError::AllocationFailed {
-                rows: column_count,
-                cols: 1,
-                elements: column_count,
-            })?;
+        // The compact singular-value vector is required to complete the
+        // factorization. Like other fatal Rust allocation failures, inability
+        // to reserve it terminates at this allocation site.
+        let mut singular_values = Vec::with_capacity(column_count);
         for column in 0..column_count {
             let mut singular_value = 0.0_f64;
             for row in 0..row_count {
@@ -1006,10 +966,15 @@ impl Matrix {
 
     /// Add two identically shaped matrices element by element.
     ///
-    /// This method checks the operand shapes and result allocation. Element
-    /// arithmetic follows ordinary IEEE-754 `f64` semantics, so overflow or
-    /// invalid operands can produce a non-finite value in the returned matrix;
-    /// use [`Matrix::all_finite`] when finite output is required.
+    /// This method reports operand-shape mismatches. Element arithmetic follows
+    /// ordinary IEEE-754 `f64` semantics, so overflow or invalid operands can
+    /// produce a non-finite value in the returned matrix; use
+    /// [`Matrix::all_finite`] when finite output is required.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the result shape when its storage cannot be allocated.
+    #[track_caller]
     pub fn try_add(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Elementwise arithmetic has no meaningful broadcasting in this dense
         // API, so require both dimensions to match exactly.
@@ -1021,10 +986,9 @@ impl Matrix {
             });
         }
 
-        // Preserve the fallible contract through result allocation. This can
-        // fail under memory pressure even though both existing operands have a
-        // valid and identical shape.
-        let mut result = Matrix::try_new(self.rows, self.cols)?;
+        // Allocate the known result shape after recoverable validation. Fatal
+        // resource failures identify this caller and shape through `new`.
+        let mut result = Matrix::new(self.rows, self.cols);
         for i in 0..self.data.len() {
             result.data[i] = self.data[i] + rhs.data[i];
         }
@@ -1033,10 +997,15 @@ impl Matrix {
 
     /// Subtract an identically shaped right-hand matrix element by element.
     ///
-    /// This method checks the operand shapes and result allocation. Element
-    /// arithmetic follows ordinary IEEE-754 `f64` semantics, so overflow or
-    /// invalid operands can produce a non-finite value in the returned matrix;
-    /// use [`Matrix::all_finite`] when finite output is required.
+    /// This method reports operand-shape mismatches. Element arithmetic follows
+    /// ordinary IEEE-754 `f64` semantics, so overflow or invalid operands can
+    /// produce a non-finite value in the returned matrix; use
+    /// [`Matrix::all_finite`] when finite output is required.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the result shape when its storage cannot be allocated.
+    #[track_caller]
     pub fn try_sub(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Preserve the same strict shape contract as addition before allocating
         // the result buffer.
@@ -1048,10 +1017,9 @@ impl Matrix {
             });
         }
 
-        // Allocate through the checked constructor for the same reason as
-        // addition: a shape- and allocation-checked method must not panic while
-        // creating its output buffer.
-        let mut result = Matrix::try_new(self.rows, self.cols)?;
+        // Allocate only after shape validation. Resource exhaustion is fatal and
+        // reports this result shape rather than masquerading as operand misuse.
+        let mut result = Matrix::new(self.rows, self.cols);
         for i in 0..self.data.len() {
             result.data[i] = self.data[i] - rhs.data[i];
         }
@@ -1060,10 +1028,15 @@ impl Matrix {
 
     /// Multiply two shape-compatible matrices serially.
     ///
-    /// This method checks the operand shapes and result allocation. Scalar
-    /// multiplication and accumulation follow ordinary IEEE-754 `f64`
-    /// semantics and can produce non-finite output; use [`Matrix::all_finite`]
-    /// when finite output is required.
+    /// This method reports operand-shape mismatches. Each output cell uses the
+    /// crate's scaled compensated product sum and is converted to `f64` only
+    /// after its reduction; an unrepresentable completed cell remains infinite.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the result shape when its dimensions or storage cannot be
+    /// represented.
+    #[track_caller]
     pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Delegate validation and arithmetic to the mode-aware implementation so
         // both public entry points retain identical error behavior.
@@ -1073,10 +1046,15 @@ impl Matrix {
     /// Multiply two matrices while optionally parallelizing sufficiently large
     /// row computations.
     ///
-    /// This method has the same shape, allocation, and IEEE-754 arithmetic
-    /// contract as [`Matrix::try_mul`]. Parallel execution changes work
-    /// distribution but preserves the serial accumulation order within each
-    /// result cell.
+    /// This method has the same recoverable-shape and scaled-arithmetic contract
+    /// as [`Matrix::try_mul`]. Parallel execution changes work distribution but
+    /// preserves the serial accumulation order within each result cell.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the result shape when its dimensions or storage cannot be
+    /// represented.
+    #[track_caller]
     pub fn try_mul_with_parallel(
         &self,
         rhs: &Matrix,
@@ -1094,10 +1072,9 @@ impl Matrix {
         // The output combines dimensions from two independently valid inputs.
         // Zero-sized storage permits shapes such as `usize::MAX x 0`, so input
         // construction alone cannot prove that `self.rows * rhs.cols` fits.
-        // Preserve this method's fallible contract by validating the derived
-        // shape instead of routing it through the panicking convenience
-        // constructor.
-        let mut result = Matrix::try_new(self.rows, rhs.cols)?;
+        // Constructing the derived output validates element-count arithmetic and
+        // reports impossible storage as a fatal panic with the output shape.
+        let mut result = Matrix::new(self.rows, rhs.cols);
         if result.data.is_empty() {
             // No output cell exists when either output dimension is zero. In
             // particular, a valid `usize::MAX x 0` result must not execute an
@@ -1170,6 +1147,12 @@ impl IndexMut<(usize, usize)> for Matrix {
 impl Add for &Matrix {
     type Output = Matrix;
 
+    /// Add through [`Matrix::try_add`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a shape mismatch or fatal result allocation failure.
+    #[track_caller]
     fn add(self, rhs: Self) -> Self::Output {
         self.try_add(rhs).unwrap_or_else(|err| panic!("{}", err))
     }
@@ -1178,6 +1161,12 @@ impl Add for &Matrix {
 impl Sub for &Matrix {
     type Output = Matrix;
 
+    /// Subtract through [`Matrix::try_sub`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a shape mismatch or fatal result allocation failure.
+    #[track_caller]
     fn sub(self, rhs: Self) -> Self::Output {
         self.try_sub(rhs).unwrap_or_else(|err| panic!("{}", err))
     }
@@ -1186,6 +1175,12 @@ impl Sub for &Matrix {
 impl Mul for &Matrix {
     type Output = Matrix;
 
+    /// Multiply through [`Matrix::try_mul`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a shape mismatch or fatal result allocation failure.
+    #[track_caller]
     fn mul(self, rhs: Self) -> Self::Output {
         self.try_mul(rhs).unwrap_or_else(|err| panic!("{}", err))
     }
@@ -1194,6 +1189,12 @@ impl Mul for &Matrix {
 impl Mul<f64> for &Matrix {
     type Output = Matrix;
 
+    /// Multiply every stored element by one scalar.
+    ///
+    /// # Panics
+    ///
+    /// Panics if cloning storage for the result cannot be completed.
+    #[track_caller]
     fn mul(self, scalar: f64) -> Self::Output {
         let mut result = self.clone();
         for val in &mut result.data {
@@ -1552,30 +1553,6 @@ mod tests {
         assert_eq!(err_serial, err_parallel);
     }
 
-    /// Ensure fallible multiplication reports overflow in its derived output
-    /// shape rather than panicking after both zero-storage inputs were accepted.
-    #[test]
-    fn test_try_mul_reports_derived_element_count_overflow() {
-        // Each input has zero elements and is independently representable. Their
-        // compatible shared zero dimension nevertheless produces an impossible
-        // `usize::MAX x usize::MAX` output shape.
-        let left = Matrix::from_vec(Vec::new(), usize::MAX, 0).unwrap();
-        let right = Matrix::from_vec(Vec::new(), 0, usize::MAX).unwrap();
-
-        for parallel in [false, true] {
-            let error = left
-                .try_mul_with_parallel(&right, parallel)
-                .expect_err("derived output overflow must remain fallible");
-            assert_eq!(
-                error,
-                MatrixError::ElementCountOverflow {
-                    rows: usize::MAX,
-                    cols: usize::MAX,
-                }
-            );
-        }
-    }
-
     /// Preserve a finite least-squares solution when same-sign projection terms
     /// overflow in source order before later terms cancel them.
     #[test]
@@ -1799,66 +1776,6 @@ mod tests {
                 assert!((result.solution[(row, 0)] - expected).abs() < 1e-8);
             }
         }
-    }
-
-    /// Verify that callers with untrusted dimensions can observe shape overflow
-    /// as structured data instead of triggering the infallible constructor's
-    /// documented panic.
-    #[test]
-    fn test_try_new_reports_element_count_overflow() {
-        let error = Matrix::try_new(usize::MAX, 2)
-            .expect_err("overflowing element counts must be rejected");
-
-        assert_eq!(
-            error,
-            MatrixError::ElementCountOverflow {
-                rows: usize::MAX,
-                cols: 2,
-            }
-        );
-    }
-
-    /// Verify that a representable element count with an impossible byte
-    /// capacity is returned as an allocation error instead of panicking.
-    #[test]
-    fn test_try_new_reports_capacity_overflow() {
-        let error = Matrix::try_new(usize::MAX, 1)
-            .expect_err("an impossible contiguous allocation must be rejected");
-
-        assert_eq!(
-            error,
-            MatrixError::AllocationFailed {
-                rows: usize::MAX,
-                cols: 1,
-                elements: usize::MAX,
-            }
-        );
-    }
-
-    /// Preserve the fallible least-squares contract for a valid zero-storage
-    /// coefficient shape whose minimum-norm output cannot be allocated.
-    #[test]
-    fn test_zero_row_least_squares_reports_solution_allocation_failure() {
-        // Both input matrices are valid because zero rows require no storage,
-        // even though the coefficient matrix describes usize::MAX variables.
-        // The requested solution is usize::MAX by one and must therefore fail
-        // through `Result` instead of panicking in the trivial-system branch.
-        let coefficients = Matrix::from_vec(Vec::new(), 0, usize::MAX)
-            .expect("zero rows make the coefficient shape storage-free");
-        let right_hand_side = Matrix::from_vec(Vec::new(), 0, 1)
-            .expect("a zero-row right-hand side requires no storage");
-
-        let error = coefficients
-            .solve_least_squares(&right_hand_side)
-            .expect_err("the impossible solution allocation must be reported");
-        assert_eq!(
-            error,
-            MatrixError::AllocationFailed {
-                rows: usize::MAX,
-                cols: 1,
-                elements: usize::MAX,
-            }
-        );
     }
 
     /// Compare random full-row-rank wide solves with a construction whose
@@ -2094,10 +2011,10 @@ mod tests {
         assert!(result.solution.all_finite());
     }
 
-    /// Verify that fallible construction reports both ordinary length mismatch
-    /// and dimension-product overflow through structured matrix errors.
+    /// Verify that buffer construction reports an ordinary length mismatch with
+    /// both the requested shape and actual storage length.
     #[test]
-    fn test_from_vec_reports_structured_shape_errors() {
+    fn test_from_vec_reports_data_length_mismatch() {
         let length_error = Matrix::from_vec(vec![1.0, 2.0], 2, 2).unwrap_err();
         assert_eq!(
             length_error,
@@ -2106,15 +2023,6 @@ mod tests {
                 cols: 2,
                 expected: 4,
                 actual: 2,
-            }
-        );
-
-        let overflow_error = Matrix::from_vec(Vec::new(), usize::MAX, 2).unwrap_err();
-        assert_eq!(
-            overflow_error,
-            MatrixError::ElementCountOverflow {
-                rows: usize::MAX,
-                cols: 2,
             }
         );
     }

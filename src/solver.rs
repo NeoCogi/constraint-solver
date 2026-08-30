@@ -1051,15 +1051,18 @@ impl NewtonRaphsonSolver {
         // Ridge regularization is an explicit alternate linear problem. Build
         // its storage only when the caller selected it; exact roots and default
         // unregularized solves never allocate an augmented matrix.
-        let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
-            MatrixError::DimensionSumOverflow {
-                operation: "regularized least-squares allocation",
-                left: j_matrix.rows(),
-                right: j_matrix.cols(),
-            },
-        )?;
-        let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())?;
-        let mut augmented_b = Matrix::try_new(augmented_rows, 1)?;
+        let augmented_rows = j_matrix
+            .rows()
+            .checked_add(j_matrix.cols())
+            .unwrap_or_else(|| {
+                panic!(
+                    "regularized least-squares row count overflows usize: {} + {}",
+                    j_matrix.rows(),
+                    j_matrix.cols()
+                )
+            });
+        let mut augmented_j = Matrix::new(augmented_rows, j_matrix.cols());
+        let mut augmented_b = Matrix::new(augmented_rows, 1);
 
         // Copy the nonlinear linearization into the upper block. Fresh
         // zero-filled matrices already contain the lower off-diagonal and
