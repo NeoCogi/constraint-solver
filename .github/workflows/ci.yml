@@ -1,5 +1,6 @@
 # Validate every distributable and developer-facing target on pushes and pull
-# requests. Benchmark execution remains manual; CI compiles its harness instead.
+# requests. Benchmark timing remains manual; CI executes the harness in test
+# mode so fixture construction and numerical assertions remain release gates.
 name: CI
 
 on:
@@ -213,8 +214,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
 
-      - name: Compile benchmark harness
-        run: cargo check --locked --bench linear_algebra --features benchmarks
+      # Criterion's test mode executes fixture setup and equivalence/rank
+      # assertions once without collecting timing samples. This catches stale or
+      # invalid benchmark workloads while leaving performance measurement manual.
+      - name: Execute benchmark fixture checks
+        run: cargo test --locked --bench linear_algebra --features benchmarks
 
       # Package verification catches missing files and manifest metadata errors
       # using the same locked dependency graph as the preceding checks.

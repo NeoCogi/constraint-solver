@@ -42,7 +42,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
   builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
   headless examples, documentation tests, warning-free all-feature public docs,
-  benchmark compilation, and package verification.
+  benchmark fixture execution, and package verification.
 
 ### Changed
 
