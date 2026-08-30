@@ -28,6 +28,7 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
 
+use crate::scaled::product_ratio;
 use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 16_384;
@@ -791,10 +792,11 @@ impl Matrix {
                     b,
                     "solve_least_squares",
                 )?;
-                // `singular_value` belongs to A/coefficient_scale. Divide in
-                // two stages so the original singular value never has to be
-                // materialized when it exceeds the finite floating-point range.
-                let coefficient = (projection / singular_value) / coefficient_scale;
+                // `singular_value` belongs to A/coefficient_scale. Restore the
+                // original scale through exponent arithmetic so neither the
+                // unscaled singular value nor a fragile intermediate quotient
+                // has to be materialized.
+                let coefficient = product_ratio([projection], [singular_value, coefficient_scale]);
                 if !coefficient.is_finite() {
                     return Err(MatrixError::NonFiniteResult {
                         operation: "solve_least_squares",
@@ -823,10 +825,9 @@ impl Matrix {
                     b,
                     "solve_least_squares",
                 )?;
-                // Restore the coefficient scale only after dividing by the
-                // normalized singular value, for the same representability
-                // reason as the tall orientation above.
-                let coefficient = (projection / singular_value) / coefficient_scale;
+                // Restore the coefficient scale through the same exponent-safe
+                // ratio used by the tall orientation above.
+                let coefficient = product_ratio([projection], [singular_value, coefficient_scale]);
                 if !coefficient.is_finite() {
                     return Err(MatrixError::NonFiniteResult {
                         operation: "solve_least_squares",

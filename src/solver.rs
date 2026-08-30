@@ -29,6 +29,7 @@ use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
 use crate::mode::{Mode, build_thread_pool};
+use crate::scaled::product_ratio;
 use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
@@ -1198,9 +1199,9 @@ impl NewtonRaphsonSolver {
     /// Normalize a raw Jacobian for equation and variable characteristic scales.
     ///
     /// The normalized derivative is `J_ij * variable_scale_j /
-    /// equation_scale_i`. Multiplication order avoids manufacturing `0 * inf`
-    /// when the scale ratio itself exceeds `f64`, while callers subsequently
-    /// reject any genuinely non-finite normalized derivative.
+    /// equation_scale_i`. The shared exponent-scaled product policy prevents
+    /// either source-code association from manufacturing zero or infinity when
+    /// the final normalized derivative remains representable.
     fn scale_jacobian_into(&self, raw: &Matrix, scaled: &mut Matrix) {
         if scaled.rows() != raw.rows() || scaled.cols() != raw.cols() {
             *scaled = Matrix::new(raw.rows(), raw.cols());
@@ -1210,34 +1211,30 @@ impl NewtonRaphsonSolver {
             for column in 0..raw.cols() {
                 let variable_scale = self.variable_scales[column];
                 let derivative = raw[(row, column)];
-                scaled[(row, column)] = if variable_scale <= equation_scale {
-                    derivative * (variable_scale / equation_scale)
-                } else {
-                    (derivative / equation_scale) * variable_scale
-                };
+                if !derivative.is_finite() {
+                    // Preserve the original invalid derivative verbatim. The
+                    // caller's post-scaling finite check then reports the
+                    // established Jacobian evaluation error instead of asking
+                    // finite-only normalization arithmetic to classify it.
+                    scaled[(row, column)] = derivative;
+                    continue;
+                }
+                // Decomposing all three values into bounded significands and
+                // integer exponents makes the result independent of an
+                // arbitrary multiplication/division association.
+                scaled[(row, column)] =
+                    product_ratio([derivative, variable_scale], [equation_scale]);
             }
         }
     }
 
     /// Multiply a normalized correction by its step and variable scale without
-    /// committing to one fragile floating-point association.
-    ///
-    /// Damping first can underflow a tiny normalized correction that a large
-    /// variable scale would recover; scaling first can overflow a large
-    /// correction that a small step would recover. Evaluate both associations
-    /// and prefer a finite non-zero representation when either one preserves the
-    /// mathematically representable result.
+    /// order-dependent intermediate overflow or underflow.
     fn scaled_update_component(delta: f64, step_size: f64, variable_scale: f64) -> f64 {
-        let damped_then_scaled = (delta * step_size) * variable_scale;
-        let scaled_then_damped = (delta * variable_scale) * step_size;
-
-        if damped_then_scaled.is_finite()
-            && (damped_then_scaled != 0.0 || scaled_then_damped == 0.0)
-        {
-            damped_then_scaled
-        } else {
-            scaled_then_damped
-        }
+        // One exponent accumulation now serves both this update path and
+        // Jacobian normalization instead of maintaining association heuristics
+        // that cover only selected scale orderings.
+        product_ratio([delta, step_size, variable_scale], [])
     }
 
     /// Apply one normalized correction atomically in caller variable units.
@@ -1245,10 +1242,9 @@ impl NewtonRaphsonSolver {
     /// The first pass validates the complete candidate without changing
     /// `vars`. The second pass commits the same arithmetic only after success,
     /// so a failure cannot leave a mixture of old and partially updated values.
-    /// Testing both multiplication associations lets backtracking and variable
-    /// scaling recover representable updates that one fixed order could
-    /// overflow or underflow. Fixed parameters are absent from `self.variables`
-    /// and remain untouched.
+    /// Exponent-scaled products let backtracking and variable scaling recover
+    /// representable updates without depending on one multiplication order.
+    /// Fixed parameters are absent from `self.variables` and remain untouched.
     fn apply_finite_step(
         &self,
         vars: &mut HashMap<VarId, f64>,
@@ -3166,10 +3162,10 @@ mod tests {
         }
     }
 
-    /// Preserve finite caller-unit corrections across both extreme scale and
-    /// backtracking associations.
+    /// Preserve finite caller-unit corrections across extreme scaling and
+    /// backtracking factors.
     #[test]
-    fn test_scaled_update_chooses_representable_multiplication_order() {
+    fn test_scaled_update_preserves_representable_products() {
         // Applying the step size first underflows 1e-320 * 1e-12, while
         // applying the large variable scale first preserves a result near 1e-24.
         let recovered_from_underflow =
@@ -3184,6 +3180,35 @@ mod tests {
             NewtonRaphsonSolver::scaled_update_component(1e308, 1e-2, 10.0);
         assert!(recovered_from_overflow.is_finite());
         assert!((recovered_from_overflow / 1e307 - 1.0).abs() < 1e-12);
+    }
+
+    /// Preserve a non-zero normalized derivative when coefficient and unit
+    /// scales span the complete finite exponent range.
+    #[test]
+    fn test_jacobian_scaling_does_not_underflow_representable_derivative() {
+        for mode in test_modes() {
+            // The normalized derivative is
+            // 1e308 * 1e-308 / 1e308 = 1e-308. Forming the scale ratio first
+            // underflows it to zero and falsely classifies x=0 as stationary;
+            // the normalized Newton correction is 1e308 and restores the
+            // ordinary caller-unit update x=1.
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::mul(Exp::val(1e308), x), Exp::val(1e308));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_equation_scales(vec![1e308])
+                .expect("the equation has one positive characteristic scale")
+                .with_variable_scales(HashMap::from([("x".to_string(), 1e-308)]))
+                .expect("the solve variable has one positive characteristic scale");
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("the representable normalized derivative must reach the root");
+
+            assert_eq!(solution.iterations, 1);
+            assert!((solution.values["x"] - 1.0).abs() < 1e-12);
+            assert!(solution.error < 1e-12);
+        }
     }
 
     /// Use equation characteristic scales consistently for least-squares

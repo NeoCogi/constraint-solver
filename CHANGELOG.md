@@ -93,8 +93,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   oracle and added a headless end-to-end solve for the graphical IK model.
 - Preserved structured `MatrixError` values through `SolverError` and retained
   already-computed gradient measures in every `NoConvergence` diagnostic.
-- Prevented norm, column-scaled stationarity, and line-search slope calculations
-  from overflowing or underflowing at extreme finite scales.
+- Prevented norm, column-scaled stationarity, line-search slope, Jacobian
+  normalization, physical update, and SVD scale-restoration calculations from
+  overflowing or underflowing at extreme finite scales. Products and quotients
+  now share one exponent-scaled arithmetic policy instead of choosing ad-hoc
+  source-code associations.
 - Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
   algebraically independent small-coefficient directions above factorization
   roundoff, preventing repeated zero corrections on solvable systems.

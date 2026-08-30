@@ -65,6 +65,11 @@ J_scaled[i,j]  = J[i,j] * t_j / s_i
 delta_x[j]     = t_j * delta_scaled[j]
 ```
 
+Products and quotients in these transformations are combined through binary
+exponent scaling, so a representable normalized derivative or caller-unit
+update is not lost merely because one intermediate multiplication order would
+overflow or underflow.
+
 The scaled residual controls convergence, stationarity, Armijo acceptance, and
 least-squares weighting. A larger equation scale therefore reduces that
 equation's weight. Variable scaling changes numerical coordinates without

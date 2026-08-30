@@ -66,6 +66,7 @@ pub mod exp;
 mod jacobian;
 pub mod matrix;
 pub mod mode;
+mod scaled;
 pub mod solver;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
