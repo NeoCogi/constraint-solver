@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Deflated roundoff-sized Jacobi columns at the same numerical-rank boundary
+  used by the pseudoinverse, preventing exact rank-deficient systems such as the
+  graphical IK startup pose from cycling until factorization exhaustion.
+
 ## [0.3.0] - 2026-08-29
 
 ### Added

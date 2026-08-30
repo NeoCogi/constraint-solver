@@ -576,7 +576,8 @@ impl Matrix {
                 }
             }
         }
-        let decomposition = Self::one_sided_jacobi_svd_columns(factor_input)?;
+        let decomposition =
+            Self::one_sided_jacobi_svd_columns(factor_input, relative_rank_tolerance)?;
 
         // A relative threshold preserves the numerical rank under uniform unit
         // changes. The strict comparison deliberately classifies an all-zero
@@ -693,8 +694,12 @@ impl Matrix {
     /// Pairwise Gram entries are evaluated after scaling both columns by their
     /// largest magnitude. That scaling prevents the convergence test and
     /// rotation angle from overflowing for otherwise finite input matrices.
+    /// `relative_rank_tolerance` is the caller's eventual pseudoinverse cutoff,
+    /// allowing the factorization and solution phases to share one definition of
+    /// a numerical null direction.
     fn one_sided_jacobi_svd_columns(
         mut orthogonal_columns: Matrix,
+        relative_rank_tolerance: f64,
     ) -> Result<JacobiSvd, MatrixError> {
         debug_assert!(orthogonal_columns.rows >= orthogonal_columns.cols);
 
@@ -717,6 +722,24 @@ impl Matrix {
 
         for _sweep in 0..max_sweeps {
             let mut rotated_any_pair = false;
+
+            // Rank-deficient inputs converge by driving one or more column norms
+            // into the numerical null space. Requiring relative orthogonality
+            // from such a roundoff-sized column is ill-posed: its tiny residual
+            // can remain almost parallel to a retained column and trigger the
+            // same meaningless rotations forever. Derive the deflation scale
+            // from the largest current column norm and the exact tolerance that
+            // the caller will later use to truncate singular values.
+            let mut largest_column_norm = 0.0_f64;
+            for column in 0..column_count {
+                let mut column_norm = 0.0_f64;
+                for row in 0..row_count {
+                    column_norm = column_norm.hypot(orthogonal_columns[(row, column)]);
+                }
+                largest_column_norm = largest_column_norm.max(column_norm);
+            }
+            let deflation_threshold =
+                numerical_rank_tolerance(largest_column_norm, relative_rank_tolerance);
 
             for left_column in 0..column_count {
                 for right_column in (left_column + 1)..column_count {
@@ -760,6 +783,16 @@ impl Matrix {
                     // a scale-aware bound for the cross term.
                     let orthogonality_threshold =
                         8.0 * f64::EPSILON * (left_norm_squared * right_norm_squared).sqrt();
+
+                    // Do not rotate a direction already below the numerical-rank
+                    // boundary. Its singular value will be omitted by the shared
+                    // pseudoinverse policy, while rotating it can only amplify
+                    // relative roundoff and prevent a zero-rotation sweep.
+                    let left_norm = pair_scale * left_norm_squared.sqrt();
+                    let right_norm = pair_scale * right_norm_squared.sqrt();
+                    if left_norm <= deflation_threshold || right_norm <= deflation_threshold {
+                        continue;
+                    }
                     if cross_product.abs() <= orthogonality_threshold {
                         continue;
                     }
@@ -1957,6 +1990,34 @@ mod tests {
         assert_eq!(result.info.rank, 1);
         let reconstructed = &a * &result.solution;
         assert!((&reconstructed - &b).norm() < 1e-12);
+    }
+
+    /// Solve the exact rank-deficient Jacobian produced by the graphical
+    /// four-link IK example when its initial chain is fully extended.
+    #[test]
+    fn test_solve_least_squares_handles_straight_four_link_ik_jacobian() {
+        let coefficients = Matrix::from_vec(
+            vec![
+                280.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // link 1
+                -240.0, 0.0, 240.0, 0.0, 0.0, 0.0, 0.0, 0.0, // link 2
+                0.0, 0.0, -200.0, 0.0, 200.0, 0.0, 0.0, 0.0, // link 3
+                0.0, 0.0, 0.0, 0.0, -160.0, 0.0, 160.0, 0.0, // link 4
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, // target x
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, // target y
+            ],
+            6,
+            8,
+        )
+        .expect("the IK Jacobian fixture has six rows and eight columns");
+        let right_hand_side = Matrix::from_vec(vec![0.0, 0.0, 0.0, 0.0, -300.0, 200.0], 6, 1)
+            .expect("the IK residual fixture has six entries");
+
+        let result = coefficients
+            .solve_least_squares(&right_hand_side)
+            .expect("a finite rank-deficient IK correction must factorize");
+
+        assert_eq!(result.info.rank, 5);
+        assert!(result.solution.all_finite());
     }
 
     /// Verify that fallible construction reports both ordinary length mismatch

@@ -538,52 +538,58 @@ mod tests {
         }
     }
 
-    /// Execute the compiled IK model without a display and independently check
-    /// its returned target and link-length geometry.
+    /// Execute a 100-frame target path without a display and independently check
+    /// every returned target and link-length geometry.
     #[test]
-    fn ik_model_solves_reachable_target_end_to_end() {
+    fn ik_model_tracks_reachable_targets_from_graphical_startup_pose() {
         let model = IkModel::new();
 
-        // Build an exact, non-singular starting pose from four absolute link
-        // angles. Avoiding a straight chain ensures the test exercises ordinary
-        // nonlinear corrections rather than depending on a degenerate tangent.
-        let extend = |parent: &Vec2d, length: f64, angle: f64| {
-            vec2(
-                parent.x + length * angle.cos(),
-                parent.y + length * angle.sin(),
-            )
-        };
-        let angles: [f64; 4] = [0.25, 0.65, -0.35, 0.9];
+        // Use the exact fully extended pose shown on graphical startup. Its
+        // Jacobian is rank deficient, so this headless path must exercise the
+        // numerical-null-space handling required by the first interactive frame
+        // instead of sidestepping it with an already bent fixture.
         let origin = vec2(0.0, 0.0);
-        let joint1 = extend(&origin, LINK_1, angles[0]);
-        let joint2 = extend(&joint1, LINK_2, angles[1]);
-        let joint3 = extend(&joint2, LINK_3, angles[2]);
-        let effector = extend(&joint3, LINK_4, angles[3]);
-        let initial = IkState {
+        let joint1 = vec2(LINK_1, 0.0);
+        let joint2 = vec2(LINK_1 + LINK_2, 0.0);
+        let joint3 = vec2(LINK_1 + LINK_2 + LINK_3, 0.0);
+        let effector = vec2(LINK_1 + LINK_2 + LINK_3 + LINK_4, 0.0);
+        let mut state = IkState {
             joint1,
             joint2,
             joint3,
             effector,
         };
-        let target = vec2(initial.effector.x - 12.0, initial.effector.y + 9.0);
 
-        let solved = model
-            .solve_pose(&initial, &target)
-            .expect("a nearby reachable target must produce a complete pose");
+        let initial_radius = 130_000.0_f64.sqrt();
+        let initial_angle = (2.0_f64 / 3.0).atan();
+        for frame in 0..100 {
+            // Follow a smooth closed path whose varying radius keeps every point
+            // comfortably inside the chain's reachable disk. The phase offset
+            // makes the first correction leave the singular horizontal pose in
+            // both x and y, matching an ordinary cursor-driven startup frame.
+            let phase = 2.0 * PI * frame as f64 / 100.0;
+            let radius = initial_radius + 20.0 * (2.0 * phase).sin();
+            let angle = initial_angle + phase;
+            let target = vec2(radius * angle.cos(), radius * angle.sin());
+            let solved = model
+                .solve_pose(&state, &target)
+                .unwrap_or_else(|error| panic!("interactive frame {frame} failed: {error}"));
 
-        // Target coordinates are direct residuals, while link checks are an
-        // independent geometric oracle over the returned joint positions.
-        assert!((solved.effector.x - target.x).abs() < 1e-8);
-        assert!((solved.effector.y - target.y).abs() < 1e-8);
-        let links = [
-            (&origin, &solved.joint1, LINK_1),
-            (&solved.joint1, &solved.joint2, LINK_2),
-            (&solved.joint2, &solved.joint3, LINK_3),
-            (&solved.joint3, &solved.effector, LINK_4),
-        ];
-        for (parent, child, expected_length) in links {
-            let offset = vec2(child.x - parent.x, child.y - parent.y);
-            assert!((vec2_len(&offset) - expected_length).abs() < 1e-8);
+            // Target coordinates are direct residuals, while link checks are an
+            // independent geometric oracle over the returned joint positions.
+            assert!((solved.effector.x - target.x).abs() < 1e-8);
+            assert!((solved.effector.y - target.y).abs() < 1e-8);
+            let links = [
+                (&origin, &solved.joint1, LINK_1),
+                (&solved.joint1, &solved.joint2, LINK_2),
+                (&solved.joint2, &solved.joint3, LINK_3),
+                (&solved.joint3, &solved.effector, LINK_4),
+            ];
+            for (parent, child, expected_length) in links {
+                let offset = vec2(child.x - parent.x, child.y - parent.y);
+                assert!((vec2_len(&offset) - expected_length).abs() < 1e-8);
+            }
+            state = solved;
         }
     }
 }
