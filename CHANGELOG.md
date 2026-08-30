@@ -31,6 +31,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and future local tooling files are not published with the crate.
 - Added arithmetic operator implementations for owned and borrowed `Exp`
   values and `f64` constants so equations can mirror their mathematical form.
+- Added shared modified-nodal-analysis integration infrastructure and 100-step
+  diode, bipolar, MOS, RC, and amplifier waveform validations.
 - Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
   builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
   headless examples, documentation tests, benchmark compilation, and package
