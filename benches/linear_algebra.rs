@@ -187,8 +187,29 @@ fn bench_least_squares(c: &mut Criterion) {
         let mut rng = LcgRng::new(789 + size as u64);
         let long_dimension = size * LEAST_SQUARES_RATIO;
 
+        // Make the square matrix strictly diagonally dominant so the timed group
+        // deterministically measures a full-rank solve rather than relying on a
+        // probabilistic property of its generated coefficients.
+        let mut square = random_matrix(size, size, &mut rng);
+        let square_rhs = random_matrix(size, 1, &mut rng);
+        for diagonal in 0..size {
+            square[(diagonal, diagonal)] += 2.0 * size as f64;
+        }
+        let square_check = square.solve_least_squares(&square_rhs).unwrap();
+        assert_eq!(square_check.info.rank, size);
+        group.bench_with_input(
+            BenchmarkId::new("square", size),
+            &square,
+            |bench, matrix| {
+                bench.iter(|| {
+                    let result = matrix.solve_least_squares(black_box(&square_rhs)).unwrap();
+                    black_box(result);
+                })
+            },
+        );
+
         // Full-rank tall and wide inputs exercise both direct and transposed SVD
-        // orientations without maintaining a second factorization benchmark.
+        // orientations under the same bounded dimension schedule.
         let tall = random_matrix(long_dimension, size, &mut rng);
         let tall_rhs = random_matrix(long_dimension, 1, &mut rng);
         let tall_check = tall.solve_least_squares(&tall_rhs).unwrap();
