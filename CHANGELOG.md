@@ -69,6 +69,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transactional Armijo update path for every `solve` call. Removed
   `solve_with_line_search`, `with_damping`, and `min_damping`; the explicit
   `initial_step_size` now caps the first candidate tested on each correction.
+- Removed redundant `Mode` convenience constructors and mode-specific solver
+  constructors. Callers now select the explicit enum variant through the single
+  `with_mode` builder after ordinary solver construction.
 - Applied one numerical default policy to square, tall, and wide systems instead
   of silently changing iteration, step-size, and regularization defaults based
   on Jacobian shape.

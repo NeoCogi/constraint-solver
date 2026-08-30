@@ -206,7 +206,8 @@ use constraint_solver::{Compiler, Exp, Mode, NewtonRaphsonSolver};
 
 let equation = Exp::sub(Exp::var("x"), Exp::val(1.0));
 let compiled = Compiler::compile(&[equation]).expect("compile failed");
-let _solver = NewtonRaphsonSolver::new_with_mode(compiled, Mode::Parallel { thread_count: 8 })
+let _solver = NewtonRaphsonSolver::new(compiled)
+    .with_mode(Mode::Parallel { thread_count: 8 })
     .expect("solver");
 ```
 

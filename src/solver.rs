@@ -450,12 +450,6 @@ impl NewtonRaphsonSolver {
         Self::build(compiled, variables)
     }
 
-    /// Create a new solver with an explicit execution mode.
-    pub fn new_with_mode(compiled: CompiledSystem, mode: Mode) -> Result<Self, SolverError> {
-        let variables = compiled.var_table.all_var_ids();
-        Self::build_with_mode(compiled, variables, mode)
-    }
-
     /// Create a solver while specifying which variables to solve for.
     ///
     /// Variables not listed here are treated as fixed parameters and must be
@@ -476,27 +470,6 @@ impl NewtonRaphsonSolver {
             }
         }
         Ok(Self::build(compiled, ids))
-    }
-
-    /// Create a solver with explicit variables and execution mode.
-    pub fn new_with_variables_and_mode(
-        compiled: CompiledSystem,
-        variables: &[&str],
-        mode: Mode,
-    ) -> Result<Self, SolverError> {
-        let mut ids = Vec::with_capacity(variables.len());
-        let mut seen = std::collections::HashSet::new();
-        for name in variables {
-            let id = compiled
-                .var_table
-                .get_id(name)
-                .ok_or_else(|| SolverError::InvalidInput(format!("Unknown variable '{name}'")))?;
-            if seen.insert(id) {
-                ids.push(id);
-            }
-        }
-
-        Self::build_with_mode(compiled, ids, mode)
     }
 
     fn build(compiled: CompiledSystem, variables: Vec<VarId>) -> Self {
@@ -525,16 +498,6 @@ impl NewtonRaphsonSolver {
             mode: Mode::Serial,
             pool: None,
         }
-    }
-
-    fn build_with_mode(
-        compiled: CompiledSystem,
-        variables: Vec<VarId>,
-        mode: Mode,
-    ) -> Result<Self, SolverError> {
-        let mut solver = Self::build(compiled, variables);
-        solver.set_mode(mode)?;
-        Ok(solver)
     }
 
     /// Update the execution mode for this solver.
@@ -1952,7 +1915,9 @@ mod tests {
 
     fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new_with_mode(compiled, mode).expect("failed to set solver mode")
+        NewtonRaphsonSolver::new(compiled)
+            .with_mode(mode)
+            .expect("failed to set solver mode")
     }
 
     fn solver_for_with_vars_mode(
@@ -1961,7 +1926,8 @@ mod tests {
         mode: Mode,
     ) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new_with_variables_and_mode(compiled, variables, mode)
+        NewtonRaphsonSolver::new_with_variables(compiled, variables)
+            .and_then(|solver| solver.with_mode(mode))
             .expect("failed to select solve variables or set mode")
     }
 
@@ -2115,6 +2081,49 @@ mod tests {
 
             assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
             assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
+        }
+    }
+
+    /// Exercise simultaneous immutable borrows of one reusable solver so its
+    /// construction-time caches cannot hide shared mutable numerical storage.
+    #[test]
+    fn test_reused_solver_supports_concurrent_solve_calls() {
+        for mode in test_modes() {
+            let x = Exp::var("x");
+            let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
+            let initial_values = [3.0, -3.0, 5.0, -5.0];
+
+            // Scoped threads borrow the same solver by shared reference. Each
+            // invocation owns its variables, residuals, Jacobian workspace, and
+            // convergence history, including when all calls install work into
+            // the same dedicated Rayon pool.
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = initial_values
+                    .into_iter()
+                    .map(|initial_value| {
+                        let solver = &solver;
+                        scope.spawn(move || {
+                            solver.solve(HashMap::from([("x".to_string(), initial_value)]))
+                        })
+                    })
+                    .collect();
+
+                for (handle, initial_value) in handles.into_iter().zip(initial_values) {
+                    let solution = handle
+                        .join()
+                        .expect("concurrent solver thread must not panic")
+                        .expect("each concurrent initial guess should converge");
+                    let expected = if initial_value.is_sign_positive() {
+                        2.0
+                    } else {
+                        -2.0
+                    };
+                    assert!((solution.values["x"] - expected).abs() < 1e-10);
+                }
+            });
         }
     }
 
