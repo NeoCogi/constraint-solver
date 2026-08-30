@@ -1754,25 +1754,55 @@ mod tests {
         );
     }
 
+    /// Compare random full-row-rank wide solves with a construction whose
+    /// Moore-Penrose solution is known independently of the SVD implementation.
     #[test]
-    fn test_solve_least_squares_random_wide_min_norm() {
+    fn test_solve_least_squares_random_wide_minimum_norm_oracle() {
         let mut rng = TestRng::new(0x1234_5678_9abc_def0);
-        let mut a = Matrix::new(2, 4);
-        a[(0, 0)] = 1.0;
-        a[(1, 1)] = 1.0;
 
-        for _ in 0..5 {
-            let b0 = rng.next_f64();
-            let b1 = rng.next_f64();
-            let b = Matrix::from_vec(vec![b0, b1], 2, 1).unwrap();
+        for _case in 0..32 {
+            let mut coefficients = random_matrix(3, 6, &mut rng);
+            for diagonal in 0..3 {
+                // The leading 3x3 block is strictly diagonally dominant because
+                // every random entry lies in [-1, 1]. It is therefore invertible
+                // and proves that all three rows are linearly independent.
+                coefficients[(diagonal, diagonal)] += 4.0;
+            }
 
-            let result = solve_default(&a, &b);
-            assert_eq!(result.info.rank, 2);
+            // Choose x=A^T*z manually, then b=A*x. This x lies in A's row space
+            // and satisfies Ax=b. Every other solution differs by a vector in
+            // null(A), which is orthogonal to x, so this construction makes x
+            // the unique minimum-Euclidean-norm solution without using a second
+            // pseudoinverse implementation as an oracle.
+            let row_coordinates = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let mut expected_variables = [0.0; 6];
+            for variable in 0..6 {
+                for equation in 0..3 {
+                    expected_variables[variable] +=
+                        coefficients[(equation, variable)] * row_coordinates[equation];
+                }
+            }
+            let mut expected_rhs = [0.0; 3];
+            for equation in 0..3 {
+                for variable in 0..6 {
+                    expected_rhs[equation] +=
+                        coefficients[(equation, variable)] * expected_variables[variable];
+                }
+            }
+            let right_hand_side = Matrix::from_vec(expected_rhs.to_vec(), 3, 1)
+                .expect("the oracle always contains three right-hand-side values");
+
+            let result = solve_default(&coefficients, &right_hand_side);
+
+            assert_eq!(result.info.rank, 3);
             assert!(result.info.cond_est.is_finite());
-            assert!((result.solution[(0, 0)] - b0).abs() < 1e-12);
-            assert!((result.solution[(1, 0)] - b1).abs() < 1e-12);
-            assert!((result.solution[(2, 0)]).abs() < 1e-12);
-            assert!((result.solution[(3, 0)]).abs() < 1e-12);
+            for (variable, expected) in expected_variables.iter().enumerate() {
+                let error = (result.solution[(variable, 0)] - expected).abs();
+                assert!(
+                    error < 1e-8,
+                    "minimum-norm mismatch at variable {variable}: {error}"
+                );
+            }
         }
     }
 
