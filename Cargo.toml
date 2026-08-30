@@ -35,18 +35,26 @@ include = [
 # Keep the harnessless Criterion executable out of ordinary all-target test
 # runs; performance measurement is an explicit developer operation.
 benchmarks = []
+# Keep native window-system dependencies out of ordinary builds and tests. The
+# interactive example opts into them explicitly.
+glfw-example = ["dep:glfw", "dep:glow", "dep:rs-math3d"]
 
 [dependencies]
 rayon = "1.8"
+# The IK example needs window/context creation only. Disabling GLFW's `all`
+# default avoids unrelated image, Vulkan, logging, and dual-backend dependency
+# trees. Optional dependencies ensure ordinary crate consumers and test runs do
+# not build native window-system code.
+glfw = { version = "0.61", optional = true, default-features = false, features = ["prebuilt-libs", "raw-window-handle-v0-6", "x11"] }
+glow = { version = "0.16", optional = true }
+rs-math3d = { version = "0.10", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
-glow = "0.16"
-# The IK example needs window/context creation only. Disabling GLFW's `all`
-# default avoids unrelated image, Vulkan, logging, and dual-backend dependency
-# trees; prebuilt native libraries retain portable example compilation.
-glfw = { version = "0.61", default-features = false, features = ["prebuilt-libs", "raw-window-handle-v0-6", "x11"] }
-rs-math3d = "0.10"
+
+[[example]]
+name = "ik_2d_glfw"
+required-features = ["glfw-example"]
 
 [[bench]]
 name = "linear_algebra"

@@ -78,6 +78,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Jacobi SVD is deterministic and serial in both solver execution modes.
 - Made Criterion benchmarks opt-in through the `benchmarks` feature and removed
   machine-specific timing tables from the README.
+- Made the interactive GLFW inverse-kinematics example and its native windowing
+  dependencies opt-in through `glfw-example`; ordinary builds and tests no
+  longer require platform window-system development packages.
 - Added bounded canonical Jacobi-SVD benchmarks for full-rank square, tall,
   wide, and rank-deficient systems, separate from larger dense-operation sizes.
 - Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,

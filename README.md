@@ -254,7 +254,9 @@ constraints and run the solver:
   Run with `cargo run --example circuit_diode`.
 - `ik_2d_glfw`: 2D inverse kinematics chain that follows the mouse (GLFW + OpenGL + glow).
   Uses small joint/target constraint structs and `Vec2d` for joint positions.
-  Run with `cargo run --example ik_2d_glfw`.
+  Run with `cargo run --features glfw-example --example ik_2d_glfw`. This
+  explicit feature may require GLFW/X11 development packages on Linux; ordinary
+  library builds and tests do not compile those native dependencies.
 
 ## Testing
 
