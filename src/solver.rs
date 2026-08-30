@@ -159,7 +159,7 @@ pub struct SolverOptions {
     /// First and largest step multiplier tested for each Newton correction.
     pub initial_step_size: f64,
     /// Explicit ridge parameter on the normalized variable correction; zero
-    /// selects the unregularized QR/SVD solve.
+    /// selects the unregularized SVD solve.
     pub regularization: f64,
     /// Armijo sufficient-decrease coefficient for every accepted update.
     pub armijo_coefficient: f64,
@@ -289,8 +289,8 @@ pub struct EquationDiagnostic {
 /// Numerical provenance for one accepted nonlinear correction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
-    /// Rank, condition estimate, and QR/SVD method for the equation- and
-    /// variable-scaled Jacobian that produced the normalized correction.
+    /// Rank and condition estimate from the SVD of the equation- and variable-
+    /// scaled Jacobian that produced the normalized correction.
     pub effective: LeastSquaresInfo,
     /// Explicit ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or
     /// `None` when the direct Jacobian was solved.
@@ -757,7 +757,7 @@ impl NewtonRaphsonSolver {
     /// # Algorithm
     /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
     /// 2. Check root and first-order stationarity termination
-    /// 3. Solve the normalized `J * delta = -f(x)` system by QR/SVD, augmenting
+    /// 3. Solve the normalized `J * delta = -f(x)` system by SVD, augmenting
     ///    it once with the caller's exact ridge strength when requested
     /// 4. Backtrack transactionally until Armijo sufficient decrease holds
     /// 5. Commit the already-evaluated candidate as the next accepted state
@@ -893,8 +893,7 @@ impl NewtonRaphsonSolver {
             // Moore-Penrose minimum-norm correction, which preserves the
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
-            let linear_solve =
-                self.solve_least_squares_system(&scaled_jacobian, &f_neg, parallel)?;
+            let linear_solve = self.solve_least_squares_system(&scaled_jacobian, &f_neg)?;
             last_linear_solve = Some(linear_solve.diagnostic.clone());
             let delta = linear_solve.solution;
 
@@ -988,19 +987,18 @@ impl NewtonRaphsonSolver {
     /// A zero ridge parameter solves the Jacobian directly. A positive value
     /// solves the single augmented system `[J; sqrt(lambda) I] delta ~= [rhs; 0]`
     /// without first computing and discarding an unregularized correction.
-    /// Both routes use the same QR/SVD implementation and preserve its exact
-    /// structured error on failure.
+    /// Both routes use the same canonical SVD implementation and preserve its
+    /// exact structured error on failure.
     fn solve_least_squares_system(
         &self,
         j_matrix: &Matrix,
         rhs: &Matrix,
-        parallel: bool,
     ) -> Result<LinearSolveResult, MatrixError> {
         if self.options.regularization == 0.0 {
-            // The direct QR/SVD path returns the minimum-norm correction for
-            // rank-deficient systems. Conditioning remains diagnostic data; it
-            // never silently changes the equation being solved.
-            let result = j_matrix.solve_least_squares(rhs, parallel)?;
+            // The direct SVD path returns the minimum-norm correction for every
+            // rank. Conditioning remains diagnostic data; it never silently
+            // changes the equation being solved.
+            let result = j_matrix.solve_least_squares(rhs)?;
             return Ok(LinearSolveResult {
                 solution: result.solution,
                 diagnostic: LinearSolveDiagnostic {
@@ -1040,7 +1038,7 @@ impl NewtonRaphsonSolver {
             augmented_j[(j_matrix.rows() + variable, variable)] = sqrt_regularization;
         }
 
-        let result = augmented_j.solve_least_squares(&augmented_b, parallel)?;
+        let result = augmented_j.solve_least_squares(&augmented_b)?;
         Ok(LinearSolveResult {
             solution: result.solution,
             diagnostic: LinearSolveDiagnostic {
@@ -1748,9 +1746,9 @@ impl NewtonRaphsonSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Mode;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
-    use crate::{LeastSquaresMethod, Mode};
 
     struct TestRng {
         state: u64,
@@ -1886,15 +1884,17 @@ mod tests {
         assert_eq!(source.downcast_ref::<MatrixError>(), Some(&matrix_error));
     }
 
-    /// Exercise the public nonlinear solver so factorization failures cannot be
-    /// hidden by a standalone conversion test that bypasses solver dispatch.
+    /// Exercise the public nonlinear solver at an extreme finite scale so the
+    /// canonical factorization cannot reject a representable pseudoinverse
+    /// correction because of an overflowing intermediate value.
     #[test]
-    fn test_solver_run_retains_non_finite_factor_error() {
+    fn test_solver_solves_extreme_rank_deficient_linearization() {
         for mode in test_modes() {
             // Every coefficient and residual is finite at the initial point,
-            // but the duplicated 1e308-scale Jacobian columns overflow QR
-            // reflector arithmetic. This is an arithmetic factorization error,
-            // not evidence that the equation system is merely singular.
+            // and the duplicated 1e308-scale Jacobian columns have the finite
+            // minimum-norm root x=y=-5e-309. The coefficient normalization in
+            // the SVD must keep that ordinary answer representable even though
+            // the unscaled largest singular value exceeds `f64::MAX`.
             let x = Exp::var("x");
             let y = Exp::var("y");
             let huge_linear_form =
@@ -1906,13 +1906,15 @@ mod tests {
             let solver = solver_for_mode(equations, mode);
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let error = solver
+            let solution = solver
                 .solve(initial)
-                .expect_err("overflowing QR arithmetic must remain a MatrixError");
-            assert!(matches!(
-                error,
-                SolverError::Matrix(MatrixError::NonFiniteFactor { .. })
-            ));
+                .expect("the finite extreme-scale pseudoinverse root must solve");
+            for variable in ["x", "y"] {
+                let relative_error = (solution.values[variable] / -5e-309 - 1.0).abs();
+                assert!(relative_error < 1e-12, "relative error: {relative_error}");
+            }
+            assert_eq!(solution.iterations, 1);
+            assert!(solution.error < 1e-12);
         }
     }
 
@@ -2838,7 +2840,7 @@ mod tests {
                 .expect("a scaled consistent linear system should reach its root");
 
             assert_eq!(solution.iterations, 1);
-            assert_eq!(solution.values["x"], 1.0);
+            assert!((solution.values["x"] - 1.0).abs() < 1e-12);
             assert_eq!(solution.values["y"], 0.0);
             assert!(solution.error < 1e-12);
         }
@@ -2916,8 +2918,7 @@ mod tests {
             let linear = diagnostic
                 .last_linear_solve
                 .as_ref()
-                .expect("stationarity reached after a QR correction");
-            assert_eq!(linear.effective.method, LeastSquaresMethod::HouseholderQr);
+                .expect("stationarity reached after an SVD correction");
             assert_eq!(linear.regularization, None);
         }
     }
@@ -3039,15 +3040,15 @@ mod tests {
     }
 
     #[test]
-    fn test_least_squares_qr_handles_ill_conditioned_overdetermined_system_without_regularization()
+    fn test_least_squares_svd_handles_ill_conditioned_overdetermined_system_without_regularization()
     {
         let mut serial_solution: Option<Solution> = None;
         for mode in test_modes() {
             let is_serial = matches!(mode, Mode::Serial);
             // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
             // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
-            // lose the tiny distinguishing term and become singular in floating point. QR-based
-            // least squares should still solve it.
+            // lose the tiny distinguishing term and become singular in floating point. The
+            // canonical SVD should still retain and solve both singular directions.
             let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
 
             let x = Exp::var("x");
@@ -3077,7 +3078,7 @@ mod tests {
 
             let solution = solver
                 .solve(initial)
-                .expect("expected solver to converge with QR least squares");
+                .expect("expected solver to converge with SVD least squares");
 
             if is_serial {
                 serial_solution = Some(solution.clone());
@@ -3085,8 +3086,14 @@ mod tests {
                 let serial = serial_solution.as_ref().expect("serial solution missing");
                 assert_solution_close(serial, &solution, 1e-8);
             }
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
-            assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
+            // The matrix condition is roughly 2/eps, so a few ulps in the
+            // factorization can move the individual coordinates by more than
+            // the residual tolerance. Require accurate variables at the scale
+            // justified by that conditioning and retain the stricter root test
+            // through the solver's residual assertion.
+            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-7);
+            assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-7);
+            assert!(solution.error < 1e-10);
         }
     }
 
@@ -3357,8 +3364,8 @@ mod tests {
         }
     }
 
-    /// Confirm that a dependent square system uses the SVD fallback after LU
-    /// detects singularity, even when augmented regularization is disabled.
+    /// Confirm that a dependent square system uses the canonical SVD directly,
+    /// even when augmented regularization is disabled.
     #[test]
     fn test_rank_deficient_square_system_converges_without_regularization() {
         let mut serial_solution: Option<Solution> = None;
@@ -3383,7 +3390,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
             let solution = solver
                 .solve(initial)
-                .expect("the square SVD fallback should solve dependent equations");
+                .expect("the canonical SVD should solve dependent equations");
 
             // Both execution modes must select the same pseudoinverse solution
             // and terminate by satisfying the actual residual equations.
@@ -3399,7 +3406,6 @@ mod tests {
             let linear = solution
                 .last_linear_solve
                 .expect("the accepted correction must retain SVD diagnostics");
-            assert_eq!(linear.effective.method, LeastSquaresMethod::JacobiSvd);
             assert_eq!(linear.effective.rank, 1);
             assert_eq!(linear.regularization, None);
         }
@@ -3439,7 +3445,6 @@ mod tests {
                         .last_linear_solve
                         .as_ref()
                         .expect("regularized correction diagnostics must be retained");
-                    assert_eq!(linear.effective.method, LeastSquaresMethod::HouseholderQr);
                     assert_eq!(linear.regularization, Some(1e-8));
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
@@ -3463,7 +3468,7 @@ mod tests {
             .expect("the fixture has a valid square shape");
         let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1)
             .expect("the fixture has a valid right-hand-side shape");
-        let result = match solver.solve_least_squares_system(&jacobian, &rhs, false) {
+        let result = match solver.solve_least_squares_system(&jacobian, &rhs) {
             Ok(result) => result,
             Err(_) => panic!("finite ridge systems must remain solvable"),
         };

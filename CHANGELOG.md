@@ -8,9 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Added a one-sided Jacobi SVD fallback for rank-deficient square, tall, and
-  wide least-squares systems, including minimum-norm Moore-Penrose solutions.
-- Added rank, condition estimate, and QR/SVD method metadata to the canonical
+- Added a one-sided Jacobi SVD for square, tall, and wide least-squares systems,
+  including minimum-norm Moore-Penrose solutions.
+- Added singular-value rank and condition metadata to the canonical
   `LeastSquaresSolution` result.
 - Added `LinearSolveDiagnostic` to successful solutions and failed-run
   diagnostics, preserving the effective factorization and explicit ridge
@@ -45,17 +45,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Made success strict and shape-independent: `Ok(Solution)` now certifies only
   `residual_norm <= residual_tolerance`; every stationary non-root returns
   `SolverError::StationaryNonRoot`, including square and underdetermined cases.
-- Replaced the overlapping QR-named least-squares entry points with one
-  `solve_least_squares` operation returning a diagnostic result. Compatibility
-  aliases from the pre-alpha API were intentionally removed.
-- Unified nonlinear Jacobian correction policy across all shapes. Full-rank
-  systems use Householder QR and rank-deficient systems use the SVD
-  pseudoinverse; ridge regularization is caller-selected.
+- Replaced the overlapping least-squares entry points and competing QR/SVD
+  dispatcher with one canonical `solve_least_squares` SVD operation returning a
+  diagnostic result. Compatibility aliases from the pre-alpha API were
+  intentionally removed.
+- Unified nonlinear Jacobian correction policy across every shape and rank.
+  The SVD pseudoinverse supplies direct corrections, while ridge regularization
+  remains explicitly caller-selected.
 - Replaced the public fixed rank cutoff with the factorization-derived relative
   threshold `f64::EPSILON * max(rows, columns)`. `solve_least_squares` no longer
-  accepts `LeastSquaresOptions`; QR and SVD share one automatic policy.
+  accepts `LeastSquaresOptions`; SVD rank classification has one automatic policy.
 - Replaced condition-triggered regularization and retry schedules with one
-  explicit policy: zero performs a direct QR/SVD solve and a positive value
+  explicit policy: zero performs a direct SVD solve and a positive value
   performs one augmented ridge solve at exactly the configured strength.
 - Replaced the ordinary/adaptive-damping and optional-line-search split with one
   transactional Armijo update path for every `solve` call. Removed
@@ -72,13 +73,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   independent reusable numerical workspaces for every solve invocation.
 - Restricted the compiled-expression Jacobian to crate scope and removed the
   unreachable public `MatrixError::RankDeficient` variant.
-- Based parallel multiplication scheduling on complete scalar work and allowed
-  wide least-squares transposition to honor the selected execution mode.
+- Based parallel multiplication scheduling on complete scalar work. The compact
+  Jacobi SVD is deterministic and serial in both solver execution modes.
 - Made Criterion benchmarks opt-in through the `benchmarks` feature and removed
   machine-specific timing tables from the README.
-- Added an asserted rank-deficient Jacobi-SVD fallback benchmark and separated
-  bounded factorization sizes from larger dense-operation sizes, avoiding the
-  former 4096x1024 QR workload in the default benchmark command.
+- Added bounded canonical Jacobi-SVD benchmarks for full-rank square, tall,
+  wide, and rank-deficient systems, separate from larger dense-operation sizes.
 - Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
   and required CI builds to use the committed dependency graph.
 - Extended the Rust 1.86 all-target gate to Windows and macOS so the MSRV claim
@@ -102,8 +102,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stationarity, Armijo acceptance, rank and condition diagnostics, the
   linearized correction, and explicit ridge regularization. Failure diagnostics
   retain both raw and scaled per-equation residuals.
-- Corrected Householder reflector scaling and triangular condition estimation,
-  including off-diagonal growth and uniform matrix rescaling.
+- Made rank classification and Moore-Penrose solutions invariant under column
+  permutation by removing the unpivoted QR pre-classification path. Uniform
+  coefficient normalization also prevents finite extreme-scale systems from
+  overflowing during factorization, including cases whose unscaled largest
+  singular value exceeds `f64::MAX` while the final solution remains finite.
 - Corrected LU pivot classification so every pivot, including the final one,
   is compared against the complete coefficient-matrix scale.
 - Returned `MatrixError::AllocationFailed` from fallible construction instead

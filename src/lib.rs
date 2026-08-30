@@ -27,8 +27,8 @@ SOFTWARE.
 //!
 //! Build residual expressions with [`Exp`], compile their variable names once
 //! with [`Compiler`], and solve square, underdetermined, or overdetermined
-//! systems with [`NewtonRaphsonSolver`]. Rectangular linearizations use QR for
-//! full-rank systems and a Jacobi-SVD pseudoinverse for rank-deficient systems.
+//! systems with [`NewtonRaphsonSolver`]. Every linearized shape uses one
+//! Jacobi-SVD pseudoinverse policy for permutation-invariant rank decisions.
 //!
 //! The solver differentiates the supplied expression tree symbolically. It
 //! does not estimate or repair derivatives with finite differences. At a
@@ -70,9 +70,7 @@ pub mod solver;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
-pub use matrix::{
-    LeastSquaresInfo, LeastSquaresMethod, LeastSquaresSolution, Matrix, MatrixError, MatrixOperand,
-};
+pub use matrix::{LeastSquaresInfo, LeastSquaresSolution, Matrix, MatrixError, MatrixOperand};
 pub use mode::Mode;
 pub use solver::{
     EquationDiagnostic, EquationTrace, LinearSolveDiagnostic, NewtonRaphsonSolver, Solution,

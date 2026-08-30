@@ -6,7 +6,7 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 - A symbolic expression tree (`Exp`) with ordinary arithmetic operators for
   building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
-- A dense matrix type with checked LU and QR/SVD least squares (`Matrix`).
+- A dense matrix type with checked LU and Jacobi-SVD least squares (`Matrix`).
 - A Newton-Raphson solver with transactional Armijo backtracking and explicit
   regularization (`NewtonRaphsonSolver`).
 
@@ -35,13 +35,13 @@ validating the repository with the current stable toolchain.
 
 The solver supports all three system shapes:
 
-- Square systems (equations == variables): solved by the same QR/SVD policy as
-  rectangular Jacobians. Full-rank systems use QR and rank-deficient systems use
-  an SVD pseudoinverse; ridge regularization occurs only when explicitly set.
-- Under-constrained systems (equations < variables): solved via QR/SVD least squares.
+- Square systems (equations == variables): solved by the same SVD pseudoinverse
+  policy as rectangular Jacobians; ridge regularization occurs only when
+  explicitly set.
+- Under-constrained systems (equations < variables): solved via SVD least squares.
   The Moore-Penrose minimum-norm Newton correction preserves the current local
   Jacobian-null-space component for continuity.
-- Over-constrained systems (equations > variables): solved via QR/SVD least
+- Over-constrained systems (equations > variables): solved via SVD least
   squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
   system whose residual is orthogonal to every Jacobian column returns
   `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
@@ -211,7 +211,7 @@ moved into a solver. Optional equation traces are positional and must include
 exactly one entry per equation; attaching them is fallible. On failure,
 `SolverRunDiagnostic::equations` pairs every raw and scaled signed residual with
 its equation index and optional trace. Successful solutions and run diagnostics also expose
-`last_linear_solve`, which reports the effective QR/SVD rank and condition
+`last_linear_solve`, which reports the effective SVD rank and condition
 estimate and whether the caller explicitly selected ridge regularization.
 
 ```rust
@@ -281,9 +281,9 @@ cargo test --test real_world_geometry -- --show-output
 ## Benchmarks
 
 Benchmarks are in `benches/linear_algebra.rs` and compare the core matrix
-operations used by the solver. Dense operations and full-rank QR compare serial
-and parallel variants; a bounded rank-deficient group measures the Jacobi-SVD
-fallback explicitly.
+operations used by the solver. Dense multiplication and transpose compare
+serial and parallel variants; bounded square, tall, wide, and rank-deficient
+groups measure the canonical Jacobi SVD.
 
 ```bash
 # Use all available cores
@@ -293,8 +293,9 @@ cargo bench --features benchmarks
 BENCH_THREADS=16 cargo bench --features benchmarks
 ```
 
-The parallel path uses Rayon for matrix multiply, transpose, and QR
-reflector updates when the working set is large enough.
+The parallel path uses Rayon for matrix multiplication and transpose when the
+working set is large enough. The compact Jacobi SVD is deterministic and
+serial in both solver execution modes.
 
 Benchmark timings are intentionally not checked into this README: results vary
 substantially with CPU topology, memory bandwidth, compiler version, and Rayon
@@ -307,11 +308,11 @@ decisions.
 - The solver supports square, under-constrained, and over-constrained systems.
 - Underdetermined systems use the Moore-Penrose minimum-norm Newton correction,
   preserving the current Jacobian-null-space component for continuity.
-- Least squares solving uses Householder QR for full-rank systems and a
-  one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
-  avoid forming normal equations. Numerical rank uses the scale-relative
-  threshold `f64::EPSILON * max(rows, columns)` rather than a caller-provided
-  application-level cutoff.
+- Least squares solving uses one one-sided Jacobi SVD pseudoinverse for every
+  matrix shape and rank. This avoids normal equations and makes numerical rank
+  independent of variable ordering. Rank uses the scale-relative threshold
+  `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
+  level cutoff.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
   to zero: zero solves the original Jacobian once, while a positive value solves
