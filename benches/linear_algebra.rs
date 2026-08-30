@@ -1,4 +1,4 @@
-use constraint_solver::Matrix;
+use constraint_solver::{LeastSquaresMethod, Matrix};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::ThreadPoolBuilder;
 use std::hint::black_box;
@@ -36,7 +36,12 @@ fn random_matrix(rows: usize, cols: usize, rng: &mut LcgRng) -> Matrix {
     m
 }
 
-const SIZES: &[usize] = &[64, 128, 256, 512, 1024];
+/// Square sizes for multiplication and transpose throughput measurements.
+const DENSE_SIZES: &[usize] = &[64, 128, 256, 512];
+/// Base dimensions for rectangular QR; the largest tall matrix is 512x128.
+const QR_SIZES: &[usize] = &[16, 32, 64, 128];
+/// Square dimensions for the cubic Jacobi-SVD fallback workload.
+const SVD_SIZES: &[usize] = &[8, 16, 32, 64];
 const QR_RATIO: usize = 4;
 /// Dimensions for products whose output is small but whose shared inner
 /// dimension makes the total arithmetic large enough to parallelize.
@@ -87,7 +92,7 @@ fn bench_matmul(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("matmul");
-    for &size in SIZES {
+    for &size in DENSE_SIZES {
         let mut rng = LcgRng::new(123 + size as u64);
         let a = random_matrix(size, size, &mut rng);
         let b = random_matrix(size, size, &mut rng);
@@ -153,7 +158,7 @@ fn bench_transpose(c: &mut Criterion) {
         .expect("failed to build rayon thread pool");
 
     let mut group = c.benchmark_group("transpose");
-    for &size in SIZES {
+    for &size in DENSE_SIZES {
         let mut rng = LcgRng::new(456 + size as u64);
         let a = random_matrix(size, size, &mut rng);
         let t_serial = a.transpose_with_parallel(false);
@@ -183,7 +188,7 @@ fn bench_qr(c: &mut Criterion) {
         .expect("failed to build rayon thread pool");
 
     let mut group = c.benchmark_group("qr");
-    for &size in SIZES {
+    for &size in QR_SIZES {
         let mut rng = LcgRng::new(789 + size as u64);
         let m = size * QR_RATIO;
         let n = size;
@@ -191,6 +196,8 @@ fn bench_qr(c: &mut Criterion) {
         let tall_b = random_matrix(m, 1, &mut rng);
         let serial = tall.solve_least_squares(&tall_b, false).unwrap();
         let parallel = pool.install(|| tall.solve_least_squares(&tall_b, true).unwrap());
+        assert_eq!(serial.info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(parallel.info.method, LeastSquaresMethod::HouseholderQr);
         assert_eq!(serial.info.rank, parallel.info.rank);
         assert_f64_close(serial.info.cond_est, parallel.info.cond_est, 1e-8, 1e-6);
         assert_matrix_close(&serial.solution, &parallel.solution, 1e-8, 1e-6);
@@ -220,6 +227,8 @@ fn bench_qr(c: &mut Criterion) {
         let wide_b = random_matrix(n, 1, &mut rng);
         let serial = wide.solve_least_squares(&wide_b, false).unwrap();
         let parallel = pool.install(|| wide.solve_least_squares(&wide_b, true).unwrap());
+        assert_eq!(serial.info.method, LeastSquaresMethod::HouseholderQr);
+        assert_eq!(parallel.info.method, LeastSquaresMethod::HouseholderQr);
         assert_eq!(serial.info.rank, parallel.info.rank);
         assert_f64_close(serial.info.cond_est, parallel.info.cond_est, 1e-8, 1e-6);
         assert_matrix_close(&serial.solution, &parallel.solution, 1e-8, 1e-6);
@@ -248,5 +257,44 @@ fn bench_qr(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_matmul, bench_transpose, bench_qr);
+/// Measure the rank-deficient path introduced for 0.3.0 independently from QR.
+fn bench_svd_fallback(c: &mut Criterion) {
+    let mut group = c.benchmark_group("svd_fallback");
+
+    for &size in SVD_SIZES {
+        let mut rng = LcgRng::new(0x5_d0 + size as u64);
+        let mut coefficients = random_matrix(size, size, &mut rng);
+        let rhs = random_matrix(size, 1, &mut rng);
+
+        // Duplicate one column exactly so QR must report rank loss and dispatch
+        // to the Jacobi-SVD pseudoinverse. Keeping the fixture construction
+        // outside the timed closure isolates factorization and solution cost.
+        for row in 0..size {
+            coefficients[(row, size - 1)] = coefficients[(row, 0)];
+        }
+        let check = coefficients.solve_least_squares(&rhs, false).unwrap();
+        assert_eq!(check.info.method, LeastSquaresMethod::JacobiSvd);
+        assert!(check.info.rank < size);
+
+        group.bench_with_input(
+            BenchmarkId::new("square/serial", size),
+            &coefficients,
+            |bench, matrix| {
+                bench.iter(|| {
+                    let result = matrix.solve_least_squares(black_box(&rhs), false).unwrap();
+                    black_box(result);
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_matmul,
+    bench_transpose,
+    bench_qr,
+    bench_svd_fallback
+);
 criterion_main!(benches);

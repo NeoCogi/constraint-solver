@@ -257,8 +257,9 @@ cargo test
 ## Benchmarks
 
 Benchmarks are in `benches/linear_algebra.rs` and compare the core matrix
-operations used by the solver. They run both serial and parallel variants
-in the same benchmark group.
+operations used by the solver. Dense operations and full-rank QR compare serial
+and parallel variants; a bounded rank-deficient group measures the Jacobi-SVD
+fallback explicitly.
 
 ```bash
 # Use all available cores

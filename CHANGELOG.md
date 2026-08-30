@@ -68,6 +68,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wide least-squares transposition to honor the selected execution mode.
 - Made Criterion benchmarks opt-in through the `benchmarks` feature and removed
   machine-specific timing tables from the README.
+- Added an asserted rank-deficient Jacobi-SVD fallback benchmark and separated
+  bounded factorization sizes from larger dense-operation sizes, avoiding the
+  former 4096x1024 QR workload in the default benchmark command.
 - Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
   and required CI builds to use the committed dependency graph.
 - Extended the Rust 1.86 all-target gate to Windows and macOS so the MSRV claim
