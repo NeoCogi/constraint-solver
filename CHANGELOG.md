@@ -6,13 +6,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- Deflated roundoff-sized Jacobi columns at the same numerical-rank boundary
-  used by the pseudoinverse, preventing exact rank-deficient systems such as the
-  graphical IK startup pose from cycling until factorization exhaustion.
-
-## [0.3.0] - 2026-08-29
+## [0.3.0] - 2026-08-30
 
 ### Added
 
@@ -132,6 +126,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   coefficient normalization also prevents finite extreme-scale systems from
   overflowing during factorization, including cases whose unscaled largest
   singular value exceeds `f64::MAX` while the final solution remains finite.
+- Deflated roundoff-sized Jacobi columns at the same numerical-rank boundary
+  used by the pseudoinverse, preventing exact rank-deficient systems such as the
+  graphical IK startup pose from cycling until factorization exhaustion.
+- Scaled right-hand sides before compensated singular-vector projection so
+  large intermediate terms cannot overflow when cancellation leaves a finite
+  least-squares solution.
 - Returned `MatrixError::AllocationFailed` from fallible construction instead
   of panicking when an otherwise valid shape cannot reserve storage.
 - Stopped preallocating convergence history from an untrusted iteration limit;
@@ -157,6 +157,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Documented exact symbolic differentiation at domain boundaries and added a
   regression distinguishing a non-finite written derivative from a safe
   algebraic rewrite; no hidden finite-difference fallback is performed.
+- Corrected the Matrix documentation to distinguish shape and allocation checks
+  in general arithmetic from the stricter finite-value contract enforced by
+  factorization and solver boundaries.
 - Made every headless example assert its known numerical outcome and removed a
   duplicated legacy matrix-test module with stale nonlinear-LU assumptions.
 - Hardened the GLFW inverse-kinematics example's failure reporting, recovery,
