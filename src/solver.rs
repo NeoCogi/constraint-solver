@@ -757,8 +757,8 @@ impl NewtonRaphsonSolver {
     /// # Algorithm
     /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
     /// 2. Check root and first-order stationarity termination
-    /// 3. Solve `J * delta = -f(x)` with condition-aware QR/SVD least squares
-    ///    and bounded regularization when requested
+    /// 3. Solve the normalized `J * delta = -f(x)` system by QR/SVD, augmenting
+    ///    it once with the caller's exact ridge strength when requested
     /// 4. Backtrack transactionally until Armijo sufficient decrease holds
     /// 5. Commit the already-evaluated candidate as the next accepted state
     fn solve_internal(&self, initial_guess: HashMap<VarId, f64>) -> Result<Solution, SolverError> {
@@ -853,8 +853,8 @@ impl NewtonRaphsonSolver {
 
             // Every system shape can reach a first-order fixed point that is not
             // a root, particularly after rank truncation or regularization.
-            // Detect it before damping or another identical linear solve and
-            // return a non-success result with the exact stationary state.
+            // Detect it before another identical linear solve or backtracking
+            // attempt and return a non-success result at the stationary state.
             let gradient = Self::residual_gradient_measure(&scaled_jacobian, &scaled_f_vals);
             if gradient.is_stationary(self.options.stationarity_tolerance) {
                 return Err(self.stationary_non_root_error(
@@ -2604,7 +2604,7 @@ mod tests {
     }
 
     /// Verify that exhaustion preserves the current state and reports failure
-    /// instead of applying an untested minimum-damping fallback.
+    /// instead of applying an untested minimum-step fallback.
     #[test]
     fn test_line_search_reports_constant_residual_as_stationary_non_root() {
         for mode in test_modes() {
@@ -3163,16 +3163,16 @@ mod tests {
     /// backtracking associations.
     #[test]
     fn test_scaled_update_chooses_representable_multiplication_order() {
-        // Damping first underflows 1e-320 * 1e-12, while applying the large
-        // variable scale first preserves the finite result near 1e-24.
+        // Applying the step size first underflows 1e-320 * 1e-12, while
+        // applying the large variable scale first preserves a result near 1e-24.
         let recovered_from_underflow =
             NewtonRaphsonSolver::scaled_update_component(1e-320, 1e-12, 1e308);
         assert!(recovered_from_underflow.is_finite());
         assert!(recovered_from_underflow > 0.0);
         assert!((recovered_from_underflow.log10() + 24.0).abs() < 0.01);
 
-        // Scaling first overflows 1e308 * 10, while damping first preserves the
-        // finite result 1e307.
+        // Scaling first overflows 1e308 * 10, while applying the step size
+        // first preserves the finite result 1e307.
         let recovered_from_overflow =
             NewtonRaphsonSolver::scaled_update_component(1e308, 1e-2, 10.0);
         assert!(recovered_from_overflow.is_finite());
@@ -3269,8 +3269,8 @@ mod tests {
         }
     }
 
-    /// Confirm that default solver settings accept a well-conditioned retained
-    /// SVD subspace instead of damping merely because a variable is unused.
+    /// Confirm that default settings accept a well-conditioned retained SVD
+    /// subspace without changing policy merely because a variable is unused.
     #[test]
     fn test_rank_deficient_overconstrained_converges_with_default_settings() {
         let mut serial_solution: Option<Solution> = None;
@@ -3345,7 +3345,7 @@ mod tests {
 
             let solution = solver
                 .solve(initial)
-                .expect("the SVD pseudoinverse should solve without damping");
+                .expect("the SVD pseudoinverse should solve without implicit regularization");
             if is_serial {
                 serial_solution = Some(solution.clone());
             } else {
