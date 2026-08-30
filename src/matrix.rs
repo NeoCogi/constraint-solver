@@ -905,13 +905,26 @@ impl Matrix {
         debug_assert_eq!(right.cols, 1);
         debug_assert!(column_scale > 0.0 && column_scale.is_finite());
 
+        // Normalize the right-hand side before summation. The left factor is a
+        // unit singular-vector component (or an orthogonal-matrix component),
+        // so both factors in every product are now bounded by one. This prevents
+        // a run of same-sign terms from overflowing before later terms cancel to
+        // a representable dot product.
+        let right_scale = (0..right.rows)
+            .map(|row| right[(row, 0)].abs())
+            .fold(0.0_f64, f64::max);
+        if right_scale == 0.0 {
+            // Every right-hand-side component is exactly zero, making the dot
+            // product zero without entering the normalization loop below.
+            return Ok(0.0);
+        }
+
         let mut sum = 0.0;
         let mut correction = 0.0;
         for row in 0..left.rows {
-            let product = (left[(row, left_column)] / column_scale) * right[(row, 0)];
-            if !product.is_finite() {
-                return Err(MatrixError::NonFiniteResult { operation });
-            }
+            let normalized_left = left[(row, left_column)] / column_scale;
+            let normalized_right = right[(row, 0)] / right_scale;
+            let product = normalized_left * normalized_right;
 
             // Neumaier compensation retains low-order terms even when the next
             // product is much larger than the running sum.
@@ -927,7 +940,10 @@ impl Matrix {
             }
         }
 
-        let result = sum + correction;
+        // Restore the common right-hand-side scale through exponent arithmetic.
+        // A non-finite result now means the mathematical projection itself lies
+        // outside f64, not that an avoidable intermediate partial sum overflowed.
+        let result = product_ratio([sum + correction, right_scale], []);
         if result.is_finite() {
             Ok(result)
         } else {
@@ -1557,15 +1573,28 @@ mod tests {
         }
     }
 
+    /// Preserve a finite least-squares solution when same-sign projection terms
+    /// overflow in source order before later terms cancel them.
     #[test]
-    fn test_solve_least_squares_overdetermined_exact() {
-        // A is 3x2, consistent system with exact solution x=[1,2].
-        let a = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], 3, 2).unwrap();
-        let b = Matrix::from_vec(vec![1.0, 2.0, 3.0], 3, 1).unwrap();
+    fn test_solve_least_squares_scales_large_cancelling_projection() {
+        let coefficients = Matrix::from_vec(vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0], 6, 1)
+            .expect("the coefficient fixture has six rows");
+        let right_hand_side = Matrix::from_vec(
+            vec![f64::MAX, f64::MAX, f64::MAX, f64::MAX, f64::MAX, 0.0],
+            6,
+            1,
+        )
+        .expect("the right-hand-side fixture has six rows");
 
-        let result = solve_default(&a, &b);
-        assert!((result.solution[(0, 0)] - 1.0).abs() < 1e-12);
-        assert!((result.solution[(1, 0)] - 2.0).abs() < 1e-12);
+        // A^T*b is exactly MAX after three positive and two negative MAX terms
+        // cancel, while A^T*A is six. The old source-order partial sum overflowed
+        // on its third positive term and rejected this representable result.
+        let result = solve_default(&coefficients, &right_hand_side);
+        let expected = f64::MAX / 6.0;
+        let relative_error = (result.solution[(0, 0)] / expected - 1.0).abs();
+
+        assert_eq!(result.info.rank, 1);
+        assert!(relative_error < 1e-15, "relative error: {relative_error}");
     }
 
     #[test]
