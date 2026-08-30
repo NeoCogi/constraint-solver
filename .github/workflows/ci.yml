@@ -75,10 +75,11 @@ jobs:
       - name: Test all targets at the MSRV
         run: cargo test --locked --all-targets
 
-      # Compile the native graphical example explicitly. Its feature is omitted
-      # from ordinary tests so library contributors do not need X11 headers.
-      - name: Check graphical example at the MSRV
-        run: cargo check --locked --example ik_2d_glfw --features glfw-example
+      # Exercise the native graphical example's headless model tests explicitly.
+      # Its feature is omitted from ordinary tests so library contributors do
+      # not need X11 headers.
+      - name: Test graphical example at the MSRV
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
 
   portable-msrv:
     name: Test all targets on ${{ matrix.os }} with Rust 1.86
@@ -113,8 +114,8 @@ jobs:
 
       # Windows and macOS consume glfw's prebuilt native libraries while still
       # proving the optional example graph supports the declared compiler floor.
-      - name: Check graphical example at the MSRV
-        run: cargo check --locked --example ik_2d_glfw --features glfw-example
+      - name: Test graphical example at the MSRV
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
 
   validate:
     name: Format, lint, test, and package
@@ -162,6 +163,12 @@ jobs:
       # executed as part of the correctness suite.
       - name: Run unit and example tests
         run: cargo test --locked --all-targets
+
+      # `required-features` excludes the native example from the ordinary test
+      # command above. Enable it here to retain its five headless geometry and
+      # end-to-end solver regressions on the stable toolchain.
+      - name: Run graphical example tests
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
 
       # Optimized arithmetic disables debug overflow traps. Re-run library
       # regressions in the release profile so coordinate and dimension safety

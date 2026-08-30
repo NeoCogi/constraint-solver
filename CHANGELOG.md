@@ -80,7 +80,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   machine-specific timing tables from the README.
 - Made the interactive GLFW inverse-kinematics example and its native windowing
   dependencies opt-in through `glfw-example`; ordinary builds and tests no
-  longer require platform window-system development packages.
+  longer require platform window-system development packages, while CI enables
+  the feature explicitly for its five headless model regressions.
 - Added bounded canonical Jacobi-SVD benchmarks for full-rank square, tall,
   wide, and rank-deficient systems, separate from larger dense-operation sizes.
 - Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
