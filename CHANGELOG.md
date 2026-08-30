@@ -27,6 +27,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dimensions, allocation failure, non-finite states, and failed convergence.
 - Added executable crate documentation, compiled README examples, complete
   public API documentation, and the `missing_docs` lint.
+- Added an explicit package allowlist so repository workflows, ignore rules,
+  and future local tooling files are not published with the crate.
 - Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
   builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
   headless examples, documentation tests, benchmark compilation, and package

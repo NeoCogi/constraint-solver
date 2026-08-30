@@ -16,6 +16,19 @@ keywords = [
     "optimization",
 ]
 categories = ["mathematics", "science", "algorithms"]
+# Keep repository automation and local tooling out of the crate archive. New
+# publishable assets must be added deliberately rather than leaking through a
+# growing VCS checkout by default.
+include = [
+    "src/**",
+    "examples/**",
+    "benches/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
 
 [features]
 # Keep the harnessless Criterion executable out of ordinary all-target test
