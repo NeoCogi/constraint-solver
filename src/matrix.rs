@@ -486,10 +486,12 @@ impl Matrix {
         let relative_rank_tolerance = numerical_rank_relative_tolerance(m, n);
 
         // Trivial cases have a unique zero-length or minimum-norm zero solution
-        // and require no numerical factorization.
+        // and require no numerical factorization. The returned variable vector
+        // can still be impossibly large when the coefficient matrix has zero
+        // rows, so preserve the fallible solve contract while allocating it.
         if n == 0 || m == 0 {
             return Ok(LeastSquaresSolution {
-                solution: Matrix::new(n, 1),
+                solution: Matrix::try_new(n, 1)?,
                 info: LeastSquaresInfo {
                     rank: 0,
                     cond_est: f64::INFINITY,
@@ -551,15 +553,30 @@ impl Matrix {
 
         // Decomposing A^T for a wide system keeps the Jacobi kernel compact and
         // avoids manufacturing zero singular columns merely to make A tall.
-        let mut factor_input = if tall_orientation {
-            a.clone()
+        // Build either orientation through the checked constructor instead of
+        // using `Clone` or the infallible public transpose operation: every
+        // allocation beneath this `Result`-returning API must remain observable
+        // as `MatrixError::AllocationFailed`.
+        let factor_rows = rows.max(cols);
+        let factor_cols = rows.min(cols);
+        let mut factor_input = Matrix::try_new(factor_rows, factor_cols)?;
+        if tall_orientation {
+            // Combine the copy and coefficient normalization into one pass so
+            // the owned Jacobi workspace is the only duplicate of A.
+            for (target, source) in factor_input.data.iter_mut().zip(&a.data) {
+                *target = *source / coefficient_scale;
+            }
         } else {
-            a.transpose()
-        };
-        for value in &mut factor_input.data {
-            *value /= coefficient_scale;
+            // Materialize the normalized transpose directly. Both source axes
+            // are known to be non-empty here, so every logical coordinate maps
+            // to one physically allocated destination element.
+            for row in 0..rows {
+                for column in 0..cols {
+                    factor_input[(column, row)] = a[(row, column)] / coefficient_scale;
+                }
+            }
         }
-        let decomposition = Self::one_sided_jacobi_svd_columns(&factor_input)?;
+        let decomposition = Self::one_sided_jacobi_svd_columns(factor_input)?;
 
         // A relative threshold preserves the numerical rank under uniform unit
         // changes. The strict comparison deliberately classifies an all-zero
@@ -586,7 +603,9 @@ impl Matrix {
         } else {
             max_singular_value / min_retained_singular_value
         };
-        let mut solution = Matrix::new(cols, 1);
+        // Allocate the public result through the same checked path as every
+        // factorization workspace so memory failure cannot escape by panic.
+        let mut solution = Matrix::try_new(cols, 1)?;
 
         for component in 0..decomposition.singular_values.len() {
             let singular_value = decomposition.singular_values[component];
@@ -674,12 +693,21 @@ impl Matrix {
     /// Pairwise Gram entries are evaluated after scaling both columns by their
     /// largest magnitude. That scaling prevents the convergence test and
     /// rotation angle from overflowing for otherwise finite input matrices.
-    fn one_sided_jacobi_svd_columns(source: &Matrix) -> Result<JacobiSvd, MatrixError> {
-        debug_assert!(source.rows >= source.cols);
+    fn one_sided_jacobi_svd_columns(
+        mut orthogonal_columns: Matrix,
+    ) -> Result<JacobiSvd, MatrixError> {
+        debug_assert!(orthogonal_columns.rows >= orthogonal_columns.cols);
 
-        let mut orthogonal_columns = source.clone();
-        let mut right_vectors = Matrix::identity(source.cols);
-        let column_count = source.cols;
+        // Take ownership of the normalized factor input so the Jacobi kernel
+        // can rotate it in place without a second full-matrix clone. The right
+        // singular-vector basis is also allocated fallibly because an existing
+        // source matrix does not guarantee enough memory for another workspace.
+        let row_count = orthogonal_columns.rows;
+        let column_count = orthogonal_columns.cols;
+        let mut right_vectors = Matrix::try_new(column_count, column_count)?;
+        for diagonal in 0..column_count {
+            right_vectors[(diagonal, diagonal)] = 1.0;
+        }
 
         // Cyclic Jacobi converges rapidly for the small dense systems targeted
         // by this crate. The dimension-aware cap is finite so pathological
@@ -695,7 +723,7 @@ impl Matrix {
                     // Find a shared scale for the two columns. A pair of zero
                     // columns is already orthogonal and requires no rotation.
                     let mut pair_scale = 0.0_f64;
-                    for row in 0..source.rows {
+                    for row in 0..row_count {
                         pair_scale = pair_scale
                             .max(orthogonal_columns[(row, left_column)].abs())
                             .max(orthogonal_columns[(row, right_column)].abs());
@@ -710,7 +738,7 @@ impl Matrix {
                     let mut left_norm_squared = 0.0;
                     let mut right_norm_squared = 0.0;
                     let mut cross_product = 0.0;
-                    for row in 0..source.rows {
+                    for row in 0..row_count {
                         let left = orthogonal_columns[(row, left_column)] / pair_scale;
                         let right = orthogonal_columns[(row, right_column)] / pair_scale;
                         left_norm_squared += left * left;
@@ -751,7 +779,7 @@ impl Matrix {
                     // Apply the rotation to A's working columns. Saving both old
                     // entries before either write preserves the exact paired
                     // transformation at every row.
-                    for row in 0..source.rows {
+                    for row in 0..row_count {
                         let old_left = orthogonal_columns[(row, left_column)];
                         let old_right = orthogonal_columns[(row, right_column)];
                         orthogonal_columns[(row, left_column)] =
@@ -795,10 +823,21 @@ impl Matrix {
 
         // Column norms are the singular values after orthogonalization. Repeated
         // `hypot` calls avoid overflow and underflow in the sum of squares.
-        let mut singular_values = Vec::with_capacity(column_count);
+        // A `Vec::with_capacity` panic would violate the surrounding fallible
+        // factorization contract. Reserve the compact singular-value buffer
+        // explicitly and map any capacity or allocator failure to the same
+        // structured matrix allocation error used by dense workspaces.
+        let mut singular_values = Vec::new();
+        singular_values
+            .try_reserve_exact(column_count)
+            .map_err(|_| MatrixError::AllocationFailed {
+                rows: column_count,
+                cols: 1,
+                elements: column_count,
+            })?;
         for column in 0..column_count {
             let mut singular_value = 0.0_f64;
-            for row in 0..source.rows {
+            for row in 0..row_count {
                 singular_value = singular_value.hypot(orthogonal_columns[(row, column)]);
             }
             if !singular_value.is_finite() {
@@ -1679,6 +1718,32 @@ mod tests {
         let error = Matrix::try_new(usize::MAX, 1)
             .expect_err("an impossible contiguous allocation must be rejected");
 
+        assert_eq!(
+            error,
+            MatrixError::AllocationFailed {
+                rows: usize::MAX,
+                cols: 1,
+                elements: usize::MAX,
+            }
+        );
+    }
+
+    /// Preserve the fallible least-squares contract for a valid zero-storage
+    /// coefficient shape whose minimum-norm output cannot be allocated.
+    #[test]
+    fn test_zero_row_least_squares_reports_solution_allocation_failure() {
+        // Both input matrices are valid because zero rows require no storage,
+        // even though the coefficient matrix describes usize::MAX variables.
+        // The requested solution is usize::MAX by one and must therefore fail
+        // through `Result` instead of panicking in the trivial-system branch.
+        let coefficients = Matrix::from_vec(Vec::new(), 0, usize::MAX)
+            .expect("zero rows make the coefficient shape storage-free");
+        let right_hand_side = Matrix::from_vec(Vec::new(), 0, 1)
+            .expect("a zero-row right-hand side requires no storage");
+
+        let error = coefficients
+            .solve_least_squares(&right_hand_side)
+            .expect_err("the impossible solution allocation must be reported");
         assert_eq!(
             error,
             MatrixError::AllocationFailed {
