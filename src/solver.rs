@@ -1108,8 +1108,19 @@ impl NewtonRaphsonSolver {
                 unreg_delta = Some(result.solution);
                 unreg_info = Some(result.info);
             }
-            Err(err) => {
-                unregularized_error = Some(err.to_string());
+            Err(error @ MatrixError::Singular { .. }) => {
+                // Singularity is the one factorization failure that ridge
+                // regularization is designed to recover. Retain its text only
+                // for the eventual solver-level diagnostic if every bounded
+                // fallback also proves singular.
+                unregularized_error = Some(error.to_string());
+            }
+            Err(error) => {
+                // Shape, tolerance, convergence, and non-finite arithmetic
+                // failures are not evidence that a ridge term can repair the
+                // linear system. Preserve the exact MatrixError variant instead
+                // of retrying and flattening its machine-readable cause.
+                return Err(LeastSquaresSolveError::Matrix(error));
             }
         }
 
@@ -1133,17 +1144,18 @@ impl NewtonRaphsonSolver {
 
         let mut last_err: Option<String> = None;
         let mut last_result: Option<LinearSolveResult> = None;
-        for (attempt, multiplier) in REGULARIZATION_MULTIPLIERS.iter().copied().enumerate() {
+        for multiplier in REGULARIZATION_MULTIPLIERS.iter().copied() {
             let lambda = self.options.regularization * multiplier;
             if !lambda.is_finite() {
                 // A finite base can overflow at a stronger fixed multiplier.
-                // Stop at that boundary because all following strengths are
-                // larger and therefore unusable as well.
-                last_err = Some(format!(
-                    "Regularization strength overflowed before attempt {}",
-                    attempt + 1
+                // This is an arithmetic failure, not matrix singularity, and
+                // every following strength is larger. Report it through the
+                // same structured channel as factorization overflow.
+                return Err(LeastSquaresSolveError::Matrix(
+                    MatrixError::NonFiniteFactor {
+                        operation: "regularized least-squares strength",
+                    },
                 ));
-                break;
             }
             let sqrt_reg = lambda.sqrt();
 
@@ -1230,8 +1242,16 @@ impl NewtonRaphsonSolver {
                     }
                     last_result = Some(linear_result);
                 }
-                Err(err) => {
-                    last_err = Some(err.to_string());
+                Err(error @ MatrixError::Singular { .. }) => {
+                    // A stronger ridge value may recover a genuinely singular
+                    // augmented factorization, so only this variant advances to
+                    // the next member of the bounded schedule.
+                    last_err = Some(error.to_string());
+                }
+                Err(error) => {
+                    // Never disguise arithmetic or structural matrix failures
+                    // as exhaustion of the solver's singularity fallback.
+                    return Err(LeastSquaresSolveError::Matrix(error));
                 }
             }
         }
@@ -2028,6 +2048,36 @@ mod tests {
         let source = std::error::Error::source(&solver_error)
             .expect("a structured matrix failure must remain in the error chain");
         assert_eq!(source.downcast_ref::<MatrixError>(), Some(&matrix_error));
+    }
+
+    /// Exercise the public nonlinear solver so factorization failures cannot be
+    /// hidden by a standalone conversion test that bypasses solver dispatch.
+    #[test]
+    fn test_solver_run_retains_non_finite_factor_error() {
+        for mode in test_modes() {
+            // Every coefficient and residual is finite at the initial point,
+            // but the duplicated 1e308-scale Jacobian columns overflow QR
+            // reflector arithmetic. This is an arithmetic factorization error,
+            // not evidence that the equation system is merely singular.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let huge_linear_form =
+                Exp::add(Exp::mul(Exp::val(-1e308), x), Exp::mul(Exp::val(-1e308), y));
+            let equations = vec![
+                Exp::sub(huge_linear_form.clone(), Exp::val(1.0)),
+                Exp::sub(huge_linear_form, Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("overflowing QR arithmetic must remain a MatrixError");
+            assert!(matches!(
+                error,
+                SolverError::Matrix(MatrixError::NonFiniteFactor { .. })
+            ));
+        }
     }
 
     #[test]
