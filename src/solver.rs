@@ -29,7 +29,7 @@ use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
 use crate::mode::{Mode, build_thread_pool};
-use crate::scaled::product_ratio;
+use crate::scaled::{ScaledSum, product_ratio};
 use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
@@ -1471,39 +1471,25 @@ impl NewtonRaphsonSolver {
             }
 
             let mut scaled_column_norm = 0.0_f64;
-            let mut dot = 0.0;
-            let mut compensation = 0.0;
+            let mut dot = ScaledSum::default();
             for row in 0..jacobian.rows() {
                 let scaled_jacobian = jacobian[(row, column)] / column_scale;
                 let scaled_residual = residuals[(row, 0)] / residual_scale;
                 scaled_column_norm = scaled_column_norm.hypot(scaled_jacobian);
-                let product = scaled_jacobian * scaled_residual;
-
-                // Neumaier compensation preserves genuine cancellation at a
-                // stationary least-squares point without reconstructing raw,
-                // potentially overflowing products first.
-                let next = dot + product;
-                compensation += if dot.abs() >= product.abs() {
-                    (dot - next) + product
-                } else {
-                    (product - next) + dot
-                };
-                dot = next;
+                // Route the normalized dot product through the same scaled
+                // compensated reduction as matrix and SVD reconstruction.
+                dot.add_product_ratio([scaled_jacobian, scaled_residual], []);
             }
 
-            let scaled_dot = dot + compensation;
+            let scaled_dot = dot.total();
             let cosine = (scaled_dot.abs() / scaled_column_norm / scaled_residual_norm).min(1.0);
             maximum_cosine = maximum_cosine.max(cosine);
 
             // Reconstruct the normalized gradient component for diagnostics,
-            // multiplying by the smaller internal scale first to avoid needless
-            // overflow. An infinite norm remains valid when its mathematical
+            // combining all three factors through exponent arithmetic. An
+            // infinite norm remains valid when its completed mathematical
             // magnitude exceeds `f64`; it does not affect the finite cosine.
-            let gradient_component = if column_scale < residual_scale {
-                (scaled_dot * column_scale) * residual_scale
-            } else {
-                (scaled_dot * residual_scale) * column_scale
-            };
+            let gradient_component = product_ratio([scaled_dot, column_scale, residual_scale], []);
             absolute_norm = absolute_norm.hypot(gradient_component);
         }
 
@@ -1572,33 +1558,17 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // Accumulate the normalized dot product with Neumaier compensation.
-        // Dividing each residual first keeps every product representable in
-        // cases where the old raw residual-times-velocity product overflowed.
-        let mut sum = 0.0;
-        let mut compensation = 0.0;
+        // Accumulate the normalized dot product through the common scaled
+        // reduction. Dividing each residual first defines the norm derivative,
+        // while exponent alignment keeps both products and partial sums from
+        // failing before a finite completed slope is known.
+        let mut slope = ScaledSum::default();
         for row in 0..scaled_residuals.rows() {
             let normalized_residual = scaled_residuals[(row, 0)] / residual_norm;
-            let product = normalized_residual * residual_velocity[(row, 0)];
-            if !product.is_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Line-search residual-norm slope overflowed",
-                    accepted_updates,
-                    vars,
-                    diagnostic_residuals,
-                ));
-            }
-
-            let next = sum + product;
-            if sum.abs() >= product.abs() {
-                compensation += (sum - next) + product;
-            } else {
-                compensation += (product - next) + sum;
-            }
-            sum = next;
+            slope.add_product_ratio([normalized_residual, residual_velocity[(row, 0)]], []);
         }
 
-        let residual_norm_derivative = sum + compensation;
+        let residual_norm_derivative = slope.total();
         if !residual_norm_derivative.is_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Line-search residual-norm slope accumulation overflowed",
@@ -3043,6 +3013,37 @@ mod tests {
             assert_eq!(diagnostic.gradient_norm, Some(0.0));
             assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
             assert!(diagnostic.error.is_infinite());
+        }
+    }
+
+    /// Preserve a representable public gradient norm when reconstructing it
+    /// requires three factors whose naive association underflows.
+    #[test]
+    fn test_gradient_diagnostic_uses_scale_safe_factor_reconstruction() {
+        for mode in test_modes() {
+            // At x=0, J^T*f is exactly 1e-308: only the first equation depends
+            // on x. Max-normalized stationarity remains correct, but multiplying
+            // scaled_dot by the tiny column scale before the large residual
+            // scale used to underflow the public absolute diagnostic to zero.
+            let x = Exp::var("x");
+            let equations = vec![
+                Exp::add(Exp::mul(Exp::val(1e-308), x), Exp::val(1.0)),
+                Exp::val(1e308),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve(initial)
+                .expect_err("the non-zero residual is stationary at the initial point");
+            let diagnostic = expect_stationary_non_root(error);
+            let gradient_norm = diagnostic
+                .gradient_norm
+                .expect("stationarity evaluation must include its absolute norm");
+            let relative_error = (gradient_norm / 1e-308 - 1.0).abs();
+
+            assert!(gradient_norm > 0.0);
+            assert!(relative_error < 1e-12, "relative error: {relative_error:e}");
         }
     }
 

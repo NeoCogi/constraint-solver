@@ -34,7 +34,7 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
 
-use crate::scaled::product_ratio;
+use crate::scaled::{ScaledSum, ScaledValue};
 use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 16_384;
@@ -614,7 +614,21 @@ impl Matrix {
         // factorization workspace so memory failure cannot escape by panic.
         let mut solution = Matrix::try_new(cols, 1)?;
 
-        for component in 0..decomposition.singular_values.len() {
+        // Project the right-hand side onto every retained singular direction
+        // without converting those intermediate coordinates back to `f64`.
+        // A projection may exceed the scalar exponent range even when division
+        // by its singular value and reconstruction produce finite variables.
+        let component_count = decomposition.singular_values.len();
+        let mut projections = Vec::new();
+        projections
+            .try_reserve_exact(component_count)
+            .map_err(|_| MatrixError::AllocationFailed {
+                rows: component_count,
+                cols: 1,
+                elements: component_count,
+            })?;
+        projections.resize(component_count, ScaledValue::ZERO);
+        for (component, projection) in projections.iter_mut().enumerate() {
             let singular_value = decomposition.singular_values[component];
             if singular_value <= rank_tolerance {
                 // Omitting this singular direction is exactly the pseudoinverse
@@ -622,73 +636,65 @@ impl Matrix {
                 continue;
             }
 
-            if tall_orientation {
+            *projection = if tall_orientation {
                 // A*V=B=U*Sigma, so this coefficient is
                 // (U_component^T*b)/sigma. Normalizing B before the dot product
                 // prevents squaring a large or tiny singular value explicitly.
-                let projection = Self::compensated_scaled_column_dot(
+                Self::scaled_column_dot(
                     &decomposition.orthogonal_columns,
                     component,
                     singular_value,
                     b,
-                    "solve_least_squares",
-                )?;
-                // `singular_value` belongs to A/coefficient_scale. Restore the
-                // original scale through exponent arithmetic so neither the
-                // unscaled singular value nor a fragile intermediate quotient
-                // has to be materialized.
-                let coefficient = product_ratio([projection], [singular_value, coefficient_scale]);
-                if !coefficient.is_finite() {
-                    return Err(MatrixError::NonFiniteResult {
-                        operation: "solve_least_squares",
-                    });
-                }
-
-                // V maps each retained singular-coordinate coefficient back to
-                // the original variable space.
-                for row in 0..cols {
-                    let contribution = decomposition.right_vectors[(row, component)] * coefficient;
-                    solution[(row, 0)] += contribution;
-                    if !solution[(row, 0)].is_finite() {
-                        return Err(MatrixError::NonFiniteResult {
-                            operation: "solve_least_squares",
-                        });
-                    }
-                }
+                )
             } else {
                 // A^T*V=B=U*Sigma implies A=V*Sigma*U^T. Project the right-hand
                 // side onto V, then map the scaled coefficient into U to obtain
                 // the minimum-norm variable vector.
-                let projection = Self::compensated_scaled_column_dot(
-                    &decomposition.right_vectors,
-                    component,
-                    1.0,
-                    b,
-                    "solve_least_squares",
-                )?;
-                // Restore the coefficient scale through the same exponent-safe
-                // ratio used by the tall orientation above.
-                let coefficient = product_ratio([projection], [singular_value, coefficient_scale]);
-                if !coefficient.is_finite() {
-                    return Err(MatrixError::NonFiniteResult {
-                        operation: "solve_least_squares",
-                    });
+                Self::scaled_column_dot(&decomposition.right_vectors, component, 1.0, b)
+            };
+        }
+
+        // Reconstruct each output coordinate through one exponent-aligned
+        // compensated sum. No singular coefficient or contribution is first
+        // materialized as `f64`; only the final caller-visible variable is
+        // checked for representability.
+        for row in 0..cols {
+            let mut reconstructed = ScaledSum::default();
+            for (component, &projection) in projections.iter().enumerate() {
+                let singular_value = decomposition.singular_values[component];
+                if singular_value <= rank_tolerance {
+                    continue;
                 }
 
-                // A column of B divided by sigma is the corresponding left
-                // singular vector U in the original variable space.
-                for row in 0..cols {
-                    let variable_direction =
-                        decomposition.orthogonal_columns[(row, component)] / singular_value;
-                    let contribution = variable_direction * coefficient;
-                    solution[(row, 0)] += contribution;
-                    if !solution[(row, 0)].is_finite() {
-                        return Err(MatrixError::NonFiniteResult {
-                            operation: "solve_least_squares",
-                        });
-                    }
+                if tall_orientation {
+                    // V maps the projected coordinate back to the original
+                    // variable space. The normalized singular value and the
+                    // global coefficient scale together restore A's units.
+                    reconstructed.add_scaled_product_ratio(
+                        projection,
+                        [decomposition.right_vectors[(row, component)]],
+                        [singular_value, coefficient_scale],
+                    );
+                } else {
+                    // In the transposed orientation, the stored orthogonal
+                    // column equals U*sigma. Dividing by sigma once recovers U,
+                    // and dividing the projection by the original sigma adds a
+                    // second normalized singular-value denominator.
+                    reconstructed.add_scaled_product_ratio(
+                        projection,
+                        [decomposition.orthogonal_columns[(row, component)]],
+                        [singular_value, singular_value, coefficient_scale],
+                    );
                 }
             }
+
+            let value = reconstructed.total();
+            if !value.is_finite() {
+                return Err(MatrixError::NonFiniteResult {
+                    operation: "solve_least_squares",
+                });
+            }
+            solution[(row, 0)] = value;
         }
 
         Ok((solution, LeastSquaresInfo { rank, cond_est }))
@@ -764,16 +770,19 @@ impl Matrix {
                     // Form the two-by-two Gram matrix in scaled coordinates.
                     // Each summand is bounded, keeping the angle computation
                     // finite whenever the number of rows is representable.
-                    let mut left_norm_squared = 0.0;
-                    let mut right_norm_squared = 0.0;
-                    let mut cross_product = 0.0;
+                    let mut left_norm_squared = ScaledSum::default();
+                    let mut right_norm_squared = ScaledSum::default();
+                    let mut cross_product = ScaledSum::default();
                     for row in 0..row_count {
                         let left = orthogonal_columns[(row, left_column)] / pair_scale;
                         let right = orthogonal_columns[(row, right_column)] / pair_scale;
-                        left_norm_squared += left * left;
-                        right_norm_squared += right * right;
-                        cross_product += left * right;
+                        left_norm_squared.add_product_ratio([left, left], []);
+                        right_norm_squared.add_product_ratio([right, right], []);
+                        cross_product.add_product_ratio([left, right], []);
                     }
+                    let left_norm_squared = left_norm_squared.total();
+                    let right_norm_squared = right_norm_squared.total();
+                    let cross_product = cross_product.total();
 
                     if !left_norm_squared.is_finite()
                         || !right_norm_squared.is_finite()
@@ -894,67 +903,31 @@ impl Matrix {
         })
     }
 
-    /// Compute a compensated dot product between one normalized matrix column
-    /// and a single-column right-hand side.
+    /// Compute a scaled compensated dot product between one matrix column and a
+    /// single-column right-hand side.
     ///
     /// `column_scale` is normally the column's singular value, producing a unit
     /// left singular vector without allocating it. Passing one computes an
     /// ordinary column dot product for an already normalized orthogonal matrix.
-    fn compensated_scaled_column_dot(
+    fn scaled_column_dot(
         left: &Matrix,
         left_column: usize,
         column_scale: f64,
         right: &Matrix,
-        operation: &'static str,
-    ) -> Result<f64, MatrixError> {
+    ) -> ScaledValue {
         debug_assert_eq!(left.rows, right.rows);
         debug_assert_eq!(right.cols, 1);
         debug_assert!(column_scale > 0.0 && column_scale.is_finite());
 
-        // Normalize the right-hand side before summation. The left factor is a
-        // unit singular-vector component (or an orthogonal-matrix component),
-        // so both factors in every product are now bounded by one. This prevents
-        // a run of same-sign terms from overflowing before later terms cancel to
-        // a representable dot product.
-        let right_scale = (0..right.rows)
-            .map(|row| right[(row, 0)].abs())
-            .fold(0.0_f64, f64::max);
-        if right_scale == 0.0 {
-            // Every right-hand-side component is exactly zero, making the dot
-            // product zero without entering the normalization loop below.
-            return Ok(0.0);
-        }
-
-        let mut sum = 0.0;
-        let mut correction = 0.0;
+        // Carry each product's exponent into the shared accumulator instead of
+        // choosing a right-hand-side normalization specific to this one dot
+        // product. This is the same reduction policy used during reconstruction
+        // and matrix multiplication.
+        let mut dot = ScaledSum::default();
         for row in 0..left.rows {
-            let normalized_left = left[(row, left_column)] / column_scale;
-            let normalized_right = right[(row, 0)] / right_scale;
-            let product = normalized_left * normalized_right;
-
-            // Neumaier compensation retains low-order terms even when the next
-            // product is much larger than the running sum.
-            let next_sum = sum + product;
-            if sum.abs() >= product.abs() {
-                correction += (sum - next_sum) + product;
-            } else {
-                correction += (product - next_sum) + sum;
-            }
-            sum = next_sum;
-            if !sum.is_finite() || !correction.is_finite() {
-                return Err(MatrixError::NonFiniteResult { operation });
-            }
+            dot.add_product_ratio([left[(row, left_column)], right[(row, 0)]], [column_scale]);
         }
-
-        // Restore the common right-hand-side scale through exponent arithmetic.
-        // A non-finite result now means the mathematical projection itself lies
-        // outside f64, not that an avoidable intermediate partial sum overflowed.
-        let result = product_ratio([sum + correction, right_scale], []);
-        if result.is_finite() {
-            Ok(result)
-        } else {
-            Err(MatrixError::NonFiniteResult { operation })
-        }
+        dot.scaled_total()
     }
 
     /// Return the Frobenius norm without introducing avoidable intermediate
@@ -1137,31 +1110,35 @@ impl Matrix {
         let scalar_work = self.rows.saturating_mul(rhs.cols).saturating_mul(self.cols);
         if parallel && should_parallelize_work(scalar_work) {
             let rhs_cols = rhs.cols;
-            // Assign complete output rows to workers. Each row is disjoint, so
-            // accumulation needs no locks and retains serial summation order
-            // within every individual result cell.
+            // Assign complete output rows to workers. Each row is disjoint, and
+            // every cell traverses the shared dimension in the same order as
+            // the serial path, so scaling and compensation remain deterministic.
             result
                 .data
                 .par_chunks_mut(rhs_cols)
                 .enumerate()
                 .for_each(|(i, row)| {
-                    for k in 0..self.cols {
-                        let a = self[(i, k)];
-                        let rhs_row = &rhs.data[k * rhs_cols..(k + 1) * rhs_cols];
-                        for j in 0..rhs_cols {
-                            row[j] += a * rhs_row[j];
+                    for (j, output) in row.iter_mut().enumerate() {
+                        let mut dot = ScaledSum::default();
+                        for k in 0..self.cols {
+                            dot.add_product_ratio([self[(i, k)], rhs[(k, j)]], []);
                         }
+                        *output = dot.total();
                     }
                 });
             return Ok(result);
         }
 
         for i in 0..self.rows {
-            for k in 0..self.cols {
-                let a = self[(i, k)];
-                for j in 0..rhs.cols {
-                    result[(i, j)] += a * rhs[(k, j)];
+            for j in 0..rhs.cols {
+                // Delay every product and partial-sum range check until the
+                // completed output cell is materialized. This prevents source
+                // order from rejecting finite results after cancellation.
+                let mut dot = ScaledSum::default();
+                for k in 0..self.cols {
+                    dot.add_product_ratio([self[(i, k)], rhs[(k, j)]], []);
                 }
+                result[(i, j)] = dot.total();
             }
         }
         Ok(result)
@@ -1621,6 +1598,48 @@ mod tests {
 
         assert_eq!(result.info.rank, 1);
         assert!(relative_error < 1e-15, "relative error: {relative_error}");
+    }
+
+    /// Preserve finite variables when cancellation occurs while multiple
+    /// singular directions are reconstructed rather than within one projection.
+    #[test]
+    fn test_solve_least_squares_scales_cancelling_singular_reconstruction() {
+        let coefficients = Matrix::from_vec(
+            vec![
+                -7.565e-309,
+                6.027e-309,
+                2.538e-309,
+                -7.022e-309,
+                -5.405e-309,
+                -8.092e-309,
+                -4.089e-309,
+                -9.221e-309,
+                9.708e-309,
+            ],
+            3,
+            3,
+        )
+        .expect("the coefficient fixture is square");
+        let right_hand_side = Matrix::from_vec(vec![-1.3260, -1.6941, 2.1713], 3, 1)
+            .expect("the right-hand-side fixture has three rows");
+
+        // Ordinary reconstruction adds two same-sign singular contributions
+        // beyond `f64::MAX` before a later direction cancels them. The complete
+        // analytical solution remains finite and close to these independently
+        // computed reference coordinates.
+        let result = solve_default(&coefficients, &right_hand_side);
+        let expected = [1.3761e308, -1.1849e308, 1.6909e308];
+
+        assert_eq!(result.info.rank, 3);
+        assert!(result.solution.all_finite());
+        for (row, expected_value) in expected.into_iter().enumerate() {
+            let relative_error = (result.solution[(row, 0)] / expected_value - 1.0).abs();
+            assert!(
+                relative_error < 5e-4,
+                "row {row}: expected {expected_value:e}, got {:e}",
+                result.solution[(row, 0)]
+            );
+        }
     }
 
     #[test]

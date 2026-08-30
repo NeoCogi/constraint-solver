@@ -1,10 +1,12 @@
-//! Scale-safe products and quotients for finite solver arithmetic.
+//! Scale-safe products, quotients, and reductions for finite solver arithmetic.
 //!
 //! Numerical normalization repeatedly combines values whose individual units
 //! can span the complete `f64` exponent range. Evaluating those expressions in
 //! an arbitrary source-code order can overflow or underflow even when the final
 //! mathematical result is representable. This module supplies one private
-//! policy that combines significands and binary exponents separately.
+//! policy that keeps intermediate products and compensated sums split into
+//! bounded significands and binary exponents until a caller-visible scalar is
+//! required.
 
 /// Fraction bits stored in one IEEE-754 binary64 value.
 const FRACTION_BITS: u32 = 52;
@@ -86,6 +88,234 @@ fn compose_positive(significand: f64, exponent: i64) -> f64 {
     significand * binary_scale
 }
 
+/// Finite scalar retained as a signed normalized significand and an independent
+/// binary exponent.
+///
+/// Keeping this representation private lets matrix and solver reductions carry
+/// an intermediate value beyond the ordinary `f64` exponent range without
+/// claiming an arbitrary-precision public number type. Only the completed
+/// result is rounded back to `f64`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScaledValue {
+    /// Signed significand whose magnitude is zero or lies in `[1, 2)`.
+    significand: f64,
+    /// Unbiased power of two applied to `significand`.
+    exponent: i64,
+}
+
+impl ScaledValue {
+    /// Exact additive identity in the scaled representation.
+    pub(crate) const ZERO: Self = Self {
+        significand: 0.0,
+        exponent: 0,
+    };
+
+    /// Normalize one signed significand/exponent pair into the representation's
+    /// stable magnitude interval.
+    fn normalized(mut significand: f64, mut exponent: i64) -> Self {
+        debug_assert!(significand.is_finite());
+        if significand == 0.0 {
+            // Canonicalizing signed zero makes accumulator initialization and
+            // exact cancellation independent of operand signs.
+            return Self::ZERO;
+        }
+
+        // Factor counts are deliberately small, but normalization here also
+        // handles a compensated sum whose magnitude grows beyond two or falls
+        // below one after cancellation.
+        while significand.abs() >= 2.0 {
+            significand *= 0.5;
+            exponent += 1;
+        }
+        while significand.abs() < 1.0 {
+            significand *= 2.0;
+            exponent -= 1;
+        }
+        Self {
+            significand,
+            exponent,
+        }
+    }
+
+    /// Form one product divided by another product without materializing a
+    /// range-sensitive intermediate `f64`.
+    pub(crate) fn product_ratio<const N: usize, const D: usize>(
+        numerators: [f64; N],
+        denominators: [f64; D],
+    ) -> Self {
+        let mut significand = 1.0;
+        let mut exponent = 0_i64;
+        let mut negative = false;
+
+        for value in numerators {
+            debug_assert!(value.is_finite());
+            if value == 0.0 {
+                // All call sites establish finite non-zero denominators, so a
+                // zero numerator makes the complete term exactly zero.
+                return Self::ZERO;
+            }
+            negative ^= value.is_sign_negative();
+            let (factor_significand, factor_exponent) = decompose_positive(value.abs());
+            significand *= factor_significand;
+            exponent += factor_exponent;
+        }
+
+        for value in denominators {
+            debug_assert!(value.is_finite() && value != 0.0);
+            negative ^= value.is_sign_negative();
+            let (factor_significand, factor_exponent) = decompose_positive(value.abs());
+            significand /= factor_significand;
+            exponent -= factor_exponent;
+        }
+
+        if negative {
+            significand = -significand;
+        }
+        Self::normalized(significand, exponent)
+    }
+
+    /// Multiply this already-scaled value by another finite product ratio while
+    /// retaining the combined exponent outside ordinary `f64` storage.
+    pub(crate) fn multiplied_ratio<const N: usize, const D: usize>(
+        self,
+        numerators: [f64; N],
+        denominators: [f64; D],
+    ) -> Self {
+        if self.significand == 0.0 {
+            // Zero remains exact and avoids decomposing factors whose values
+            // cannot affect the result.
+            return Self::ZERO;
+        }
+        let ratio = Self::product_ratio(numerators, denominators);
+        if ratio.significand == 0.0 {
+            return Self::ZERO;
+        }
+        Self::normalized(
+            self.significand * ratio.significand,
+            self.exponent + ratio.exponent,
+        )
+    }
+
+    /// Round this completed scaled value to the nearest representable `f64`.
+    pub(crate) fn to_f64(self) -> f64 {
+        if self.significand == 0.0 {
+            return 0.0;
+        }
+        let magnitude = compose_positive(self.significand.abs(), self.exponent);
+        if self.significand.is_sign_negative() {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+}
+
+/// Compensated sum whose terms are aligned by binary exponent before addition.
+///
+/// Each term can itself be a product or quotient represented by [`ScaledValue`].
+/// The accumulator therefore avoids both forms of order-dependent range loss:
+/// overflow while forming one term and overflow in a partial sum that later
+/// cancellation would have returned to the finite range.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScaledSum {
+    /// Common exponent to which `sum` and `correction` are aligned.
+    exponent: i64,
+    /// Ordinary running sum of bounded, exponent-aligned significands.
+    sum: f64,
+    /// Neumaier compensation retaining low-order rounding residuals.
+    correction: f64,
+    /// Whether a non-zero term established `exponent`.
+    initialized: bool,
+}
+
+impl Default for ScaledSum {
+    /// Construct an empty accumulator representing exact zero.
+    fn default() -> Self {
+        Self {
+            exponent: 0,
+            sum: 0.0,
+            correction: 0.0,
+            initialized: false,
+        }
+    }
+}
+
+impl ScaledSum {
+    /// Add one scaled value after aligning it with the accumulator's reference
+    /// exponent.
+    pub(crate) fn add_scaled(&mut self, value: ScaledValue) {
+        if value.significand == 0.0 {
+            // Exact zero has no exponent and cannot affect compensation.
+            return;
+        }
+
+        let term = if !self.initialized {
+            self.exponent = value.exponent;
+            self.initialized = true;
+            value.significand
+        } else if value.exponent > self.exponent {
+            // Rescale prior state downward before adopting the larger exponent.
+            // The exponent difference is non-positive and therefore cannot
+            // overflow while it is materialized as a power of two.
+            let prior_scale = compose_positive(1.0, self.exponent - value.exponent);
+            self.sum *= prior_scale;
+            self.correction *= prior_scale;
+            self.exponent = value.exponent;
+            value.significand
+        } else {
+            // Align a smaller term to the existing scale. Values more than the
+            // subnormal range below it round away exactly as ordinary `f64`
+            // precision requires, without overflowing the dominant partial sum.
+            let term_scale = compose_positive(1.0, value.exponent - self.exponent);
+            value.significand * term_scale
+        };
+
+        // Neumaier compensation keeps the rounding residue from whichever of
+        // the existing sum and new term has greater magnitude.
+        let next = self.sum + term;
+        self.correction += if self.sum.abs() >= term.abs() {
+            (self.sum - next) + term
+        } else {
+            (term - next) + self.sum
+        };
+        self.sum = next;
+    }
+
+    /// Form and add one finite product ratio through the shared scaled-number
+    /// representation.
+    pub(crate) fn add_product_ratio<const N: usize, const D: usize>(
+        &mut self,
+        numerators: [f64; N],
+        denominators: [f64; D],
+    ) {
+        self.add_scaled(ScaledValue::product_ratio(numerators, denominators));
+    }
+
+    /// Multiply an existing scaled intermediate by another product ratio and
+    /// add the combined term without prematurely converting either to `f64`.
+    pub(crate) fn add_scaled_product_ratio<const N: usize, const D: usize>(
+        &mut self,
+        value: ScaledValue,
+        numerators: [f64; N],
+        denominators: [f64; D],
+    ) {
+        self.add_scaled(value.multiplied_ratio(numerators, denominators));
+    }
+
+    /// Return the compensated result while preserving its binary exponent.
+    pub(crate) fn scaled_total(self) -> ScaledValue {
+        if !self.initialized {
+            return ScaledValue::ZERO;
+        }
+        ScaledValue::normalized(self.sum + self.correction, self.exponent)
+    }
+
+    /// Round the completed compensated sum to `f64` exactly once.
+    pub(crate) fn total(self) -> f64 {
+        self.scaled_total().to_f64()
+    }
+}
+
 /// Evaluate a product divided by another product without order-dependent
 /// intermediate overflow or underflow.
 ///
@@ -98,50 +328,14 @@ pub(crate) fn product_ratio<const N: usize, const D: usize>(
     numerators: [f64; N],
     denominators: [f64; D],
 ) -> f64 {
-    let mut significand = 1.0;
-    let mut exponent = 0_i64;
-    let mut negative = false;
-
-    for value in numerators {
-        debug_assert!(value.is_finite());
-        if value == 0.0 {
-            // All solver uses have finite non-zero denominators, so a zero
-            // numerator makes the complete mathematical product exactly zero.
-            return 0.0;
-        }
-        negative ^= value.is_sign_negative();
-        let (factor_significand, factor_exponent) = decompose_positive(value.abs());
-        significand *= factor_significand;
-        exponent += factor_exponent;
-    }
-
-    for value in denominators {
-        debug_assert!(value.is_finite() && value != 0.0);
-        negative ^= value.is_sign_negative();
-        let (factor_significand, factor_exponent) = decompose_positive(value.abs());
-        significand /= factor_significand;
-        exponent -= factor_exponent;
-    }
-
-    // At the small fixed arities used by the solver, these loops execute only a
-    // handful of times. Keeping the significand normalized makes composition
-    // independent of how many numerator or denominator factors a caller uses.
-    while significand >= 2.0 {
-        significand *= 0.5;
-        exponent += 1;
-    }
-    while significand < 1.0 {
-        significand *= 2.0;
-        exponent -= 1;
-    }
-
-    let magnitude = compose_positive(significand, exponent);
-    if negative { -magnitude } else { magnitude }
+    // Preserve the scalar convenience used by non-reduction call sites while
+    // routing its implementation through the same representation as sums.
+    ScaledValue::product_ratio(numerators, denominators).to_f64()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::product_ratio;
+    use super::{ScaledSum, product_ratio};
 
     /// Compare non-zero values relatively so subnormal regressions cannot pass
     /// merely because an absolute tolerance is much larger than the answer.
@@ -167,5 +361,24 @@ mod tests {
         // scale combinations; exponent accumulation keeps the final quotient.
         assert_relative_close(product_ratio([1.0], [1e-308, 1e308]), 1.0, 1e-12);
         assert_relative_close(product_ratio([1e308], [1e-308, 1e308]), 1e308, 1e-12);
+    }
+
+    /// Ensure partial sums and even individual terms can temporarily exceed the
+    /// `f64` exponent range when later cancellation leaves a finite answer.
+    #[test]
+    fn scaled_sum_delays_range_checks_until_the_completed_reduction() {
+        let mut partial_overflow = ScaledSum::default();
+        partial_overflow.add_product_ratio([f64::MAX], []);
+        partial_overflow.add_product_ratio([f64::MAX], []);
+        partial_overflow.add_product_ratio([-f64::MAX], []);
+        assert_eq!(partial_overflow.total(), f64::MAX);
+
+        // Each of the first two products is individually outside `f64`, but
+        // their exact cancellation must not erase the final unit term.
+        let mut term_overflow = ScaledSum::default();
+        term_overflow.add_product_ratio([f64::MAX, 2.0], []);
+        term_overflow.add_product_ratio([-f64::MAX, 2.0], []);
+        term_overflow.add_product_ratio([1.0], []);
+        assert_eq!(term_overflow.total(), 1.0);
     }
 }
