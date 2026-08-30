@@ -754,11 +754,13 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the finite non-negative regularization parameter used when the
-    /// system is ill-conditioned.
+    /// Override the finite non-negative ridge parameter applied to corrections.
     ///
-    /// Configuration is validated when a solve begins; negative values are not
-    /// converted to zero implicitly.
+    /// Zero solves each linearized Jacobian directly. A positive value augments
+    /// every linearized correction with that exact ridge strength; condition
+    /// estimates remain diagnostic and never activate regularization implicitly.
+    /// Configuration is validated when a solve begins, and negative values are
+    /// not converted to zero.
     pub fn with_regularization(mut self, regularization: f64) -> Self {
         // Retain non-finite and negative values until validation so the caller
         // receives an explicit configuration error.

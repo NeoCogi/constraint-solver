@@ -340,9 +340,10 @@ decisions.
   guess map; missing variables are treated as errors.
 - Internally, the solver differentiates and simplifies its symbolic Jacobian
   once during construction. Each solve creates independent numerical storage
-  and reuses residual, Jacobian, and regularization workspaces between
-  iterations. Matrix factorizations still allocate their own working copies and
-  temporary vectors.
+  and reuses residual, Jacobian, and line-search candidate workspaces between
+  iterations. When positive regularization is configured, each correction
+  allocates and fills its augmented ridge matrices. Matrix factorizations also
+  allocate their own working storage.
 - Derivatives are evaluated from the exact symbolic tree; the solver does not
   replace non-finite derivatives with finite differences. A finite residual at
   a domain boundary may therefore still return
