@@ -33,28 +33,6 @@ use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
 
-/// Distinct ridge strengths attempted after an enabled direct solve is judged
-/// ill-conditioned.
-///
-/// Regularization is a bounded numerical fallback, not an iteration budget.
-/// Keeping this short geometric schedule structural prevents callers from
-/// requesting unbounded work or repeating an identical factorization while
-/// still testing the base scale and two meaningfully stronger alternatives.
-const REGULARIZATION_MULTIPLIERS: [f64; 3] = [1.0, 10.0, 100.0];
-
-/// Reusable storage for the augmented system used by regularized least-squares
-/// solves.
-struct LeastSquaresWorkspace {
-    /// Coefficient matrix `[J; sqrt(lambda) I]` populated for each solve.
-    augmented_j: Matrix,
-    /// Right-hand side `[rhs; 0]` paired with `augmented_j`.
-    augmented_b: Matrix,
-    /// Number of residual rows copied from the unregularized Jacobian.
-    num_equations: usize,
-    /// Number of solve variables and regularization rows.
-    num_variables: usize,
-}
-
 /// Borrowed numerical state required to test line-search candidates for one
 /// Newton iteration.
 ///
@@ -142,50 +120,6 @@ impl ResidualGradientMeasure {
     }
 }
 
-impl LeastSquaresWorkspace {
-    /// Allocate zero-filled augmented matrices for repeated regularized solves.
-    fn new(num_equations: usize, num_variables: usize) -> Result<Self, MatrixError> {
-        // The augmented row count is caller-derived dimension arithmetic and
-        // must be checked before allocation so release builds cannot wrap to a
-        // smaller, internally inconsistent matrix.
-        let augmented_rows =
-            num_equations
-                .checked_add(num_variables)
-                .ok_or(MatrixError::DimensionSumOverflow {
-                    operation: "regularized least-squares workspace construction",
-                    left: num_equations,
-                    right: num_variables,
-                })?;
-
-        // Both augmented matrices start at zero. Each solve overwrites the
-        // residual block and regularization diagonal; every lower off-diagonal
-        // coefficient and lower right-hand-side value remains zero forever.
-        Ok(LeastSquaresWorkspace {
-            augmented_j: Matrix::try_new(augmented_rows, num_variables)?,
-            augmented_b: Matrix::try_new(augmented_rows, 1)?,
-            num_equations,
-            num_variables,
-        })
-    }
-}
-
-/// Internal distinction between invalid linear-algebra inputs and exhaustion of
-/// both the direct and regularized least-squares paths.
-enum LeastSquaresSolveError {
-    /// A shape or matrix-operation precondition failed before a numerical solve
-    /// could be attempted.
-    Matrix(MatrixError),
-    /// Neither the unregularized solve nor any fixed augmented fallback
-    /// strength produced an acceptable solution.
-    Singular {
-        /// Explanation from the direct, unregularized path or its condition
-        /// diagnostics.
-        unregularized_error: String,
-        /// Explanation from the augmented regularized fallback.
-        regularized_error: String,
-    },
-}
-
 /// Complete numerical policy for one reusable nonlinear solver.
 ///
 /// Fields are public so pre-alpha callers can start from [`SolverOptions::default`]
@@ -202,10 +136,8 @@ pub struct SolverOptions {
     pub stationarity_tolerance: f64,
     /// First and largest step multiplier tested for each Newton correction.
     pub initial_step_size: f64,
-    /// Base ridge parameter for ill-conditioned augmented least squares.
+    /// Explicit ridge parameter; zero selects the unregularized QR/SVD solve.
     pub regularization: f64,
-    /// Condition estimate above which enabled regularization is attempted.
-    pub condition_limit: f64,
     /// QR/SVD numerical-rank policy used by every Jacobian shape.
     pub least_squares: LeastSquaresOptions,
     /// Armijo sufficient-decrease coefficient for every accepted update.
@@ -226,8 +158,7 @@ impl Default for SolverOptions {
             residual_tolerance: 1e-10,
             stationarity_tolerance: 1e-10,
             initial_step_size: 1.0,
-            regularization: 1e-8,
-            condition_limit: 1e12,
+            regularization: 0.0,
             least_squares: LeastSquaresOptions::default(),
             armijo_coefficient: 1e-4,
             line_search_max_trials: 64,
@@ -321,14 +252,11 @@ pub struct EquationDiagnostic {
 /// Numerical provenance for one accepted nonlinear correction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
-    /// Rank and condition classification of the original Jacobian solve when it
-    /// completed successfully, even if it was later replaced by regularization.
-    pub unregularized: Option<LeastSquaresInfo>,
     /// Rank, condition estimate, and QR/SVD method that produced the correction
     /// actually used by the nonlinear solver.
     pub effective: LeastSquaresInfo,
-    /// Ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or `None` when the
-    /// original unregularized solution was used.
+    /// Explicit ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or
+    /// `None` when the direct Jacobian was solved.
     pub regularization: Option<f64>,
 }
 
@@ -363,10 +291,6 @@ pub struct SolverRunDiagnostic {
 /// Failures returned by solver construction, validation, and iteration.
 #[derive(Debug, Clone)]
 pub enum SolverError {
-    /// The Jacobian or regularized least-squares system could not be solved.
-    /// The diagnostic is boxed so successful `Result` values do not carry space
-    /// for maps and per-equation details that exist only on failure.
-    SingularMatrix(Box<SolverRunDiagnostic>),
     /// The configured update budget or line search ended without convergence.
     /// The diagnostic is boxed to keep the error enum compact.
     NoConvergence(Box<SolverRunDiagnostic>),
@@ -395,9 +319,6 @@ impl fmt::Display for SolverError {
     /// for callers that pattern-match the error.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SolverError::SingularMatrix(diagnostic) => {
-                write!(f, "Singular matrix: {}", diagnostic.message)
-            }
             SolverError::NoConvergence(diagnostic) => {
                 write!(f, "Solver did not converge: {}", diagnostic.message)
             }
@@ -424,8 +345,7 @@ impl std::error::Error for SolverError {
         // Only a retained matrix failure has a lower-level source object.
         match self {
             SolverError::Matrix(error) => Some(error),
-            SolverError::SingularMatrix(_)
-            | SolverError::NoConvergence(_)
+            SolverError::NoConvergence(_)
             | SolverError::NonFiniteEvaluation(_)
             | SolverError::StationaryNonRoot(_)
             | SolverError::InvalidInput(_) => None,
@@ -728,8 +648,6 @@ impl NewtonRaphsonSolver {
         let mut last_linear_solve: Option<LinearSolveDiagnostic> = None;
 
         let num_equations = jacobian.equation_count();
-        let num_variables = self.variables.len();
-
         let mut f_vals = Matrix::new(num_equations, 1);
         let mut f_neg = Matrix::new(num_equations, 1);
         // Populate the complete initial accepted state once. Subsequent
@@ -744,11 +662,6 @@ impl NewtonRaphsonSolver {
         let mut candidate_vars = vars.clone();
         let mut candidate_f_vals = Matrix::new(num_equations, 1);
 
-        let mut least_squares_workspace = if self.options.regularization > 0.0 {
-            Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
-        } else {
-            None
-        };
         let parallel = self.parallel_enabled();
 
         if !f_vals.all_finite() {
@@ -838,35 +751,8 @@ impl NewtonRaphsonSolver {
             // Moore-Penrose minimum-norm correction, which preserves the
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
-            let delta_result = self.solve_least_squares_system(
-                jacobian_workspace.jacobian(),
-                &f_neg,
-                least_squares_workspace.as_mut(),
-                parallel,
-            );
-
-            let linear_solve = match delta_result {
-                Ok(linear_solve) => linear_solve,
-                Err(LeastSquaresSolveError::Matrix(err)) => {
-                    return Err(err.into());
-                }
-                Err(LeastSquaresSolveError::Singular {
-                    unregularized_error,
-                    regularized_error,
-                }) => {
-                    let diagnostic = self.build_diagnostic(
-                        format!(
-                            "Jacobian system could not produce a Newton correction (unregularized_error: {unregularized_error}; regularized_error: {regularized_error})"
-                        ),
-                        iter,
-                        &vars,
-                        &f_vals,
-                        Some(gradient),
-                        last_linear_solve,
-                    );
-                    return Err(SolverError::SingularMatrix(Box::new(diagnostic)));
-                }
-            };
+            let linear_solve =
+                self.solve_least_squares_system(jacobian_workspace.jacobian(), &f_neg, parallel)?;
             last_linear_solve = Some(linear_solve.diagnostic.clone());
             let delta = linear_solve.solution;
 
@@ -940,218 +826,71 @@ impl NewtonRaphsonSolver {
         }
     }
 
-    /// Solve a possibly rectangular linear system against one right-hand side,
-    /// applying adaptive regularization when factorization diagnostics indicate
-    /// excessive conditioning.
+    /// Solve one linearized correction using the caller's explicit ridge policy.
     ///
-    /// Wide systems use the least-squares implementation's minimum-norm
-    /// pseudoinverse result, while square and tall systems use the same
-    /// condition-aware QR/SVD dispatcher. The paired diagnostic always
-    /// describes the correction actually returned.
+    /// A zero ridge parameter solves the Jacobian directly. A positive value
+    /// solves the single augmented system `[J; sqrt(lambda) I] delta ~= [rhs; 0]`
+    /// without first computing and discarding an unregularized correction.
+    /// Both routes use the same QR/SVD implementation and preserve its exact
+    /// structured error on failure.
     fn solve_least_squares_system(
         &self,
         j_matrix: &Matrix,
         rhs: &Matrix,
-        workspace: Option<&mut LeastSquaresWorkspace>,
         parallel: bool,
-    ) -> Result<LinearSolveResult, LeastSquaresSolveError> {
-        let mut workspace = workspace;
-        // Prefer direct least squares to avoid forming normal equations (J^T J),
-        // which can severely amplify conditioning issues. Full-rank systems use
-        // QR, while rank-deficient systems use an SVD pseudoinverse. If the
-        // retained singular subspace is still ill-conditioned, fall back to the
-        // regularized augmented system [J; sqrt(lambda) I] * x ~= [rhs; 0].
-        // Numerical rank loss alone is valid for a Moore-Penrose solve. The SVD
-        // condition estimate describes only its retained image, so finite,
-        // well-conditioned rank-deficient systems need no artificial damping.
-        let is_ill_conditioned = |info: &LeastSquaresInfo| -> bool {
-            !info.cond_est.is_finite() || info.cond_est > self.options.condition_limit
-        };
-
-        let mut unregularized_error: Option<String> = None;
-        let mut unreg_delta: Option<Matrix> = None;
-        let mut unreg_info: Option<LeastSquaresInfo> = None;
-
-        match j_matrix.solve_least_squares(rhs, self.options.least_squares, parallel) {
-            Ok(result) => {
-                if !is_ill_conditioned(&result.info) {
-                    return Ok(LinearSolveResult {
-                        solution: result.solution,
-                        diagnostic: LinearSolveDiagnostic {
-                            unregularized: Some(result.info),
-                            effective: result.info,
-                            regularization: None,
-                        },
-                    });
-                }
-                unreg_delta = Some(result.solution);
-                unreg_info = Some(result.info);
-            }
-            Err(error @ MatrixError::Singular { .. }) => {
-                // Singularity is the one factorization failure that ridge
-                // regularization is designed to recover. Retain its text only
-                // for the eventual solver-level diagnostic if every bounded
-                // fallback also proves singular.
-                unregularized_error = Some(error.to_string());
-            }
-            Err(error) => {
-                // Shape, tolerance, convergence, and non-finite arithmetic
-                // failures are not evidence that a ridge term can repair the
-                // linear system. Preserve the exact MatrixError variant instead
-                // of retrying and flattening its machine-readable cause.
-                return Err(LeastSquaresSolveError::Matrix(error));
-            }
-        }
-
-        if self.options.regularization <= 0.0 {
-            if let (Some(solution), Some(info)) = (unreg_delta, unreg_info) {
-                return Ok(LinearSolveResult {
-                    solution,
-                    diagnostic: LinearSolveDiagnostic {
-                        unregularized: Some(info),
-                        effective: info,
-                        regularization: None,
-                    },
-                });
-            }
-            return Err(LeastSquaresSolveError::Singular {
-                unregularized_error: unregularized_error
-                    .unwrap_or_else(|| "Unregularized least squares failed".to_string()),
-                regularized_error: "Regularization disabled".to_string(),
+    ) -> Result<LinearSolveResult, MatrixError> {
+        if self.options.regularization == 0.0 {
+            // The direct QR/SVD path returns the minimum-norm correction for
+            // rank-deficient systems. Conditioning remains diagnostic data; it
+            // never silently changes the equation being solved.
+            let result = j_matrix.solve_least_squares(rhs, self.options.least_squares, parallel)?;
+            return Ok(LinearSolveResult {
+                solution: result.solution,
+                diagnostic: LinearSolveDiagnostic {
+                    effective: result.info,
+                    regularization: None,
+                },
             });
         }
 
-        let mut last_err: Option<String> = None;
-        let mut last_result: Option<LinearSolveResult> = None;
-        for multiplier in REGULARIZATION_MULTIPLIERS.iter().copied() {
-            let lambda = self.options.regularization * multiplier;
-            if !lambda.is_finite() {
-                // A finite base can overflow at a stronger fixed multiplier.
-                // This is an arithmetic failure, not matrix singularity, and
-                // every following strength is larger. Report it through the
-                // same structured channel as factorization overflow.
-                return Err(LeastSquaresSolveError::Matrix(
-                    MatrixError::NonFiniteFactor {
-                        operation: "regularized least-squares strength",
-                    },
-                ));
+        // Ridge regularization is an explicit alternate linear problem. Build
+        // its storage only when the caller selected it; exact roots and default
+        // unregularized solves never allocate an augmented matrix.
+        let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
+            MatrixError::DimensionSumOverflow {
+                operation: "regularized least-squares allocation",
+                left: j_matrix.rows(),
+                right: j_matrix.cols(),
+            },
+        )?;
+        let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())?;
+        let mut augmented_b = Matrix::try_new(augmented_rows, 1)?;
+
+        // Copy the nonlinear linearization into the upper block. Fresh
+        // zero-filled matrices already contain the lower off-diagonal and
+        // right-hand-side zeros required by the ridge formulation.
+        for row in 0..j_matrix.rows() {
+            for column in 0..j_matrix.cols() {
+                augmented_j[(row, column)] = j_matrix[(row, column)];
             }
-            let sqrt_reg = lambda.sqrt();
-
-            let reg_result = match workspace.as_deref_mut() {
-                Some(workspace) => {
-                    if workspace.num_equations != j_matrix.rows()
-                        || workspace.num_variables != j_matrix.cols()
-                    {
-                        return Err(LeastSquaresSolveError::Matrix(
-                            MatrixError::DimensionMismatch {
-                                operation: "least_squares",
-                                left: (workspace.augmented_j.rows(), workspace.augmented_j.cols()),
-                                right: (j_matrix.rows(), j_matrix.cols()),
-                            },
-                        ));
-                    }
-
-                    for i in 0..workspace.num_equations {
-                        for j in 0..workspace.num_variables {
-                            workspace.augmented_j[(i, j)] = j_matrix[(i, j)];
-                        }
-                        workspace.augmented_b[(i, 0)] = rhs[(i, 0)];
-                    }
-
-                    // Construction permanently zeroes every lower
-                    // off-diagonal coefficient and lower RHS value. Only the
-                    // diagonal changes with each adaptive regularization retry,
-                    // so rewriting the entire square block would be dead work.
-                    for i in 0..workspace.num_variables {
-                        workspace.augmented_j[(workspace.num_equations + i, i)] = sqrt_reg;
-                    }
-
-                    workspace.augmented_j.solve_least_squares(
-                        &workspace.augmented_b,
-                        self.options.least_squares,
-                        parallel,
-                    )
-                }
-                None => {
-                    // This allocation fallback is normally avoided by the
-                    // reusable workspace, but it remains independently safe for
-                    // future callers that do not provide one.
-                    let augmented_rows = j_matrix.rows().checked_add(j_matrix.cols()).ok_or(
-                        LeastSquaresSolveError::Matrix(MatrixError::DimensionSumOverflow {
-                            operation: "regularized least-squares allocation",
-                            left: j_matrix.rows(),
-                            right: j_matrix.cols(),
-                        }),
-                    )?;
-                    let mut augmented_j = Matrix::try_new(augmented_rows, j_matrix.cols())
-                        .map_err(LeastSquaresSolveError::Matrix)?;
-                    let mut augmented_b = Matrix::try_new(augmented_rows, 1)
-                        .map_err(LeastSquaresSolveError::Matrix)?;
-                    for i in 0..j_matrix.rows() {
-                        for j in 0..j_matrix.cols() {
-                            augmented_j[(i, j)] = j_matrix[(i, j)];
-                        }
-                        augmented_b[(i, 0)] = rhs[(i, 0)];
-                    }
-                    for i in 0..j_matrix.cols() {
-                        augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
-                        augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
-                    }
-                    augmented_j.solve_least_squares(
-                        &augmented_b,
-                        self.options.least_squares,
-                        parallel,
-                    )
-                }
-            };
-
-            match reg_result {
-                Ok(result) => {
-                    let linear_result = LinearSolveResult {
-                        solution: result.solution,
-                        diagnostic: LinearSolveDiagnostic {
-                            unregularized: unreg_info,
-                            effective: result.info,
-                            regularization: Some(lambda),
-                        },
-                    };
-                    if !is_ill_conditioned(&result.info) {
-                        return Ok(linear_result);
-                    }
-                    last_result = Some(linear_result);
-                }
-                Err(error @ MatrixError::Singular { .. }) => {
-                    // A stronger ridge value may recover a genuinely singular
-                    // augmented factorization, so only this variant advances to
-                    // the next member of the bounded schedule.
-                    last_err = Some(error.to_string());
-                }
-                Err(error) => {
-                    // Never disguise arithmetic or structural matrix failures
-                    // as exhaustion of the solver's singularity fallback.
-                    return Err(LeastSquaresSolveError::Matrix(error));
-                }
-            }
+            augmented_b[(row, 0)] = rhs[(row, 0)];
         }
 
-        if let Some(result) = last_result {
-            return Ok(result);
+        // sqrt(lambda) on the appended diagonal makes the augmented
+        // least-squares objective exactly ||J delta-rhs||^2 + lambda||delta||^2.
+        let sqrt_regularization = self.options.regularization.sqrt();
+        for variable in 0..j_matrix.cols() {
+            augmented_j[(j_matrix.rows() + variable, variable)] = sqrt_regularization;
         }
 
-        Err(LeastSquaresSolveError::Singular {
-            unregularized_error: unregularized_error
-                .or_else(|| {
-                    unreg_info.map(|info| {
-                        format!(
-                            "Least squares ill-conditioned (rank {}, cond {:.2e})",
-                            info.rank, info.cond_est
-                        )
-                    })
-                })
-                .unwrap_or_else(|| "Unregularized least squares failed".to_string()),
-            regularized_error: last_err
-                .unwrap_or_else(|| "Regularized least squares failed".to_string()),
+        let result =
+            augmented_j.solve_least_squares(&augmented_b, self.options.least_squares, parallel)?;
+        Ok(LinearSolveResult {
+            solution: result.solution,
+            diagnostic: LinearSolveDiagnostic {
+                effective: result.info,
+                regularization: Some(self.options.regularization),
+            },
         })
     }
 
@@ -1259,17 +998,6 @@ impl NewtonRaphsonSolver {
                 && self.options.line_search_min_step <= self.options.initial_step_size,
             "line_search_min_step must be finite, positive, and no greater than initial_step_size",
         )?;
-
-        // The condition threshold has no effect when regularization is
-        // disabled. When active, require a mathematically meaningful condition
-        // number: every non-empty retained singular subspace has condition at
-        // least one.
-        if self.options.regularization > 0.0 {
-            Self::require_valid_option(
-                self.options.condition_limit.is_finite() && self.options.condition_limit >= 1.0,
-                "condition_limit must be finite and at least one",
-            )?;
-        }
 
         Ok(())
     }
@@ -1400,8 +1128,7 @@ impl NewtonRaphsonSolver {
         // configuration errors occur before numerical correction and therefore
         // have no attachment point.
         let diagnostic = match &mut error {
-            SolverError::SingularMatrix(diagnostic)
-            | SolverError::NoConvergence(diagnostic)
+            SolverError::NoConvergence(diagnostic)
             | SolverError::NonFiniteEvaluation(diagnostic)
             | SolverError::StationaryNonRoot(diagnostic) => Some(diagnostic),
             SolverError::Matrix(_) | SolverError::InvalidInput(_) => None,
@@ -2176,18 +1903,6 @@ mod tests {
                 Box::new(|solver| solver.with_regularization(f64::INFINITY)),
             ),
             (
-                "condition_limit",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.condition_limit = f64::INFINITY)
-                }),
-            ),
-            (
-                "condition_limit",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.condition_limit = 0.5)
-                }),
-            ),
-            (
                 "least_squares.relative_rank_tolerance",
                 Box::new(|solver| {
                     configure_options(solver, |options| {
@@ -2231,27 +1946,6 @@ mod tests {
                 }
                 other => panic!("expected InvalidInput, got {other:?}"),
             }
-        }
-    }
-
-    /// Ignore condition policy only when regularization is disabled.
-    #[test]
-    fn test_configuration_validation_ignores_inactive_policy() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
-            let equation = Exp::sub(x, Exp::val(1.0));
-            let initial = HashMap::from([("x".to_string(), 1.0)]);
-
-            // A disabled ridge fallback cannot consult the condition threshold,
-            // so an otherwise invalid threshold remains intentionally inactive.
-            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
-                options.regularization = 0.0;
-                options.condition_limit = f64::NAN;
-            });
-            let solution = solver
-                .solve(initial)
-                .expect("inactive regularization policy must be ignored");
-            assert_eq!(solution.iterations, 0);
         }
     }
 
@@ -3289,8 +2983,8 @@ mod tests {
         }
     }
 
-    /// Confirm that a full-rank but ill-conditioned square Jacobian receives the
-    /// same regularization policy as a rectangular Jacobian.
+    /// Confirm that an explicitly regularized square solve uses the augmented
+    /// ridge system rather than first applying its direct correction.
     #[test]
     fn test_ill_conditioned_square_system_uses_regularized_least_squares() {
         for mode in test_modes() {
@@ -3306,6 +3000,7 @@ mod tests {
             let second_equation = Exp::sub(y, Exp::val(1.0));
             let solver = solver_for_mode(vec![first_equation, second_equation], mode)
                 .with_residual_tolerance(1e-12)
+                .with_regularization(1e-8)
                 .with_max_iterations(1);
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
@@ -3323,50 +3018,39 @@ mod tests {
                         .as_ref()
                         .expect("regularized correction diagnostics must be retained");
                     assert_eq!(linear.effective.method, LeastSquaresMethod::HouseholderQr);
-                    assert!(linear.regularization.is_some());
-                    assert!(
-                        linear
-                            .unregularized
-                            .is_some_and(|info| info.cond_est > 1e12)
-                    );
+                    assert_eq!(linear.regularization, Some(1e-8));
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
         }
     }
 
-    /// Keep regularization fallback finite and ensure each attempted augmented
-    /// factorization uses a distinct, stronger ridge value.
+    /// Verify that explicit regularization performs one predictable augmented
+    /// solve with exactly the caller's ridge strength.
     #[test]
-    fn test_regularization_uses_fixed_distinct_bounded_schedule() {
+    fn test_regularization_uses_exact_configured_strength() {
         let x = Exp::var("x");
         let y = Exp::var("y");
         let equation = Exp::add(x, y);
-        let solver = configure_options(solver_for_mode(vec![equation], Mode::Serial), |options| {
-            options.regularization = 1e-8;
-            options.condition_limit = 1.0;
-        });
+        let solver = solver_for_mode(vec![equation], Mode::Serial).with_regularization(1e-8);
 
-        // Every augmented diagonal system remains above the deliberately strict
-        // condition limit, forcing the fallback to exhaust its structural
-        // schedule and return the final usable result.
+        // The fixture is deliberately ill-conditioned, but conditioning no
+        // longer selects or changes policy: positive regularization means the
+        // requested augmented problem is solved exactly once.
         let jacobian = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-8], 2, 2)
             .expect("the fixture has a valid square shape");
         let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1)
             .expect("the fixture has a valid right-hand-side shape");
-        let result = match solver.solve_least_squares_system(&jacobian, &rhs, None, false) {
+        let result = match solver.solve_least_squares_system(&jacobian, &rhs, false) {
             Ok(result) => result,
             Err(_) => panic!("finite ridge systems must remain solvable"),
         };
 
-        // The last of the three distinct strengths is base * 100. A
-        // caller-controlled identical or unbounded retry loop no longer exists.
         let used_regularization = result
             .diagnostic
             .regularization
-            .expect("ill-conditioning must select an augmented solve");
-        assert!((used_regularization - 1e-6).abs() <= f64::EPSILON);
-        assert!(result.diagnostic.effective.cond_est > 1.0);
+            .expect("positive regularization must select an augmented solve");
+        assert_eq!(used_regularization, 1e-8);
     }
 
     #[test]

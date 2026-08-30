@@ -168,8 +168,7 @@ exactly one entry per equation; attaching them is fallible. On failure,
 `SolverRunDiagnostic::equations` pairs every signed residual with its equation
 index and optional trace. Successful solutions and run diagnostics also expose
 `last_linear_solve`, which reports the effective QR/SVD rank and condition
-estimate, whether regularization was used, and the original unregularized
-classification when a ridge solve replaced it.
+estimate and whether the caller explicitly selected ridge regularization.
 
 ```rust
 use constraint_solver::{Compiler, EquationTrace, Exp, NewtonRaphsonSolver};
@@ -244,10 +243,10 @@ decisions.
   one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
   avoid forming normal equations.
 - Regularization uses the augmented ridge system
-  `[J; sqrt(lambda) I] * delta ~= [-f; 0]` and is applied adaptively when the
-  retained solve subspace is ill-conditioned; use `.with_regularization(0.0)`
-  to disable it. Rank loss by itself does not force regularization when the
-  retained SVD subspace is well conditioned.
+  `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
+  to zero: zero solves the original Jacobian once, while a positive value solves
+  one augmented system using exactly that ridge strength. Condition estimates
+  are diagnostic and never silently replace the requested linear problem.
 - Line search applies a slope-based Armijo condition directly to the residual
   norm `||f||`. It evaluates the equivalent scale-safe directional derivative
   `(f / ||f||)^T (J delta)` without first forming the potentially overflowing

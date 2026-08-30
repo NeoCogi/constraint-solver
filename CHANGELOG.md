@@ -13,8 +13,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added rank, condition estimate, and QR/SVD method metadata to the canonical
   `LeastSquaresSolution` result.
 - Added `LinearSolveDiagnostic` to successful solutions and failed-run
-  diagnostics, preserving both the effective factorization and the original
-  unregularized classification when ridge regularization is selected.
+  diagnostics, preserving the effective factorization and explicit ridge
+  strength used for the accepted correction.
 - Added `SolverOptions` and `LeastSquaresOptions` as the documented sources of
   nonlinear iteration, line-search, regularization, and rank policy.
 - Added structured equation diagnostics and optional caller-provided equation
@@ -39,10 +39,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Unified nonlinear Jacobian correction policy across all shapes. Full-rank
   systems use Householder QR, rank-deficient systems use the SVD pseudoinverse,
   and ill-conditioned retained subspaces use augmented ridge regularization.
-- Replaced caller-controlled regularization retry counts and growth factors
-  with a fixed three-strength fallback, so retries are bounded and distinct.
-- Centralized numerical defaults and ignored numerical policies that the
-  selected solve path cannot execute.
+- Replaced condition-triggered regularization and retry schedules with one
+  explicit policy: zero performs a direct QR/SVD solve and a positive value
+  performs one augmented ridge solve at exactly the configured strength.
 - Replaced the ordinary/adaptive-damping and optional-line-search split with one
   transactional Armijo update path for every `solve` call. Removed
   `solve_with_line_search`, `with_damping`, and `min_damping`; the explicit
@@ -93,6 +92,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Reused accepted Armijo residuals as the next solver state, eliminating
   repeated evaluation and an unreachable duplicate success branch. Corrections
   that cannot change any variable now terminate without consuming updates.
+- Allocated augmented ridge matrices only when a positive regularization value
+  actually requests that alternate linear problem; initial roots and default
+  direct solves no longer allocate unused `(m+n) x n` storage.
 - Made line-search trial limits and initial step sizes authoritative and stopped
   rejected candidates from being counted as accepted solver updates.
 - Documented exact symbolic differentiation at domain boundaries and added a
