@@ -22,8 +22,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Checked dense matrix operations and permutation-invariant Jacobi-SVD
-//! least-squares solving.
+//! Dense matrix operations with checked shapes and allocations, plus
+//! permutation-invariant Jacobi-SVD least-squares solving.
+//!
+//! General arithmetic follows ordinary IEEE-754 `f64` semantics and can
+//! therefore produce NaN or infinity. Its fallible methods report structural
+//! and allocation failures; callers that require finite arithmetic results can
+//! verify them with [`Matrix::all_finite`]. The least-squares solver enforces a
+//! stricter contract and rejects non-finite inputs, factors, and results.
 
 use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
@@ -1026,6 +1032,11 @@ impl Matrix {
     }
 
     /// Add two identically shaped matrices element by element.
+    ///
+    /// This method checks the operand shapes and result allocation. Element
+    /// arithmetic follows ordinary IEEE-754 `f64` semantics, so overflow or
+    /// invalid operands can produce a non-finite value in the returned matrix;
+    /// use [`Matrix::all_finite`] when finite output is required.
     pub fn try_add(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Elementwise arithmetic has no meaningful broadcasting in this dense
         // API, so require both dimensions to match exactly.
@@ -1048,6 +1059,11 @@ impl Matrix {
     }
 
     /// Subtract an identically shaped right-hand matrix element by element.
+    ///
+    /// This method checks the operand shapes and result allocation. Element
+    /// arithmetic follows ordinary IEEE-754 `f64` semantics, so overflow or
+    /// invalid operands can produce a non-finite value in the returned matrix;
+    /// use [`Matrix::all_finite`] when finite output is required.
     pub fn try_sub(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Preserve the same strict shape contract as addition before allocating
         // the result buffer.
@@ -1060,8 +1076,8 @@ impl Matrix {
         }
 
         // Allocate through the checked constructor for the same reason as
-        // addition: a fallible arithmetic method must not panic while creating
-        // its output buffer.
+        // addition: a shape- and allocation-checked method must not panic while
+        // creating its output buffer.
         let mut result = Matrix::try_new(self.rows, self.cols)?;
         for i in 0..self.data.len() {
             result.data[i] = self.data[i] - rhs.data[i];
@@ -1070,6 +1086,11 @@ impl Matrix {
     }
 
     /// Multiply two shape-compatible matrices serially.
+    ///
+    /// This method checks the operand shapes and result allocation. Scalar
+    /// multiplication and accumulation follow ordinary IEEE-754 `f64`
+    /// semantics and can produce non-finite output; use [`Matrix::all_finite`]
+    /// when finite output is required.
     pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
         // Delegate validation and arithmetic to the mode-aware implementation so
         // both public entry points retain identical error behavior.
@@ -1078,6 +1099,11 @@ impl Matrix {
 
     /// Multiply two matrices while optionally parallelizing sufficiently large
     /// row computations.
+    ///
+    /// This method has the same shape, allocation, and IEEE-754 arithmetic
+    /// contract as [`Matrix::try_mul`]. Parallel execution changes work
+    /// distribution but preserves the serial accumulation order within each
+    /// result cell.
     pub fn try_mul_with_parallel(
         &self,
         rhs: &Matrix,

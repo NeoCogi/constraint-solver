@@ -6,8 +6,8 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 - A symbolic expression tree (`Exp`) with ordinary arithmetic operators for
   building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
-- A dense matrix type with checked arithmetic and canonical Jacobi-SVD least
-  squares (`Matrix`).
+- A dense matrix type with shape- and allocation-checked operations and
+  canonical Jacobi-SVD least squares (`Matrix`).
 - A Newton-Raphson solver with transactional Armijo backtracking and explicit
   regularization (`NewtonRaphsonSolver`).
 
@@ -325,6 +325,11 @@ decisions.
   independent of variable ordering. Rank uses the scale-relative threshold
   `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
   level cutoff.
+- General `Matrix` arithmetic checks operand shapes and result allocation, then
+  follows ordinary IEEE-754 `f64` semantics. Finite operands can therefore
+  produce NaN or infinity through overflow or invalid intermediate operations;
+  call `Matrix::all_finite()` where finite output is required. Factorization and
+  solver boundaries perform their own stricter non-finite validation.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
   to zero: zero solves the original Jacobian once, while a positive value solves
