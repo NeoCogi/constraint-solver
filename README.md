@@ -6,7 +6,8 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 - A symbolic expression tree (`Exp`) for building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
 - A dense matrix type with checked LU and QR/SVD least squares (`Matrix`).
-- A Newton-Raphson solver with damping, regularization, and optional line search (`NewtonRaphsonSolver`).
+- A Newton-Raphson solver with transactional Armijo backtracking and bounded
+  regularization (`NewtonRaphsonSolver`).
 
 This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
 
@@ -122,7 +123,7 @@ let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-10);
 ```
 
-### Line search
+### Globalized nonlinear solve
 
 ```rust
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
@@ -142,9 +143,9 @@ let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.5);
 initial.insert("y".to_string(), 0.25);
 
-let solution = solver
-    .solve_with_line_search(initial)
-    .expect("solve failed");
+// Every solve uses Armijo backtracking; accepted candidates are evaluated
+// before they replace the current state.
+let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-8);
 ```
 
@@ -245,8 +246,8 @@ decisions.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]` and is applied adaptively when the
   retained solve subspace is ill-conditioned; use `.with_regularization(0.0)`
-  to disable it. Rank loss by itself does not force damping when the retained
-  SVD subspace is well conditioned.
+  to disable it. Rank loss by itself does not force regularization when the
+  retained SVD subspace is well conditioned.
 - Line search applies a slope-based Armijo condition directly to the residual
   norm `||f||`. It evaluates the equivalent scale-safe directional derivative
   `(f / ||f||)^T (J delta)` without first forming the potentially overflowing

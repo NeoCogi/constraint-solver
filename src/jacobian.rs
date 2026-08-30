@@ -146,18 +146,6 @@ impl Jacobian {
         Ok(())
     }
 
-    pub(crate) fn evaluate_functions_checked(
-        &self,
-        vars: &HashMap<VarId, f64>,
-    ) -> Result<Matrix, EvaluationError> {
-        let rows = self.expressions.len();
-        let mut result = Matrix::new(rows, 1);
-
-        self.evaluate_functions_checked_into(vars, &mut result)?;
-
-        Ok(result)
-    }
-
     pub(crate) fn evaluate_functions_checked_into(
         &self,
         vars: &HashMap<VarId, f64>,

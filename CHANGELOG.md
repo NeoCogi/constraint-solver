@@ -43,6 +43,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with a fixed three-strength fallback, so retries are bounded and distinct.
 - Centralized numerical defaults and ignored numerical policies that the
   selected solve path cannot execute.
+- Replaced the ordinary/adaptive-damping and optional-line-search split with one
+  transactional Armijo update path for every `solve` call. Removed
+  `solve_with_line_search`, `with_damping`, and `min_damping`; the explicit
+  `initial_step_size` now caps the first candidate tested on each correction.
+- Applied one numerical default policy to square, tall, and wide systems instead
+  of silently changing iteration, step-size, and regularization defaults based
+  on Jacobian shape.
 - Changed Armijo line search to operate directly on the residual norm with the
   scale-safe directional derivative `(f / ||f||)^T (J delta)`.
 - Removed origin-based point projection from nonlinear iteration; every wide
@@ -83,8 +90,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Corrected accepted-iteration accounting and refreshed residuals after every
   update so returned values, errors, histories, and diagnostics describe the
   same numerical state.
-- Prevented damping adaptation from reacting to artificial history sentinels or
-  treating deliberately damped progress as convergence.
+- Reused accepted Armijo residuals as the next solver state, eliminating
+  repeated evaluation and an unreachable duplicate success branch. Corrections
+  that cannot change any variable now terminate without consuming updates.
 - Made line-search trial limits and initial step sizes authoritative and stopped
   rejected candidates from being counted as accepted solver updates.
 - Documented exact symbolic differentiation at domain boundaries and added a

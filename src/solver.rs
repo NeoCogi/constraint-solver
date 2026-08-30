@@ -22,8 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Damped Newton-Raphson iteration, line search, regularized least squares,
-//! convergence results, and structured failure diagnostics.
+//! Globalized Newton-Raphson iteration, regularized least squares, convergence
+//! results, and structured failure diagnostics.
 
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
@@ -66,6 +66,8 @@ struct LineSearchContext<'a> {
     /// Current accepted variables, including solve variables and fixed
     /// parameters.
     vars: &'a HashMap<VarId, f64>,
+    /// Reusable transaction buffer populated with each candidate state.
+    candidate_vars: &'a mut HashMap<VarId, f64>,
     /// Newton correction direction whose scalar multiplier is being searched.
     delta: &'a Matrix,
     /// Residual norm at the current accepted point.
@@ -89,6 +91,16 @@ struct LineSearchContext<'a> {
     gradient: ResidualGradientMeasure,
     /// Reusable output storage for candidate residual evaluations.
     candidate_residuals: &'a mut Matrix,
+}
+
+/// Metadata for a candidate that satisfied the solver's acceptance policy.
+///
+/// Candidate variables and residuals remain in the mutable buffers supplied to
+/// [`NewtonRaphsonSolver::line_search`]. Keeping only scalar metadata here makes
+/// acceptance explicit without allocating or copying a second owned state.
+struct AcceptedStep {
+    /// Residual norm evaluated at the accepted candidate variables.
+    residual_norm: f64,
 }
 
 /// Absolute and column-scaled measures of the nonlinear least-squares gradient
@@ -188,26 +200,24 @@ pub struct SolverOptions {
     pub residual_tolerance: f64,
     /// Maximum residual/Jacobian-column cosine used for `StationaryNonRoot`.
     pub stationarity_tolerance: f64,
-    /// Initial standard-solver damping and maximum line-search trial step.
-    pub damping_factor: f64,
-    /// Smallest damping retained by ordinary solves after adaptive reductions.
-    pub min_damping: f64,
+    /// First and largest step multiplier tested for each Newton correction.
+    pub initial_step_size: f64,
     /// Base ridge parameter for ill-conditioned augmented least squares.
     pub regularization: f64,
     /// Condition estimate above which enabled regularization is attempted.
     pub condition_limit: f64,
     /// QR/SVD numerical-rank policy used by every Jacobian shape.
     pub least_squares: LeastSquaresOptions,
-    /// Armijo sufficient-decrease coefficient used only by line search.
+    /// Armijo sufficient-decrease coefficient for every accepted update.
     pub armijo_coefficient: f64,
     /// Maximum number of candidate steps evaluated by one line search.
     pub line_search_max_trials: usize,
-    /// Smallest positive candidate step evaluated only by line search.
+    /// Smallest positive candidate step evaluated before reporting stagnation.
     pub line_search_min_step: f64,
 }
 
 impl Default for SolverOptions {
-    /// Return the ordinary square/underdetermined solver policy.
+    /// Return the crate's single globalized Newton policy.
     fn default() -> Self {
         // Keep every numerical constant visible in one value rather than
         // scattering hidden policy through iteration and factorization bodies.
@@ -215,8 +225,7 @@ impl Default for SolverOptions {
             max_iterations: 100,
             residual_tolerance: 1e-10,
             stationarity_tolerance: 1e-10,
-            damping_factor: 1.0,
-            min_damping: 0.001,
+            initial_step_size: 1.0,
             regularization: 1e-8,
             condition_limit: 1e12,
             least_squares: LeastSquaresOptions::default(),
@@ -234,12 +243,13 @@ impl Default for SolverOptions {
 /// - Under-constrained systems (equations < variables) - uses least squares
 /// - Over-constrained systems (equations > variables) - uses least squares
 ///
-/// The solver uses adaptive damping and regularization for numerical stability.
+/// Every correction is accepted transactionally by Armijo backtracking, and
+/// ill-conditioned linearized systems may use bounded ridge regularization.
 pub struct NewtonRaphsonSolver {
     /// Residual expressions and their simplified symbolic partial derivatives.
     ///
     /// Keeping this cache on the reusable solver avoids repeating symbolic
-    /// differentiation every time `solve` or `solve_with_line_search` is called.
+    /// differentiation every time [`NewtonRaphsonSolver::solve`] is called.
     jacobian: Jacobian,
     /// Variable IDs that correspond to unknowns in the system
     variables: Vec<VarId>,
@@ -444,12 +454,11 @@ impl From<MatrixError> for SolverError {
 }
 
 impl NewtonRaphsonSolver {
-    /// Create a new Newton-Raphson solver with adaptive parameters
+    /// Create a Newton-Raphson solver with one shape-independent policy.
     ///
-    /// Parameters are automatically adjusted based on system type:
-    /// - Over-constrained systems get more iterations, conservative damping,
-    ///   and stronger regularization
-    /// - Every shape uses the same residual and stationarity tolerances
+    /// Square, tall, and wide systems begin with identical iteration,
+    /// backtracking, tolerance, and regularization settings. Callers can replace
+    /// those explicit defaults through [`NewtonRaphsonSolver::with_options`].
     ///
     /// # Arguments
     /// * `compiled` - Compiled system of equations (each should evaluate to 0 at solution)
@@ -508,31 +517,20 @@ impl NewtonRaphsonSolver {
     }
 
     fn build(compiled: CompiledSystem, variables: Vec<VarId>) -> Self {
-        // Allow both under-constrained and over-constrained systems
-        // We'll use least squares to solve them
-        let is_over_constrained = compiled.equations.len() > variables.len();
-
         // Symbolic differentiation depends only on the compiled equations and
         // selected solve variables, both of which are immutable for the
         // solver's lifetime. Construct and simplify every derivative here so
         // repeated numerical solves share the result.
         let jacobian = Jacobian::new(compiled.equations, variables.clone());
 
-        // Begin with the public ordinary-system policy, then adjust only the
-        // workload and stabilization defaults for an overdetermined Jacobian.
-        // Residual and stationarity semantics remain identical for every shape.
-        let mut options = SolverOptions::default();
-        if is_over_constrained {
-            options.max_iterations = 200;
-            options.damping_factor = 0.7;
-            options.regularization = 1e-4;
-        }
-
         NewtonRaphsonSolver {
             jacobian,
             variables,
             var_table: compiled.var_table,
-            options,
+            // One numerical policy applies to square, tall, and wide systems.
+            // Shape-specific hidden defaults would make otherwise identical
+            // APIs change iteration budgets and regularization unexpectedly.
+            options: SolverOptions::default(),
             equation_traces: Vec::new(),
             mode: Mode::Serial,
             pool: None,
@@ -647,8 +645,8 @@ impl NewtonRaphsonSolver {
     /// Override the positive, finite residual norm required for success.
     ///
     /// The solver deliberately does not treat a small applied update as
-    /// convergence because damping can make a useful correction arbitrarily
-    /// small. Configuration is validated when a solve begins.
+    /// convergence because backtracking can make a useful correction
+    /// arbitrarily small. Configuration is validated when a solve begins.
     pub fn with_residual_tolerance(mut self, residual_tolerance: f64) -> Self {
         // Store without clamping so NaN, infinity, zero, and negative values are
         // observable to the common configuration validator.
@@ -669,16 +667,15 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the finite initial damping factor in the interval `(0, 1]`.
+    /// Override the finite first Armijo trial multiplier in `(0, 1]`.
     ///
-    /// Standard solves use this value for their first accepted update and adapt
-    /// it only after observing a later residual. Line-search solves use it as
-    /// the largest initial trial step on every iteration. Configuration is
-    /// validated when a solve begins; invalid values are not silently clamped.
-    pub fn with_damping(mut self, damping_factor: f64) -> Self {
-        // Preserve the requested value for deterministic validation and error
-        // reporting at the shared solve entry point.
-        self.options.damping_factor = damping_factor;
+    /// A value below one deliberately caps every correction before
+    /// backtracking. Configuration is validated when a solve begins; invalid
+    /// values are retained so the caller receives a deterministic error.
+    pub fn with_initial_step_size(mut self, initial_step_size: f64) -> Self {
+        // Store the exact policy value rather than silently clamping it into the
+        // valid interval and hiding configuration mistakes.
+        self.options.initial_step_size = initial_step_size;
         self
     }
 
@@ -694,33 +691,27 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Solve the system using standard Newton-Raphson method
+    /// Solve the system using Newton corrections accepted by Armijo backtracking.
     pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
         // Reject invalid reusable settings before translating or validating the
         // caller's variable map.
-        self.validate_configuration(false)?;
+        self.validate_configuration()?;
         let vars = self.map_initial_guess(initial_guess)?;
-        self.run_in_mode(|| self.solve_modified_internal(vars, false))
+        self.run_in_mode(|| self.solve_internal(vars))
     }
 
-    /// Core Newton-Raphson solver implementation with optional line search
+    /// Run the solver's single accepted-state Newton iteration.
     ///
     /// # Arguments
     /// * `initial_guess` - Starting values for all variables (by name)
-    /// * `use_line_search` - Whether to use backtracking line search for step size
-    ///
     /// # Algorithm
-    /// 1. Evaluate f(x) and check for convergence
-    /// 2. Compute Jacobian J = df/dx
+    /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
+    /// 2. Check root and first-order stationarity termination
     /// 3. Solve `J * delta = -f(x)` with condition-aware QR/SVD least squares
-    ///    and adaptive regularization when requested
-    /// 4. Update: x_new = x_old + damping * delta
-    /// 5. Adapt damping based on error change
-    fn solve_modified_internal(
-        &self,
-        initial_guess: HashMap<VarId, f64>,
-        use_line_search: bool,
-    ) -> Result<Solution, SolverError> {
+    ///    and bounded regularization when requested
+    /// 4. Backtrack transactionally until Armijo sufficient decrease holds
+    /// 5. Commit the already-evaluated candidate as the next accepted state
+    fn solve_internal(&self, initial_guess: HashMap<VarId, f64>) -> Result<Solution, SolverError> {
         // The public entry point has validated both the selected policy and this
         // owned internal map, so move it directly into mutable solver state.
         let mut vars = initial_guess;
@@ -732,11 +723,6 @@ impl NewtonRaphsonSolver {
         // entire theoretical update budget. A very large valid budget must not
         // panic before an already-solved initial point can be inspected.
         let mut convergence_history = Vec::new();
-        // Standard solves begin with exactly the configured damping factor. A
-        // previous residual is optional so the first iteration cannot pretend
-        // it observed an improvement from an artificial infinity sentinel.
-        let mut damping = self.options.damping_factor;
-        let mut last_error: Option<f64> = None;
         // Retain only the most recent accepted correction solve; this is the
         // factorization provenance relevant to the current state.
         let mut last_linear_solve: Option<LinearSolveDiagnostic> = None;
@@ -746,12 +732,17 @@ impl NewtonRaphsonSolver {
 
         let mut f_vals = Matrix::new(num_equations, 1);
         let mut f_neg = Matrix::new(num_equations, 1);
-        // Populate the workspace in place. Allocating an independent Jacobian
-        // and immediately replacing this correctly sized buffer would double
-        // initial derivative storage for no benefit.
+        // Populate the complete initial accepted state once. Subsequent
+        // residuals arrive from successful line-search candidates, while each
+        // newly accepted point receives exactly one Jacobian evaluation.
+        jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
         jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
 
-        let mut line_search_f_vals = Matrix::new(num_equations, 1);
+        // Candidate buffers are separate from accepted state until Armijo
+        // succeeds. Swapping them on acceptance avoids both rollback logic and
+        // reevaluation of an already-tested residual vector.
+        let mut candidate_vars = vars.clone();
+        let mut candidate_f_vals = Matrix::new(num_equations, 1);
 
         let mut least_squares_workspace = if self.options.regularization > 0.0 {
             Some(LeastSquaresWorkspace::new(num_equations, num_variables)?)
@@ -760,33 +751,30 @@ impl NewtonRaphsonSolver {
         };
         let parallel = self.parallel_enabled();
 
-        for iter in 0..self.options.max_iterations {
-            // Step 1: Evaluate function values f(x)
-            jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
-            if !f_vals.all_finite() {
-                return Err(Self::attach_linear_solve(
-                    self.non_finite_evaluation_error(
-                        "Residual evaluation produced NaN or infinity",
-                        iter,
-                        &vars,
-                        &f_vals,
-                    ),
-                    last_linear_solve,
-                ));
-            }
-            if !jacobian_workspace.jacobian().all_finite() {
-                return Err(Self::attach_linear_solve(
-                    self.non_finite_evaluation_error(
-                        "Jacobian evaluation produced NaN or infinity",
-                        iter,
-                        &vars,
-                        &f_vals,
-                    ),
-                    last_linear_solve,
-                ));
-            }
+        if !f_vals.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Residual evaluation produced NaN or infinity",
+                0,
+                &vars,
+                &f_vals,
+            ));
+        }
+        if !jacobian_workspace.jacobian().all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Jacobian evaluation produced NaN or infinity",
+                0,
+                &vars,
+                &f_vals,
+            ));
+        }
+        convergence_history.push(f_vals.norm());
+
+        // The current state is always fully evaluated at loop entry. A mutable
+        // accepted-update count lets the budget-exhausted state receive the same
+        // root and stationarity checks without a special final evaluation path.
+        let mut iter = 0;
+        loop {
             let error = f_vals.norm();
-            convergence_history.push(error);
 
             // A successful result requires the actual constraints to satisfy
             // the residual threshold before any mutation is attempted. Every
@@ -823,28 +811,22 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
-            // Adaptive damping belongs only to the standard solver. Line search
-            // has its own evaluated acceptance and exhaustion rules, so mutating
-            // an unused damping value must not influence its stagnation outcome.
-            if !use_line_search {
-                if let Some(previous_error) = last_error {
-                    // Compare only two real consecutive residuals. This keeps
-                    // the caller's configured damping unchanged for the first
-                    // update and adapts it for subsequent updates. Only genuine
-                    // residual growth reduces damping; a small improvement is
-                    // expected near a non-zero least-squares optimum and is not
-                    // evidence of stagnation.
-                    if error > previous_error * 1.5 {
-                        damping = (damping * 0.5).max(self.options.min_damping);
-                    } else if error < previous_error * 0.5 {
-                        damping = (damping * 1.2).min(1.0);
-                    }
-                }
-
-                // Retain the current residual for a genuine consecutive
-                // comparison on the next standard iteration. Line search does
-                // not maintain this unused state.
-                last_error = Some(error);
+            // Root and stationarity checks deliberately precede this boundary:
+            // the final permitted update may legitimately land on either. Only
+            // a still-active state is classified as budget exhaustion.
+            if iter == self.options.max_iterations {
+                let diagnostic = self.build_diagnostic(
+                    format!(
+                        "Failed to converge after {} accepted updates. Final error: {:.2e}",
+                        self.options.max_iterations, error
+                    ),
+                    iter,
+                    &vars,
+                    &f_vals,
+                    Some(gradient),
+                    last_linear_solve,
+                );
+                return Err(SolverError::NoConvergence(Box::new(diagnostic)));
             }
 
             for i in 0..num_equations {
@@ -900,70 +882,43 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
-            // Step 4: Determine step size (damping or line search)
-            let step_size = if use_line_search {
-                // Use backtracking line search to find a step that has actually
-                // demonstrated sufficient residual reduction. Passing the
-                // current residuals lets an exhausted search report the state
-                // at which it failed rather than the final rejected candidate.
-                let residual_norm_directional_derivative = self
-                    .residual_norm_directional_derivative(
-                        jacobian_workspace.jacobian(),
-                        &f_vals,
-                        &delta,
-                        parallel,
-                        &vars,
-                        iter,
-                    )
-                    .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
-                self.line_search(LineSearchContext {
+            // Armijo is the only update policy. It leaves the accepted state
+            // untouched while populating candidate buffers, so failure cannot
+            // require rollback or consume an update count.
+            let residual_norm_directional_derivative = self
+                .residual_norm_directional_derivative(
+                    jacobian_workspace.jacobian(),
+                    &f_vals,
+                    &delta,
+                    parallel,
+                    &vars,
+                    iter,
+                )
+                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
+            let accepted_step = self
+                .line_search(LineSearchContext {
                     jacobian,
                     vars: &vars,
+                    candidate_vars: &mut candidate_vars,
                     delta: &delta,
                     current_residual_norm: error,
                     residual_norm_directional_derivative,
                     accepted_updates: iter,
                     current_residuals: &f_vals,
                     gradient,
-                    candidate_residuals: &mut line_search_f_vals,
+                    candidate_residuals: &mut candidate_f_vals,
                 })
-                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?
-            } else {
-                // Use current damping factor as step size
-                damping
-            };
+                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
 
-            // Commit the correction only when every resulting coordinate is
-            // finite. Checking the residual afterward is insufficient because an
-            // expression such as a reciprocal can map an infinite variable back
-            // to a finite value and make an invalid iterate look like a root.
-            if !self.apply_finite_step(&mut vars, &delta, step_size) {
-                return Err(Self::attach_linear_solve(
-                    self.non_finite_evaluation_error(
-                        "Newton update would produce a non-finite variable value",
-                        iter,
-                        &vars,
-                        &f_vals,
-                    ),
-                    last_linear_solve,
-                ));
-            }
+            // The candidate residual has already passed finite and Armijo
+            // checks. Swap both buffers together so variables and residuals
+            // become one atomic accepted state without evaluating f(x) again.
+            std::mem::swap(&mut vars, &mut candidate_vars);
+            std::mem::swap(&mut f_vals, &mut candidate_f_vals);
 
-            // Refresh both the residual and Jacobian at the accepted point.
-            // Any convergence result below must describe this new state, not
-            // the residual that preceded the update.
-            jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
-            if !f_vals.all_finite() {
-                return Err(Self::attach_linear_solve(
-                    self.non_finite_evaluation_error(
-                        "Accepted Newton update produced non-finite residuals",
-                        iter + 1,
-                        &vars,
-                        &f_vals,
-                    ),
-                    last_linear_solve,
-                ));
-            }
+            // Only the Jacobian was not needed by candidate acceptance. Evaluate
+            // it once for the newly committed state and retain it through the
+            // next iteration's convergence and correction calculations.
             jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
             if !jacobian_workspace.jacobian().all_finite() {
                 return Err(Self::attach_linear_solve(
@@ -976,89 +931,13 @@ impl NewtonRaphsonSolver {
                     last_linear_solve,
                 ));
             }
-            let updated_error = f_vals.norm();
+            let updated_error = accepted_step.residual_norm;
+            convergence_history.push(updated_error);
+            iter += 1;
 
-            if updated_error <= self.options.residual_tolerance {
-                // A terminating candidate belongs in the history even though a
-                // subsequent loop iteration will not push it.
-                convergence_history.push(updated_error);
-                let gradient =
-                    Self::residual_gradient_measure(jacobian_workspace.jacobian(), &f_vals);
-
-                return Ok(self.build_solution(
-                    &vars,
-                    iter + 1,
-                    updated_error,
-                    gradient,
-                    last_linear_solve,
-                    convergence_history,
-                ));
-            }
-
-            // Least-squares stationarity is checked once at the beginning of the
-            // next iteration. Deferring that check avoids computing `J^T f`
-            // twice for every accepted state while still testing the final state
-            // explicitly after the update budget is exhausted below.
+            // Root and stationarity checks occur once at the next loop entry,
+            // using the residual and Jacobian for exactly this accepted state.
         }
-
-        // Failed to converge within max iterations
-        let residuals = jacobian.evaluate_functions_checked(&vars)?;
-        if !residuals.all_finite() {
-            return Err(Self::attach_linear_solve(
-                self.non_finite_evaluation_error(
-                    "Final residual evaluation produced NaN or infinity",
-                    self.options.max_iterations,
-                    &vars,
-                    &residuals,
-                ),
-                last_linear_solve,
-            ));
-        }
-        let final_error = residuals.norm();
-        if final_error <= self.options.residual_tolerance {
-            // The final allowed correction can land directly on a root. There is
-            // no following loop iteration to run the ordinary residual check, so
-            // accept that state with diagnostics evaluated at returned values.
-            let gradient =
-                Self::residual_gradient_measure(jacobian_workspace.jacobian(), &residuals);
-            convergence_history.push(final_error);
-            return Ok(self.build_solution(
-                &vars,
-                self.options.max_iterations,
-                final_error,
-                gradient,
-                last_linear_solve,
-                convergence_history,
-            ));
-        }
-
-        // The loop normally checks stationarity at the start of the next
-        // iteration. When the final allowed update lands on a fixed point there
-        // is no next iteration, so apply the same shape-independent error rule
-        // before reporting mere budget exhaustion.
-        let gradient = Self::residual_gradient_measure(jacobian_workspace.jacobian(), &residuals);
-        if gradient.is_stationary(self.options.stationarity_tolerance) {
-            return Err(self.stationary_non_root_error(
-                self.options.max_iterations,
-                &vars,
-                &residuals,
-                gradient,
-                last_linear_solve,
-            ));
-        }
-
-        let diagnostic = self.build_diagnostic(
-            format!(
-                "Failed to converge after {} iterations. Final error: {:.2e}",
-                self.options.max_iterations, final_error
-            ),
-            self.options.max_iterations,
-            &vars,
-            &residuals,
-            Some(gradient),
-            last_linear_solve,
-        );
-        Err(SolverError::NoConvergence(Box::new(diagnostic)))
     }
 
     /// Solve a possibly rectangular linear system against one right-hand side,
@@ -1328,10 +1207,10 @@ impl NewtonRaphsonSolver {
             .ok_or_else(|| SolverError::InvalidInput(message.to_string()))
     }
 
-    /// Validate every setting that the selected solve path can execute before
-    /// expression evaluation or iteration begins.
-    fn validate_configuration(&self, use_line_search: bool) -> Result<(), SolverError> {
-        // These controls participate in every solve mode.
+    /// Validate the solver's complete numerical policy before evaluation.
+    fn validate_configuration(&self) -> Result<(), SolverError> {
+        // One update path consumes every field, so validation no longer depends
+        // on which public entry point happened to be selected.
         Self::require_valid_option(
             self.options.max_iterations > 0,
             "max_iterations must be greater than zero",
@@ -1346,10 +1225,10 @@ impl NewtonRaphsonSolver {
             "stationarity_tolerance must be finite and greater than zero",
         )?;
         Self::require_valid_option(
-            self.options.damping_factor.is_finite()
-                && self.options.damping_factor > 0.0
-                && self.options.damping_factor <= 1.0,
-            "damping_factor must be finite and in the interval (0, 1]",
+            self.options.initial_step_size.is_finite()
+                && self.options.initial_step_size > 0.0
+                && self.options.initial_step_size <= 1.0,
+            "initial_step_size must be finite and in the interval (0, 1]",
         )?;
         Self::require_valid_option(
             self.options.regularization.is_finite() && self.options.regularization >= 0.0,
@@ -1364,33 +1243,22 @@ impl NewtonRaphsonSolver {
             "least_squares.relative_rank_tolerance must be finite and non-negative",
         )?;
 
-        // Ordinary adaptive damping and backtracking line search have disjoint
-        // secondary policies, so validate only the selected branch.
-        if use_line_search {
-            Self::require_valid_option(
-                self.options.armijo_coefficient.is_finite()
-                    && self.options.armijo_coefficient > 0.0
-                    && self.options.armijo_coefficient < 1.0,
-                "armijo_coefficient must be finite and in the interval (0, 1)",
-            )?;
-            Self::require_valid_option(
-                self.options.line_search_max_trials > 0,
-                "line_search_max_trials must be greater than zero",
-            )?;
-            Self::require_valid_option(
-                self.options.line_search_min_step.is_finite()
-                    && self.options.line_search_min_step > 0.0
-                    && self.options.line_search_min_step <= self.options.damping_factor,
-                "line_search_min_step must be finite, positive, and no greater than damping_factor",
-            )?;
-        } else {
-            Self::require_valid_option(
-                self.options.min_damping.is_finite()
-                    && self.options.min_damping > 0.0
-                    && self.options.min_damping <= self.options.damping_factor,
-                "min_damping must be finite, positive, and no greater than damping_factor",
-            )?;
-        }
+        Self::require_valid_option(
+            self.options.armijo_coefficient.is_finite()
+                && self.options.armijo_coefficient > 0.0
+                && self.options.armijo_coefficient < 1.0,
+            "armijo_coefficient must be finite and in the interval (0, 1)",
+        )?;
+        Self::require_valid_option(
+            self.options.line_search_max_trials > 0,
+            "line_search_max_trials must be greater than zero",
+        )?;
+        Self::require_valid_option(
+            self.options.line_search_min_step.is_finite()
+                && self.options.line_search_min_step > 0.0
+                && self.options.line_search_min_step <= self.options.initial_step_size,
+            "line_search_min_step must be finite, positive, and no greater than initial_step_size",
+        )?;
 
         // The condition threshold has no effect when regularization is
         // disabled. When active, require a mathematically meaningful condition
@@ -1660,7 +1528,7 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // The caller invokes line search only for non-roots, so a positive
+        // The iteration requests a slope only for non-roots, so a positive
         // finite norm must exist. Rejecting an unexpected zero or non-finite
         // norm here keeps this private helper safe if future call sites change.
         let residual_norm = residuals.norm();
@@ -1781,6 +1649,7 @@ impl NewtonRaphsonSolver {
     /// # Context fields
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
+    /// * `candidate_vars` - Reusable transaction buffer for proposed values
     /// * `delta` - Newton step direction
     /// * `current_residual_norm` - Current function error `||f(x)||`
     /// * `residual_norm_directional_derivative` - Scale-safe value of
@@ -1791,16 +1660,17 @@ impl NewtonRaphsonSolver {
     /// * `candidate_residuals` - Reusable storage for each trial point
     ///
     /// # Returns
-    /// An accepted step size alpha such that `x_new = x + alpha * delta`
-    /// satisfies the sufficient-decrease condition. If no tested step is
-    /// acceptable, the method returns `NoConvergence`; it never substitutes an
-    /// untested or previously rejected fallback step.
-    fn line_search(&self, context: LineSearchContext<'_>) -> Result<f64, SolverError> {
+    /// Metadata for an accepted candidate whose variables and residuals remain
+    /// in the supplied transaction buffers. If no tested step is acceptable,
+    /// the method returns `NoConvergence`; it never substitutes an untested or
+    /// previously rejected fallback step.
+    fn line_search(&self, context: LineSearchContext<'_>) -> Result<AcceptedStep, SolverError> {
         // Give the context fields concise numerical names for the candidate loop
         // while preserving their documented grouping at the call boundary.
         let LineSearchContext {
             jacobian,
             vars,
+            candidate_vars,
             delta,
             current_residual_norm,
             residual_norm_directional_derivative,
@@ -1839,32 +1709,51 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // Begin with the caller's configured maximum step and reuse a cloned
-        // variable map for all candidates so fixed parameters remain present on
-        // every trial.
-        let mut alpha = self.options.damping_factor;
-        let mut new_vars = vars.clone();
+        // Begin with the caller's configured maximum step. The reusable
+        // candidate map is restored from accepted state for every trial so fixed
+        // parameters remain present and rejected values never leak forward.
+        let mut alpha = self.options.initial_step_size;
         let mut attempted_trials = 0;
 
         for _ in 0..self.options.line_search_max_trials {
             attempted_trials += 1;
-            new_vars.clone_from(vars);
+            candidate_vars.clone_from(vars);
 
             // Build the candidate transactionally. Variable overflow is rejected
             // before expression evaluation, while a finite smaller step remains
             // eligible on the next backtracking trial.
-            if self.apply_finite_step(&mut new_vars, delta, alpha) {
+            if self.apply_finite_step(candidate_vars, delta, alpha) {
+                // If even the largest remaining multiplier cannot change any
+                // variable at floating-point precision, every smaller candidate
+                // will be identical. Stop immediately instead of counting a
+                // no-op as an accepted update or repeating it to the budget.
+                if candidate_vars == vars {
+                    let diagnostic = self.build_diagnostic(
+                        format!(
+                            "Newton correction cannot change the variable state at the tested step size {alpha:.2e}"
+                        ),
+                        accepted_updates,
+                        vars,
+                        current_residuals,
+                        Some(gradient),
+                        None,
+                    );
+                    return Err(SolverError::NoConvergence(Box::new(diagnostic)));
+                }
+
                 // Non-finite residuals are likewise rejected by the finite Armijo
                 // comparison. This permits a large exponential step to recover at
                 // a smaller alpha without accepting an invalid candidate.
-                jacobian.evaluate_functions_checked_into(&new_vars, candidate_residuals)?;
+                jacobian.evaluate_functions_checked_into(candidate_vars, candidate_residuals)?;
                 let new_error = candidate_residuals.norm();
                 let required_error = current_residual_norm
                     + self.options.armijo_coefficient
                         * alpha
                         * residual_norm_directional_derivative;
                 if new_error.is_finite() && new_error <= required_error {
-                    return Ok(alpha);
+                    return Ok(AcceptedStep {
+                        residual_norm: new_error,
+                    });
                 }
             }
 
@@ -1891,21 +1780,6 @@ impl NewtonRaphsonSolver {
             None,
         );
         Err(SolverError::NoConvergence(Box::new(diagnostic)))
-    }
-
-    /// Solve the system using Newton-Raphson with line search
-    ///
-    /// Line search helps improve convergence robustness by automatically
-    /// finding good step sizes, especially useful for difficult systems.
-    pub fn solve_with_line_search(
-        &self,
-        initial_guess: HashMap<String, f64>,
-    ) -> Result<Solution, SolverError> {
-        // Validate shared and line-search-specific policy before mapping
-        // caller-visible variable names to internal IDs.
-        self.validate_configuration(true)?;
-        let vars = self.map_initial_guess(initial_guess)?;
-        self.run_in_mode(|| self.solve_modified_internal(vars, true))
     }
 }
 
@@ -2102,13 +1976,7 @@ mod tests {
             initial.insert("x".to_string(), 0.5);
             initial.insert("y".to_string(), 0.866);
 
-            let solution = match solver.solve(initial.clone()) {
-                Ok(sol) => sol,
-                Err(_) => match solver.solve_with_line_search(initial) {
-                    Ok(sol) => sol,
-                    Err(e) => panic!("Failed to solve: {:?}", e),
-                },
-            };
+            let solution = solver.solve(initial).expect("Failed to solve system");
             if is_serial {
                 serial_solution = Some(solution.clone());
             } else {
@@ -2174,7 +2042,7 @@ mod tests {
             initial.insert("y".to_string(), 0.25);
 
             let solution = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect("Failed to solve transcendental system");
 
             if is_serial {
@@ -2288,16 +2156,16 @@ mod tests {
                 Box::new(|solver| solver.with_stationarity_tolerance(f64::INFINITY)),
             ),
             (
-                "damping_factor",
-                Box::new(|solver| solver.with_damping(0.0)),
+                "initial_step_size",
+                Box::new(|solver| solver.with_initial_step_size(0.0)),
             ),
             (
-                "damping_factor",
-                Box::new(|solver| solver.with_damping(1.1)),
+                "initial_step_size",
+                Box::new(|solver| solver.with_initial_step_size(1.1)),
             ),
             (
-                "damping_factor",
-                Box::new(|solver| solver.with_damping(f64::INFINITY)),
+                "initial_step_size",
+                Box::new(|solver| solver.with_initial_step_size(f64::INFINITY)),
             ),
             (
                 "regularization",
@@ -2306,10 +2174,6 @@ mod tests {
             (
                 "regularization",
                 Box::new(|solver| solver.with_regularization(f64::INFINITY)),
-            ),
-            (
-                "min_damping",
-                Box::new(|solver| configure_options(solver, |options| options.min_damping = 0.0)),
             ),
             (
                 "condition_limit",
@@ -2358,18 +2222,9 @@ mod tests {
             let solver = configure(NewtonRaphsonSolver::new(compiled));
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            // Only the three line-search fields require the line-search entry
-            // point. Every other table entry is active in an ordinary solve.
-            let uses_line_search = matches!(
-                expected_parameter,
-                "armijo_coefficient" | "line_search_max_trials" | "line_search_min_step"
-            );
-            let error = if uses_line_search {
-                solver.solve_with_line_search(initial)
-            } else {
-                solver.solve(initial)
-            }
-            .expect_err("invalid active configuration must be rejected");
+            let error = solver
+                .solve(initial)
+                .expect_err("invalid active configuration must be rejected");
             match error {
                 SolverError::InvalidInput(message) => {
                     assert!(message.contains(expected_parameter), "{message}");
@@ -2379,7 +2234,7 @@ mod tests {
         }
     }
 
-    /// Ignore numerical policy that the selected solve path cannot execute.
+    /// Ignore condition policy only when regularization is disabled.
     #[test]
     fn test_configuration_validation_ignores_inactive_policy() {
         for mode in test_modes() {
@@ -2387,33 +2242,15 @@ mod tests {
             let equation = Exp::sub(x, Exp::val(1.0));
             let initial = HashMap::from([("x".to_string(), 1.0)]);
 
-            // Ordinary Newton does not read line-search settings, and disabled
-            // regularization does not read its condition threshold.
-            let solver = configure_options(
-                solver_for_mode(vec![equation.clone()], mode.clone()),
-                |options| {
-                    options.regularization = 0.0;
-                    options.condition_limit = f64::NAN;
-                    options.armijo_coefficient = f64::NAN;
-                    options.line_search_max_trials = 0;
-                    options.line_search_min_step = f64::NAN;
-                },
-            );
-            let solution = solver
-                .solve(initial.clone())
-                .expect("inactive ordinary-solve policy must be ignored");
-            assert_eq!(solution.iterations, 0);
-
-            // Conversely, line search does not read ordinary adaptive damping's
-            // floor. Regularization remains inactive as above.
+            // A disabled ridge fallback cannot consult the condition threshold,
+            // so an otherwise invalid threshold remains intentionally inactive.
             let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
-                options.min_damping = f64::NAN;
                 options.regularization = 0.0;
                 options.condition_limit = f64::NAN;
             });
             let solution = solver
-                .solve_with_line_search(initial)
-                .expect("inactive line-search policy must be ignored");
+                .solve(initial)
+                .expect("inactive regularization policy must be ignored");
             assert_eq!(solution.iterations, 0);
         }
     }
@@ -2456,32 +2293,15 @@ mod tests {
             let equation = Exp::div(Exp::val(1.0), scaled_x);
             let initial = HashMap::from([("x".to_string(), 1e308)]);
 
-            // The ordinary Newton path has no smaller candidate to try. It must
-            // reject the update and report the last finite accepted point.
-            let solver =
-                solver_for_mode(vec![equation.clone()], mode.clone()).with_regularization(0.0);
-            let error = solver
-                .solve(initial.clone())
-                .expect_err("an overflowing Newton update must not become a solution");
-            match error {
-                SolverError::NonFiniteEvaluation(diagnostic) => {
-                    assert!(diagnostic.message.contains("non-finite variable value"));
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert_eq!(diagnostic.values["x"], 1e308);
-                    assert!(diagnostic.values.values().all(|value| value.is_finite()));
-                }
-                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
-            }
-
-            // A line search treats the same overflowing full step as a rejected
-            // candidate. Limiting the search to that one trial makes the
-            // preserved-state behavior deterministic for this regression.
+            // Candidate construction rejects the overflowing full step before
+            // expression evaluation. Limiting the search to that one trial
+            // makes preservation of the initial accepted state deterministic.
             let solver = configure_options(
                 solver_for_mode(vec![equation], mode).with_regularization(0.0),
                 |options| options.line_search_max_trials = 1,
             );
             let error = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect_err("an overflowing line-search candidate must be rejected");
             match error {
                 SolverError::NoConvergence(diagnostic) => {
@@ -2690,7 +2510,7 @@ mod tests {
             initial.insert("a".to_string(), 2.0);
 
             let solution = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect("solver should converge when fixed variables are provided");
             if is_serial {
                 serial_solution = Some(solution.clone());
@@ -2721,7 +2541,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let solution = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect("deep backtracking should recover a finite step");
 
             if is_serial {
@@ -2751,7 +2571,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let error = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect_err("one rejected candidate must exhaust the configured search");
 
             match error {
@@ -2782,7 +2602,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let solution = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect("scale-safe residual-norm slope should permit the Newton step");
 
             assert_eq!(solution.values["x"], 1.0);
@@ -2803,7 +2623,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect_err("a constant residual is stationary but not a root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -2817,18 +2637,17 @@ mod tests {
         }
     }
 
-    /// Verify that a standard solve uses the configured damping value unchanged
-    /// for its first Newton update.
+    /// Verify that the configured initial trial cap applies to the first update.
     #[test]
-    fn test_standard_solver_honors_initial_damping_on_first_step() {
+    fn test_solver_honors_initial_step_size() {
         for mode in test_modes() {
             // The undamped Newton correction from x=0 is exactly one. With a
-            // single allowed update and damping 0.5, the final diagnostic must
-            // therefore contain x=0.5 rather than the formerly inflated x=0.6.
+            // single allowed update and a 0.5 cap, the final diagnostic must
+            // contain x=0.5.
             let x = Exp::var("x");
             let equation = Exp::sub(x, Exp::val(1.0));
             let solver = solver_for_mode(vec![equation], mode)
-                .with_damping(0.5)
+                .with_initial_step_size(0.5)
                 .with_max_iterations(1);
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
@@ -2847,63 +2666,27 @@ mod tests {
         }
     }
 
-    /// Confirm that damping is an effective maximum trial size for line-search
-    /// solves rather than an ignored setting.
+    /// Ensure that an intentionally small trial cap does not become a false
+    /// small-step failure before the residual tolerance is satisfied.
     #[test]
-    fn test_line_search_uses_configured_initial_trial_size() {
+    fn test_small_initial_step_reaches_residual_tolerance() {
         for mode in test_modes() {
-            // The full Newton step would solve this equation immediately. A
-            // configured maximum alpha of 0.25 must instead stop at x=0.25 after
-            // the single allowed update.
+            // A 0.1 cap requires roughly 220 geometric updates to reduce the
+            // residual below 1e-10. The applied correction becomes small before
+            // then, but that is explicit policy rather than stagnation.
             let x = Exp::var("x");
             let equation = Exp::sub(x, Exp::val(1.0));
             let solver = solver_for_mode(vec![equation], mode)
-                .with_damping(0.25)
-                .with_max_iterations(1);
+                .with_initial_step_size(0.1)
+                .with_residual_tolerance(1e-10)
+                .with_max_iterations(300);
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_with_line_search(initial)
-                .expect_err("one quarter-step cannot yet reach the root");
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert!((diagnostic.values["x"] - 0.25).abs() < 1e-12);
-                    assert!((diagnostic.error - 0.75).abs() < 1e-12);
-                    assert_eq!(diagnostic.gradient_norm, Some(0.75));
-                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
-            }
-        }
-    }
+            let solution = solver
+                .solve(initial)
+                .expect("capped linear updates should eventually reach the root");
 
-    /// Ensure that intentionally small damping does not become a false
-    /// small-step failure before the residual tolerance is satisfied.
-    #[test]
-    fn test_heavily_damped_linear_solve_reaches_residual_tolerance() {
-        for use_line_search in [false, true] {
-            for mode in test_modes() {
-                // Damping 0.1 requires roughly 220 geometric updates to reduce
-                // the residual below 1e-10. The applied update becomes smaller
-                // than tolerance earlier, but that is a caller-selected step
-                // size rather than evidence of numerical stagnation.
-                let x = Exp::var("x");
-                let equation = Exp::sub(x, Exp::val(1.0));
-                let solver = solver_for_mode(vec![equation], mode)
-                    .with_damping(0.1)
-                    .with_residual_tolerance(1e-10)
-                    .with_max_iterations(300);
-                let initial = HashMap::from([("x".to_string(), 0.0)]);
-
-                let solution = if use_line_search {
-                    solver.solve_with_line_search(initial)
-                } else {
-                    solver.solve(initial)
-                }
-                .expect("damped linear updates should eventually reach the root");
-
-                assert!(solution.error < 1e-10);
-            }
+            assert!(solution.error < 1e-10);
         }
     }
 
@@ -3052,7 +2835,7 @@ mod tests {
             let x_residual = Exp::sub(x, Exp::val(1.0));
             let y_residual = Exp::mul(Exp::val(1e9), y);
             let solver = solver_for_mode(vec![x_residual, y_residual.clone(), y_residual], mode)
-                .with_damping(1.0)
+                .with_initial_step_size(1.0)
                 .with_stationarity_tolerance(1e-8)
                 .with_regularization(0.0);
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
@@ -3095,8 +2878,8 @@ mod tests {
         }
     }
 
-    /// Ensure the default damping policy can approach a non-zero residual floor
-    /// instead of treating the naturally shrinking objective changes as failure.
+    /// Ensure Armijo reaches a non-zero residual floor without confusing small
+    /// objective changes with failure.
     #[test]
     fn test_inconsistent_overdetermined_system_reaches_stationarity_from_away() {
         let mut serial_diagnostic: Option<SolverRunDiagnostic> = None;
@@ -3105,8 +2888,8 @@ mod tests {
 
             // The least-squares objective for these incompatible equations has
             // its unique stationary point at x=0 and residual norm sqrt(2). The
-            // previous absolute residual-change stagnation rule stopped around
-            // x=3e-6 under the default 0.7 damping, before `J^T f` met tolerance.
+            // A former absolute residual-change rule stopped before `J^T f`
+            // met tolerance even though valid descent remained.
             let x = Exp::var("x");
             let equations = vec![
                 Exp::sub(x.clone(), Exp::val(1.0)),
@@ -3117,7 +2900,7 @@ mod tests {
 
             let error = solver
                 .solve(initial)
-                .expect_err("default damping should identify a stationary non-root");
+                .expect_err("Armijo should identify a stationary non-root");
             let diagnostic = expect_stationary_non_root(error);
 
             if is_serial {
@@ -3167,7 +2950,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
             let error = solver
-                .solve_with_line_search(initial)
+                .solve(initial)
                 .expect_err("Armijo line search should reach a stationary non-root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -3208,45 +2991,36 @@ mod tests {
     #[test]
     fn test_residual_tolerance_boundary_is_successful() {
         for mode in test_modes() {
-            for use_line_search in [false, true] {
-                // The initial residual norm is exactly one. Equality with the
-                // configured tolerance must certify this point without a linear
-                // solve or an accepted update.
-                let x = Exp::var("x");
-                let solver =
-                    solver_for_mode(vec![x.clone()], mode.clone()).with_residual_tolerance(1.0);
-                let initial = HashMap::from([("x".to_string(), 1.0)]);
-                let solution = if use_line_search {
-                    solver.solve_with_line_search(initial)
-                } else {
-                    solver.solve(initial)
-                }
+            // The initial residual norm is exactly one. Equality with the
+            // configured tolerance must certify this point without a linear
+            // solve or an accepted update.
+            let x = Exp::var("x");
+            let solver =
+                solver_for_mode(vec![x.clone()], mode.clone()).with_residual_tolerance(1.0);
+            let initial = HashMap::from([("x".to_string(), 1.0)]);
+            let solution = solver
+                .solve(initial)
                 .expect("a residual equal to tolerance must be successful");
 
-                assert_eq!(solution.error, 1.0);
-                assert_eq!(solution.iterations, 0);
-                assert_eq!(solution.last_linear_solve, None);
+            assert_eq!(solution.error, 1.0);
+            assert_eq!(solution.iterations, 0);
+            assert_eq!(solution.last_linear_solve, None);
 
-                // Starting at residual two with a half-sized Newton step lands
-                // exactly on the same boundary. The post-update check must use
-                // the identical inclusive contract and report one accepted
-                // correction rather than iteration exhaustion.
-                let solver = solver_for_mode(vec![x], mode.clone())
-                    .with_residual_tolerance(1.0)
-                    .with_damping(0.5)
-                    .with_max_iterations(1);
-                let initial = HashMap::from([("x".to_string(), 2.0)]);
-                let solution = if use_line_search {
-                    solver.solve_with_line_search(initial)
-                } else {
-                    solver.solve(initial)
-                }
+            // Starting at residual two with a half-sized Newton step lands
+            // exactly on the same boundary. The next accepted-state check must
+            // use the identical inclusive contract.
+            let solver = solver_for_mode(vec![x], mode)
+                .with_residual_tolerance(1.0)
+                .with_initial_step_size(0.5)
+                .with_max_iterations(1);
+            let initial = HashMap::from([("x".to_string(), 2.0)]);
+            let solution = solver
+                .solve(initial)
                 .expect("an accepted update on the tolerance boundary must succeed");
 
-                assert_eq!(solution.values["x"], 1.0);
-                assert_eq!(solution.error, 1.0);
-                assert_eq!(solution.iterations, 1);
-            }
+            assert_eq!(solution.values["x"], 1.0);
+            assert_eq!(solution.error, 1.0);
+            assert_eq!(solution.iterations, 1);
         }
     }
 
@@ -3300,7 +3074,7 @@ mod tests {
 
             let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
                 .with_regularization(0.0)
-                .with_damping(1.0)
+                .with_initial_step_size(1.0)
                 .with_max_iterations(10)
                 .with_residual_tolerance(1e-10);
 
@@ -3327,43 +3101,33 @@ mod tests {
     /// makes genuine minimum-norm residual corrections away from a root.
     #[test]
     fn test_nonlinear_underdetermined_solver_never_starves_corrections() {
-        for use_line_search in [false, true] {
-            for mode in test_modes() {
-                // The Jacobian row [y, x] rotates as either coordinate changes.
-                // The removed point-projection phase repeatedly chased that row
-                // space, moved the exact root (2, 0.5), and never executed the
-                // residual correction shared by ordinary and line-search solves.
-                let x = Exp::var("x");
-                let y = Exp::var("y");
-                let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
-                let solver = solver_for_mode(vec![equation], mode)
-                    .with_residual_tolerance(1e-12)
-                    .with_regularization(0.0);
+        for mode in test_modes() {
+            // The Jacobian row [y, x] rotates as either coordinate changes. The
+            // removed point-projection phase chased that row space and could
+            // starve residual corrections indefinitely.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_residual_tolerance(1e-12)
+                .with_regularization(0.0);
 
-                let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
-                let solution = if use_line_search {
-                    solver.solve_with_line_search(exact_root)
-                } else {
-                    solver.solve(exact_root)
-                }
+            let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
+            let solution = solver
+                .solve(exact_root)
                 .expect("an exact nonlinear root must remain unchanged");
-                assert_eq!(solution.iterations, 0);
-                assert_eq!(solution.values["x"], 2.0);
-                assert_eq!(solution.values["y"], 0.5);
+            assert_eq!(solution.iterations, 0);
+            assert_eq!(solution.values["x"], 2.0);
+            assert_eq!(solution.values["y"], 0.5);
 
-                // Reuse the same compiled solver away from the root. Every
-                // accepted iteration must now be a residual-reducing Newton
-                // correction rather than a projection-only state transition.
-                let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
-                let solution = if use_line_search {
-                    solver.solve_with_line_search(initial)
-                } else {
-                    solver.solve(initial)
-                }
+            // Reuse the same compiled solver away from the root. Every accepted
+            // iteration must be a residual-reducing Newton correction.
+            let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
+            let solution = solver
+                .solve(initial)
                 .expect("a nonlinear wide system must execute Newton corrections");
-                assert!(solution.iterations > 0);
-                assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
-            }
+            assert!(solution.iterations > 0);
+            assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
         }
     }
 
