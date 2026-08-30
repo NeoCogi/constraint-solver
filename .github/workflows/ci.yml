@@ -183,6 +183,14 @@ jobs:
       - name: Run documentation tests
         run: cargo test --locked --doc
 
+      # Doctests exercise examples but do not promote rustdoc's own warnings.
+      # Build the complete public API separately so broken links and other
+      # documentation regressions fail the release gate.
+      - name: Build warning-free public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
       - name: Compile benchmark harness
         run: cargo check --locked --bench linear_algebra --features benchmarks
 
