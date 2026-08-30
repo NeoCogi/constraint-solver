@@ -338,4 +338,28 @@ mod tests {
         let solution = solver.solve(initial).expect("operator tree must solve");
         assert!((solution.values["x"] - 1.0).abs() < 1e-10);
     }
+
+    /// Carry a logarithm through public construction, compilation, symbolic
+    /// differentiation, and nonlinear solving on its valid real domain.
+    #[test]
+    fn test_logarithm_expression_compiles_differentiates_and_solves() {
+        use crate::compiler::Compiler;
+        use crate::solver::NewtonRaphsonSolver;
+        use std::collections::HashMap;
+
+        // ln(x)-1 has the unique positive root e and derivative 1/x. Beginning
+        // at two keeps every Newton and Armijo candidate inside the real domain.
+        let x = Exp::var("x");
+        let equation = Exp::ln(x) - 1.0;
+        let compiled = Compiler::compile(&[equation]).expect("logarithm tree must compile");
+        let solver = NewtonRaphsonSolver::new(compiled).with_residual_tolerance(1e-12);
+        let initial = HashMap::from([("x".to_string(), 2.0)]);
+
+        let solution = solver
+            .solve(initial)
+            .expect("logarithm equation must solve");
+
+        assert!((solution.values["x"] - std::f64::consts::E).abs() < 1e-10);
+        assert!(solution.error < 1e-12);
+    }
 }

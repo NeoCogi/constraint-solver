@@ -473,4 +473,17 @@ mod tests {
         assert!(compiled.variable_names().is_empty());
         assert!(compiled.is_empty());
     }
+
+    /// Reject the one variable name that the public name-keyed solve API cannot
+    /// address unambiguously and preserve its structured compiler variant.
+    #[test]
+    fn empty_variable_name_returns_its_public_compile_error() {
+        let equation = Exp::var("");
+
+        let error = Compiler::compile(&[equation])
+            .expect_err("an empty variable name must not enter the registry");
+
+        assert_eq!(error, CompileError::EmptyVariableName);
+        assert_eq!(error.to_string(), "Variable name cannot be empty");
+    }
 }

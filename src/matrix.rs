@@ -1531,6 +1531,41 @@ mod tests {
         );
     }
 
+    /// Exercise successful explicit elementwise arithmetic instead of covering
+    /// only the recoverable shape-error branches.
+    #[test]
+    fn test_try_add_and_subtract_matching_matrices() {
+        let left = Matrix::from_vec(vec![1.0, -2.0, 3.5, 4.0], 2, 2)
+            .expect("left fixture has four elements");
+        let right = Matrix::from_vec(vec![0.5, 2.0, -1.5, 6.0], 2, 2)
+            .expect("right fixture has four elements");
+
+        let sum = left.try_add(&right).expect("matching shapes must add");
+        let difference = left.try_sub(&right).expect("matching shapes must subtract");
+
+        assert_eq!(
+            sum,
+            Matrix::from_vec(vec![1.5, 0.0, 2.0, 10.0], 2, 2).unwrap()
+        );
+        assert_eq!(
+            difference,
+            Matrix::from_vec(vec![0.5, -4.0, 5.0, -2.0], 2, 2).unwrap()
+        );
+    }
+
+    /// Keep the convenience operator's fatal shape diagnostic visible rather
+    /// than allowing an opaque unwrap panic to replace the matrix context.
+    #[test]
+    #[should_panic(expected = "Matrix dimension mismatch for add: left is 1x2, right is 2x1")]
+    fn test_add_operator_panic_explains_shape_mismatch() {
+        let left = Matrix::new(1, 2);
+        let right = Matrix::new(2, 1);
+
+        // Operator syntax is intentionally infallible; callers that need to
+        // recover from shape mismatch use `try_add` instead.
+        let _ = &left + &right;
+    }
+
     #[test]
     fn test_try_mul_dimension_mismatch() {
         let a = Matrix::new(2, 3);
