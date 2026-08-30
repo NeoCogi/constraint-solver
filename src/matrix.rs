@@ -437,6 +437,13 @@ impl Matrix {
         // The transposed shape reverses the logical dimensions while preserving
         // the same total element count.
         let mut result = Matrix::new(self.cols, self.rows);
+        if result.data.is_empty() {
+            // A valid shape such as `usize::MAX x 0` has no coordinates to
+            // copy. Returning from storage cardinality avoids walking the huge
+            // logical row dimension even though the operation is already
+            // complete, and also avoids zero-sized parallel chunks.
+            return result;
+        }
         let element_count = self.rows.saturating_mul(self.cols);
         if parallel && should_parallelize_work(element_count) {
             result
@@ -1196,6 +1203,12 @@ impl Matrix {
         // shape instead of routing it through the panicking convenience
         // constructor.
         let mut result = Matrix::try_new(self.rows, rhs.cols)?;
+        if result.data.is_empty() {
+            // No output cell exists when either output dimension is zero. In
+            // particular, a valid `usize::MAX x 0` result must not execute an
+            // effectively unbounded outer-row loop whose body can never write.
+            return Ok(result);
+        }
         // Each output cell performs `self.cols` multiply-adds. Including that
         // inner dimension recognizes skinny products with few output cells but
         // substantial arithmetic, which the former output-size test missed.
@@ -1510,6 +1523,30 @@ mod tests {
         assert_eq!(mt_serial[(1, 0)], 2.0);
         assert_eq!(mt_serial[(2, 0)], 3.0);
         assert_eq!(mt_serial[(0, 1)], 4.0);
+    }
+
+    /// Complete zero-storage operations from physical cardinality rather than
+    /// iterating over enormous logical dimensions that contain no coordinates.
+    #[test]
+    fn test_zero_storage_transpose_and_multiplication_return_immediately() {
+        let huge_empty = Matrix::from_vec(Vec::new(), usize::MAX, 0)
+            .expect("a zero-column matrix requires no storage");
+        let empty_right =
+            Matrix::from_vec(Vec::new(), 0, 0).expect("a zero-by-zero matrix is valid");
+
+        for parallel in [false, true] {
+            let transposed = huge_empty.transpose_with_parallel(parallel);
+            assert_eq!(transposed.rows(), 0);
+            assert_eq!(transposed.cols(), usize::MAX);
+            assert_eq!(transposed.norm(), 0.0);
+
+            let product = huge_empty
+                .try_mul_with_parallel(&empty_right, parallel)
+                .expect("a product with zero output columns is already complete");
+            assert_eq!(product.rows(), usize::MAX);
+            assert_eq!(product.cols(), 0);
+            assert_eq!(product.norm(), 0.0);
+        }
     }
 
     #[test]

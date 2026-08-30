@@ -122,6 +122,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   history now grows only as accepted updates are observed.
 - Checked all derived matrix element counts and augmented-system row counts
   before allocation, including products involving zero-sized operands.
+- Returned immediately from transpose and multiplication when their checked
+  result has zero storage, so valid shapes such as `usize::MAX x 0` do not loop
+  over logical dimensions that contain no elements.
 - Rejected NaN, infinity, and finite-input arithmetic overflow at expression,
   Jacobian, update, and matrix-solve boundaries.
 - Corrected accepted-iteration accounting and refreshed residuals after every
