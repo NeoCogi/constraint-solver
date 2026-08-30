@@ -29,6 +29,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   public API documentation, and the `missing_docs` lint.
 - Added an explicit package allowlist so repository workflows, ignore rules,
   and future local tooling files are not published with the crate.
+- Added arithmetic operator implementations for owned and borrowed `Exp`
+  values and `f64` constants so equations can mirror their mathematical form.
 - Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
   builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
   headless examples, documentation tests, benchmark compilation, and package

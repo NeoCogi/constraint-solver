@@ -46,8 +46,8 @@ SOFTWARE.
 //! use std::collections::HashMap;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Residual zero means x = 2.
-//! let equation = Exp::sub(Exp::var("x"), Exp::val(2.0));
+//! // Residual zero means x = 2. Arithmetic operators build expression nodes.
+//! let equation = Exp::var("x") - 2.0;
 //! let compiled = Compiler::compile(&[equation])?;
 //! let solver = NewtonRaphsonSolver::new(compiled);
 //! let initial = HashMap::from([("x".to_string(), 0.0)]);

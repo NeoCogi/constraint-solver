@@ -26,6 +26,7 @@ SOFTWARE.
 //! nonlinear equation residuals.
 
 use std::fmt;
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// Immutable symbolic scalar expression tree.
 ///
@@ -35,6 +36,10 @@ use std::fmt;
 /// not substitute finite-difference derivatives. Algebraically equivalent
 /// trees can consequently behave differently at domain boundaries where one
 /// symbolic derivative contains an indeterminate floating-point operation.
+///
+/// The ordinary arithmetic operators accept owned or borrowed expressions and
+/// `f64` constants. Operator evaluation builds a new symbolic tree; it does not
+/// numerically evaluate either operand.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exp {
     /// Literal floating-point constant.
@@ -146,6 +151,101 @@ impl Exp {
     }
 }
 
+impl From<f64> for Exp {
+    /// Convert a floating-point scalar into a symbolic constant.
+    fn from(value: f64) -> Self {
+        // Preserve the exact scalar payload just as `Exp::val` does.
+        Self::Val(value)
+    }
+}
+
+impl From<&Exp> for Exp {
+    /// Clone a borrowed expression when an operator needs owned tree nodes.
+    fn from(value: &Exp) -> Self {
+        // Expression trees are immutable values, so cloning cannot change the
+        // source operand or introduce shared mutable state.
+        value.clone()
+    }
+}
+
+/// Implement one binary operator for owned and borrowed expression left-hand
+/// sides, plus scalar left-hand sides whose operand order must be preserved.
+///
+/// Keeping these mechanically identical implementations in one macro makes the
+/// supported ownership combinations consistent across all four operators.
+macro_rules! impl_binary_operator {
+    ($trait:ident, $method:ident, $constructor:ident) => {
+        impl<Rhs> $trait<Rhs> for Exp
+        where
+            Rhs: Into<Exp>,
+        {
+            type Output = Exp;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                // Move the owned left tree and normalize the right operand into
+                // an expression before constructing the requested binary node.
+                Exp::$constructor(self, rhs.into())
+            }
+        }
+
+        impl<Rhs> $trait<Rhs> for &Exp
+        where
+            Rhs: Into<Exp>,
+        {
+            type Output = Exp;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                // Clone only the borrowed left tree; an owned right operand can
+                // still move directly into the result.
+                Exp::$constructor(self.clone(), rhs.into())
+            }
+        }
+
+        impl $trait<Exp> for f64 {
+            type Output = Exp;
+
+            fn $method(self, rhs: Exp) -> Self::Output {
+                // Scalar-left subtraction and division are order-sensitive, so
+                // retain the scalar as the first constructor argument.
+                Exp::$constructor(Exp::Val(self), rhs)
+            }
+        }
+
+        impl $trait<&Exp> for f64 {
+            type Output = Exp;
+
+            fn $method(self, rhs: &Exp) -> Self::Output {
+                // Borrowed right operands are cloned into the new immutable
+                // tree while the scalar becomes its left constant node.
+                Exp::$constructor(Exp::Val(self), rhs.clone())
+            }
+        }
+    };
+}
+
+impl_binary_operator!(Add, add, add);
+impl_binary_operator!(Sub, sub, sub);
+impl_binary_operator!(Mul, mul, mul);
+impl_binary_operator!(Div, div, div);
+
+impl Neg for Exp {
+    type Output = Exp;
+
+    fn neg(self) -> Self::Output {
+        // Move the owned tree directly under a unary negation node.
+        Exp::neg(self)
+    }
+}
+
+impl Neg for &Exp {
+    type Output = Exp;
+
+    fn neg(self) -> Self::Output {
+        // Preserve the borrowed source by cloning it into the new unary node.
+        Exp::neg(self.clone())
+    }
+}
+
 impl fmt::Display for Exp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Parenthesize binary operations consistently so the rendered tree is
@@ -196,5 +296,46 @@ mod tests {
         );
 
         assert_eq!(format!("{expr}"), "(((x^2) + (3 * y)) - 1)");
+    }
+
+    /// Exercise every ownership and scalar position supported by the binary
+    /// operator implementations, including order-sensitive scalar-left forms.
+    #[test]
+    fn test_arithmetic_operators_preserve_expression_structure() {
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+
+        let borrowed_sum = &x + &y;
+        assert_eq!(borrowed_sum, Exp::add(x.clone(), y.clone()));
+
+        let owned_product = x.clone() * y.clone();
+        assert_eq!(owned_product, Exp::mul(x.clone(), y.clone()));
+
+        let scalar_right = x.clone() - 2.0;
+        assert_eq!(scalar_right, Exp::sub(x.clone(), Exp::val(2.0)));
+
+        let scalar_left = 2.0 / &x;
+        assert_eq!(scalar_left, Exp::div(Exp::val(2.0), x.clone()));
+
+        let borrowed_negation = -&y;
+        assert_eq!(borrowed_negation, Exp::neg(y));
+    }
+
+    /// Compile and solve a mixed borrowed/scalar operator expression through
+    /// the public pipeline so ergonomic syntax is covered beyond enum shapes.
+    #[test]
+    fn test_operator_expression_compiles_and_solves() {
+        use crate::compiler::Compiler;
+        use crate::solver::NewtonRaphsonSolver;
+        use std::collections::HashMap;
+
+        let x = Exp::var("x");
+        let equation = 2.0 / (&x + 1.0) - 1.0;
+        let compiled = Compiler::compile(&[equation]).expect("operator tree must compile");
+        let solver = NewtonRaphsonSolver::new(compiled);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let solution = solver.solve(initial).expect("operator tree must solve");
+        assert!((solution.values["x"] - 1.0).abs() < 1e-10);
     }
 }

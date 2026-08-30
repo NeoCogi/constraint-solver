@@ -3,10 +3,11 @@
 
 A small `f64` constraint-solving core for nonlinear systems. This crate provides:
 
-- A symbolic expression tree (`Exp`) for building equation systems.
+- A symbolic expression tree (`Exp`) with ordinary arithmetic operators for
+  building equation systems.
 - A compiler that maps variable names to internal IDs (`Compiler`).
 - A dense matrix type with checked LU and QR/SVD least squares (`Matrix`).
-- A Newton-Raphson solver with transactional Armijo backtracking and bounded
+- A Newton-Raphson solver with transactional Armijo backtracking and explicit
   regularization (`NewtonRaphsonSolver`).
 
 This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
