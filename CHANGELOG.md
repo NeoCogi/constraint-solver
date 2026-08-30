@@ -14,7 +14,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LeastSquaresSolution` result.
 - Added `LinearSolveDiagnostic` to successful solutions and failed-run
   diagnostics, preserving the effective factorization and explicit ridge
-  strength used for the accepted correction.
+  strength used for the most recent successful solve attempt, even when line
+  search later rejected its correction.
 - Added `SolverOptions` as the documented source of nonlinear iteration,
   Armijo, and explicit regularization policy.
 - Added structured equation diagnostics and optional caller-provided equation
@@ -91,8 +92,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behavior, underdetermined policy, line-search example, and LU pivot scale.
 - Replaced self-comparison in randomized Jacobian coverage with an analytical
   oracle and added a headless end-to-end solve for the graphical IK model.
-- Preserved structured `MatrixError` values through `SolverError` and retained
-  already-computed gradient measures in every `NoConvergence` diagnostic.
+- Preserved structured `MatrixError` values through contextual
+  `SolverError::Matrix` failures, including the complete accepted variable,
+  residual, gradient, equation-trace, iteration, and prior-attempt state.
+  Already-computed gradient measures are also retained in every
+  `NoConvergence` diagnostic.
 - Prevented norm, column-scaled stationarity, line-search slope, Jacobian
   normalization, physical update, and SVD scale-restoration calculations from
   overflowing or underflowing at extreme finite scales. Products and quotients

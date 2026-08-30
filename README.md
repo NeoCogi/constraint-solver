@@ -216,8 +216,12 @@ moved into a solver. Optional equation traces are positional and must include
 exactly one entry per equation; attaching them is fallible. On failure,
 `SolverRunDiagnostic::equations` pairs every raw and scaled signed residual with
 its equation index and optional trace. Successful solutions and run diagnostics also expose
-`last_linear_solve`, which reports the effective SVD rank and condition
-estimate and whether the caller explicitly selected ridge regularization.
+`last_linear_attempt`, which reports the effective SVD rank and condition
+estimate and whether the caller explicitly selected ridge regularization. It is
+an attempt diagnostic: a later Armijo failure can reject the resulting
+correction without erasing the successfully completed factorization. A
+`SolverError::Matrix` retains both its typed `MatrixError` source and the
+complete `SolverRunDiagnostic` at the accepted state where the attempt failed.
 
 ```rust
 use constraint_solver::{Compiler, EquationTrace, Exp, NewtonRaphsonSolver};

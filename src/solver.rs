@@ -91,6 +91,8 @@ struct DirectionalDerivativeContext<'a> {
     diagnostic_residuals: &'a Matrix,
     /// Number of corrections accepted before this slope calculation.
     accepted_updates: usize,
+    /// Gradient measures already evaluated at the current accepted point.
+    gradient: ResidualGradientMeasure,
 }
 
 /// Metadata for a candidate that satisfied the solver's acceptance policy.
@@ -254,9 +256,12 @@ pub struct Solution {
     /// `None` means the residual was zero, so its direction was undefined. A
     /// successful exact root therefore reports `None` here.
     pub relative_gradient_norm: Option<f64>,
-    /// Last linearized correction solve, or `None` when the initial point already
-    /// satisfied the residual tolerance and no factorization was needed.
-    pub last_linear_solve: Option<LinearSolveDiagnostic>,
+    /// Successful linearized solve attempt that produced the most recent
+    /// accepted update represented by this solution.
+    ///
+    /// `None` means the initial point required no factorization or the first
+    /// attempted factorization failed before producing diagnostics.
+    pub last_linear_attempt: Option<LinearSolveDiagnostic>,
     /// Scaled residual norms for the initial point and each accepted update
     /// through the returned point.
     pub convergence_history: Vec<f64>,
@@ -287,7 +292,7 @@ pub struct EquationDiagnostic {
     pub trace: Option<EquationTrace>,
 }
 
-/// Numerical provenance for one accepted nonlinear correction.
+/// Numerical provenance for one successful linearized solve attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearSolveDiagnostic {
     /// Rank and condition estimate from the SVD of the equation- and variable-
@@ -316,11 +321,12 @@ pub struct SolverRunDiagnostic {
     /// Largest absolute residual/Jacobian-column cosine when it was defined and
     /// evaluated at the diagnostic state.
     pub relative_gradient_norm: Option<f64>,
-    /// Last successful linearized solve represented by this failure state.
+    /// Most recent successful linearized solve attempt represented by this
+    /// failure state, whether or not line search accepted its correction.
     ///
     /// `None` means failure occurred before any correction was produced, such as
     /// an invalid initial evaluation or an initially stationary non-root.
-    pub last_linear_solve: Option<LinearSolveDiagnostic>,
+    pub last_linear_attempt: Option<LinearSolveDiagnostic>,
     /// Variable values at the end of the run, keyed by compiled variable name.
     pub values: HashMap<String, f64>,
     /// Per-equation residuals enriched with any attached source metadata.
@@ -344,11 +350,16 @@ pub enum SolverError {
     /// systems. It does not claim the state is a local minimum; stationary
     /// maxima and saddles use the same non-success result.
     StationaryNonRoot(Box<SolverRunDiagnostic>),
-    /// Structured failure from matrix construction or linear algebra.
-    ///
-    /// The original variant and its machine-readable dimensions, operand, or
-    /// operation metadata are retained instead of being flattened into text.
-    Matrix(MatrixError),
+    /// A matrix operation failed while constructing or solving a nonlinear
+    /// correction.
+    Matrix {
+        /// Original typed matrix failure, including machine-readable shape,
+        /// operand, operation, or arithmetic metadata.
+        source: MatrixError,
+        /// Complete accepted nonlinear state at which the matrix failure
+        /// occurred.
+        diagnostic: Box<SolverRunDiagnostic>,
+    },
     /// Invalid input parameters or system setup.
     InvalidInput(String),
 }
@@ -371,7 +382,11 @@ impl fmt::Display for SolverError {
                     diagnostic.message
                 )
             }
-            SolverError::Matrix(error) => write!(f, "Matrix operation failed: {error}"),
+            SolverError::Matrix { source, diagnostic } => write!(
+                f,
+                "Correction matrix operation failed after {} accepted updates: {source}",
+                diagnostic.iterations
+            ),
             SolverError::InvalidInput(message) => write!(f, "Invalid solver input: {message}"),
         }
     }
@@ -383,7 +398,7 @@ impl std::error::Error for SolverError {
         // Run diagnostics and input messages originate at this solver layer.
         // Only a retained matrix failure has a lower-level source object.
         match self {
-            SolverError::Matrix(error) => Some(error),
+            SolverError::Matrix { source, .. } => Some(source),
             SolverError::NoConvergence(_)
             | SolverError::NonFiniteEvaluation(_)
             | SolverError::StationaryNonRoot(_)
@@ -400,15 +415,6 @@ impl From<EvaluationError> for SolverError {
         SolverError::InvalidInput(format!(
             "Internal compiled-system invariant failed: {value}"
         ))
-    }
-}
-
-impl From<MatrixError> for SolverError {
-    /// Retain a matrix failure as structured data at the public solver boundary.
-    fn from(value: MatrixError) -> Self {
-        // Do not force callers to parse Display text to recover dimensions,
-        // operands, or the operation that failed.
-        SolverError::Matrix(value)
     }
 }
 
@@ -774,9 +780,10 @@ impl NewtonRaphsonSolver {
         // entire theoretical update budget. A very large valid budget must not
         // panic before an already-solved initial point can be inspected.
         let mut convergence_history = Vec::new();
-        // Retain only the most recent accepted correction solve; this is the
-        // factorization provenance relevant to the current state.
-        let mut last_linear_solve: Option<LinearSolveDiagnostic> = None;
+        // Retain the most recent successful linear solve attempt independently
+        // from line-search acceptance. This is attempt provenance, while `iter`
+        // and convergence history continue to count accepted state changes.
+        let mut last_linear_attempt: Option<LinearSolveDiagnostic> = None;
 
         let num_equations = jacobian.equation_count();
         let mut f_vals = Matrix::new(num_equations, 1);
@@ -847,7 +854,7 @@ impl NewtonRaphsonSolver {
                     iter,
                     error,
                     gradient,
-                    last_linear_solve,
+                    last_linear_attempt,
                     convergence_history,
                 ));
             }
@@ -863,7 +870,7 @@ impl NewtonRaphsonSolver {
                     &vars,
                     &f_vals,
                     gradient,
-                    last_linear_solve,
+                    last_linear_attempt,
                 ));
             }
 
@@ -880,7 +887,7 @@ impl NewtonRaphsonSolver {
                     &vars,
                     &f_vals,
                     Some(gradient),
-                    last_linear_solve,
+                    last_linear_attempt,
                 );
                 return Err(SolverError::NoConvergence(Box::new(diagnostic)));
             }
@@ -894,19 +901,30 @@ impl NewtonRaphsonSolver {
             // Moore-Penrose minimum-norm correction, which preserves the
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
-            let linear_solve = self.solve_least_squares_system(&scaled_jacobian, &f_neg)?;
-            last_linear_solve = Some(linear_solve.diagnostic.clone());
+            let linear_solve = self
+                .solve_least_squares_system(&scaled_jacobian, &f_neg)
+                .map_err(|source| {
+                    self.matrix_error(
+                        source,
+                        iter,
+                        &vars,
+                        &f_vals,
+                        gradient,
+                        last_linear_attempt.clone(),
+                    )
+                })?;
+            last_linear_attempt = Some(linear_solve.diagnostic.clone());
             let delta = linear_solve.solution;
 
             if !delta.all_finite() {
-                return Err(Self::attach_linear_solve(
+                return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Linear solve produced a non-finite Newton correction",
                         iter,
                         &vars,
                         &f_vals,
                     ),
-                    last_linear_solve,
+                    last_linear_attempt,
                 ));
             }
 
@@ -922,8 +940,9 @@ impl NewtonRaphsonSolver {
                     vars: &vars,
                     diagnostic_residuals: &f_vals,
                     accepted_updates: iter,
+                    gradient,
                 })
-                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
+                .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
             let accepted_step = self
                 .line_search(LineSearchContext {
                     jacobian,
@@ -938,7 +957,7 @@ impl NewtonRaphsonSolver {
                     candidate_residuals: &mut candidate_f_vals,
                     candidate_scaled_residuals: &mut candidate_scaled_f_vals,
                 })
-                .map_err(|error| Self::attach_linear_solve(error, last_linear_solve.clone()))?;
+                .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
 
             // The candidate residual has already passed finite and Armijo
             // checks. Swap both buffers together so variables and residuals
@@ -952,26 +971,26 @@ impl NewtonRaphsonSolver {
             // next iteration's convergence and correction calculations.
             jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
             if !jacobian_workspace.jacobian().all_finite() {
-                return Err(Self::attach_linear_solve(
+                return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Accepted Newton update produced a non-finite Jacobian",
                         iter + 1,
                         &vars,
                         &f_vals,
                     ),
-                    last_linear_solve,
+                    last_linear_attempt,
                 ));
             }
             self.scale_jacobian_into(jacobian_workspace.jacobian(), &mut scaled_jacobian);
             if !scaled_jacobian.all_finite() {
-                return Err(Self::attach_linear_solve(
+                return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Variable or equation scaling produced a non-finite Jacobian",
                         iter + 1,
                         &vars,
                         &f_vals,
                     ),
-                    last_linear_solve,
+                    last_linear_attempt,
                 ));
             }
             let updated_error = accepted_step.residual_norm;
@@ -1292,7 +1311,7 @@ impl NewtonRaphsonSolver {
         iterations: usize,
         error: f64,
         gradient: ResidualGradientMeasure,
-        last_linear_solve: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LinearSolveDiagnostic>,
         convergence_history: Vec<f64>,
     ) -> Solution {
         // Convert internal IDs only after all numerical convergence checks have
@@ -1303,7 +1322,7 @@ impl NewtonRaphsonSolver {
             error,
             gradient_norm: gradient.absolute_norm,
             relative_gradient_norm: gradient.relative_norm,
-            last_linear_solve,
+            last_linear_attempt,
             convergence_history,
         }
     }
@@ -1316,9 +1335,9 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
         gradient: ResidualGradientMeasure,
-        last_linear_solve: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LinearSolveDiagnostic>,
     ) -> SolverError {
-        // Pass the already-computed gradient and linear solve into the common
+        // Pass the already-computed gradient and linear attempt into the common
         // constructor so no second evaluation or later field mutation can
         // disagree with the terminating state.
         let diagnostic = self.build_diagnostic(
@@ -1332,28 +1351,57 @@ impl NewtonRaphsonSolver {
             vars,
             residuals,
             Some(gradient),
-            last_linear_solve,
+            last_linear_attempt,
         );
         SolverError::StationaryNonRoot(Box::new(diagnostic))
     }
 
-    /// Attach the last successful linear solve to any run-state error produced
-    /// after that correction was available.
-    fn attach_linear_solve(
-        mut error: SolverError,
-        last_linear_solve: Option<LinearSolveDiagnostic>,
+    /// Combine a typed matrix failure with the complete accepted nonlinear
+    /// state at which correction construction or related linear algebra failed.
+    fn matrix_error(
+        &self,
+        source: MatrixError,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+        gradient: ResidualGradientMeasure,
+        last_linear_attempt: Option<LinearSolveDiagnostic>,
     ) -> SolverError {
-        // All run-state variants own the same boxed diagnostic shape. Invalid
-        // configuration errors occur before numerical correction and therefore
-        // have no attachment point.
+        // The current loop state has already evaluated both residual and
+        // gradient. Preserve them rather than forcing callers to choose between
+        // the nonlinear context and the machine-readable matrix cause.
+        let diagnostic = self.build_diagnostic(
+            format!("Correction matrix operation failed: {source}"),
+            iterations,
+            vars,
+            residuals,
+            Some(gradient),
+            last_linear_attempt,
+        );
+        SolverError::Matrix {
+            source,
+            diagnostic: Box::new(diagnostic),
+        }
+    }
+
+    /// Attach the last successful linear attempt to any run-state error
+    /// produced after that correction was available.
+    fn attach_linear_attempt(
+        mut error: SolverError,
+        last_linear_attempt: Option<LinearSolveDiagnostic>,
+    ) -> SolverError {
+        // Every numerical run-state variant owns the same boxed diagnostic
+        // shape. Invalid configuration errors occur before correction and
+        // therefore have no attachment point.
         let diagnostic = match &mut error {
             SolverError::NoConvergence(diagnostic)
             | SolverError::NonFiniteEvaluation(diagnostic)
             | SolverError::StationaryNonRoot(diagnostic) => Some(diagnostic),
-            SolverError::Matrix(_) | SolverError::InvalidInput(_) => None,
+            SolverError::Matrix { diagnostic, .. } => Some(diagnostic),
+            SolverError::InvalidInput(_) => None,
         };
         if let Some(diagnostic) = diagnostic {
-            diagnostic.last_linear_solve = last_linear_solve;
+            diagnostic.last_linear_attempt = last_linear_attempt;
         }
         error
     }
@@ -1464,12 +1512,24 @@ impl NewtonRaphsonSolver {
             vars,
             diagnostic_residuals,
             accepted_updates,
+            gradient,
         } = context;
 
         // Multiplying J by the candidate direction produces the residual-space
         // velocity used by the chain rule. The multiplication honors the
         // solver's selected execution mode and retains structured shape errors.
-        let residual_velocity = jacobian.try_mul_with_parallel(direction, parallel)?;
+        let residual_velocity = jacobian
+            .try_mul_with_parallel(direction, parallel)
+            .map_err(|source| {
+                self.matrix_error(
+                    source,
+                    accepted_updates,
+                    vars,
+                    diagnostic_residuals,
+                    gradient,
+                    None,
+                )
+            })?;
         if !residual_velocity.all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Line-search directional derivative produced NaN or infinity",
@@ -1565,7 +1625,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals_matrix: &Matrix,
         gradient: Option<ResidualGradientMeasure>,
-        last_linear_solve: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LinearSolveDiagnostic>,
     ) -> SolverRunDiagnostic {
         // Residual row order matches compiled equation order. Clone optional
         // trace metadata into the owned diagnostic so it remains useful after
@@ -1587,7 +1647,7 @@ impl NewtonRaphsonSolver {
             error: self.scaled_residual_norm(residuals_matrix),
             gradient_norm: gradient.map(|measure| measure.absolute_norm),
             relative_gradient_norm: gradient.and_then(|measure| measure.relative_norm),
-            last_linear_solve,
+            last_linear_attempt,
             values: self.values_by_name(vars),
             equations,
         }
@@ -1805,8 +1865,19 @@ mod tests {
         match (serial, parallel) {
             // Compare the structured payloads for variants whose data is not a
             // floating-point run diagnostic covered by their focused tests.
-            (SolverError::Matrix(left), SolverError::Matrix(right)) => {
-                assert_eq!(left, right);
+            (
+                SolverError::Matrix {
+                    source: left_source,
+                    diagnostic: left_diagnostic,
+                },
+                SolverError::Matrix {
+                    source: right_source,
+                    diagnostic: right_diagnostic,
+                },
+            ) => {
+                assert_eq!(left_source, right_source);
+                assert_eq!(left_diagnostic.iterations, right_diagnostic.iterations);
+                assert_eq!(left_diagnostic.values, right_diagnostic.values);
             }
             (SolverError::InvalidInput(left), SolverError::InvalidInput(right)) => {
                 assert_eq!(left, right);
@@ -1855,29 +1926,57 @@ mod tests {
             .expect("failed to select solve variables or set mode")
     }
 
-    /// Preserve every machine-readable matrix error field across the public
-    /// solver conversion and standard error-source chain.
+    /// Preserve every machine-readable matrix field and the complete nonlinear
+    /// run state when an actual correction solve fails.
     #[test]
-    fn test_solver_error_retains_structured_matrix_cause() {
-        let matrix_error = MatrixError::DimensionMismatch {
-            operation: "test operation",
-            left: (2, 3),
-            right: (4, 5),
-        };
-        let solver_error = SolverError::from(matrix_error.clone());
+    fn test_linear_solve_error_retains_matrix_cause_and_run_diagnostic() {
+        // The derivative is the smallest positive subnormal. Its mathematical
+        // correction is larger than `f64::MAX`, forcing a real public solve to
+        // return a typed matrix result error after residuals and gradient have
+        // already been evaluated at the accepted initial state.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(f64::from_bits(1)), x), Exp::val(1.0));
+        let solver = solver_for_mode(vec![equation], Mode::Serial)
+            .with_equation_traces(vec![Some(EquationTrace {
+                constraint_id: 41,
+                description: "unrepresentable correction fixture".to_string(),
+            })])
+            .expect("one trace is supplied for one equation");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-        // Pattern matching must recover the original variant without parsing
-        // its human-readable Display representation.
+        let solver_error = solver
+            .solve(initial)
+            .expect_err("the required correction lies outside the f64 range");
+        let expected_source = MatrixError::NonFiniteResult {
+            operation: "solve_least_squares",
+        };
+
         match &solver_error {
-            SolverError::Matrix(retained) => assert_eq!(retained, &matrix_error),
-            other => panic!("expected structured Matrix error, got {other:?}"),
+            SolverError::Matrix { source, diagnostic } => {
+                assert_eq!(source, &expected_source);
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 0.0);
+                assert_eq!(diagnostic.error, 1.0);
+                assert_eq!(diagnostic.last_linear_attempt, None);
+                assert_eq!(diagnostic.equations.len(), 1);
+                assert_eq!(diagnostic.equations[0].residual, -1.0);
+                assert_eq!(diagnostic.equations[0].scaled_residual, -1.0);
+                assert_eq!(
+                    diagnostic.equations[0]
+                        .trace
+                        .as_ref()
+                        .map(|trace| trace.constraint_id),
+                    Some(41)
+                );
+            }
+            other => panic!("expected contextual Matrix error, got {other:?}"),
         }
 
-        // Generic error-reporting integrations should observe the identical
-        // typed value as the lower-level source.
+        // Generic error-reporting integrations must observe the identical typed
+        // value as the lower-level source without parsing display text.
         let source = std::error::Error::source(&solver_error)
             .expect("a structured matrix failure must remain in the error chain");
-        assert_eq!(source.downcast_ref::<MatrixError>(), Some(&matrix_error));
+        assert_eq!(source.downcast_ref::<MatrixError>(), Some(&expected_source));
     }
 
     /// Exercise the public nonlinear solver at an extreme finite scale so the
@@ -2572,6 +2671,12 @@ mod tests {
                     assert_eq!(diagnostic.values["x"], -20.0);
                     assert!(diagnostic.gradient_norm.is_some());
                     assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
+                    let attempt = diagnostic
+                        .last_linear_attempt
+                        .as_ref()
+                        .expect("the rejected candidate still followed a successful SVD attempt");
+                    assert_eq!(attempt.effective.rank, 1);
+                    assert_eq!(attempt.regularization, None);
                 }
                 other => panic!("expected NoConvergence, got {other:?}"),
             }
@@ -2912,7 +3017,7 @@ mod tests {
                     .is_some_and(|norm| norm < 1e-8)
             );
             let linear = diagnostic
-                .last_linear_solve
+                .last_linear_attempt
                 .as_ref()
                 .expect("stationarity reached after an SVD correction");
             assert_eq!(linear.regularization, None);
@@ -2972,7 +3077,7 @@ mod tests {
 
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.convergence_history, vec![0.0]);
-            assert_eq!(solution.last_linear_solve, None);
+            assert_eq!(solution.last_linear_attempt, None);
         }
     }
 
@@ -2994,7 +3099,7 @@ mod tests {
 
             assert_eq!(solution.error, 1.0);
             assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.last_linear_solve, None);
+            assert_eq!(solution.last_linear_attempt, None);
 
             // Starting at residual two with a half-sized Newton step lands
             // exactly on the same boundary. The next accepted-state check must
@@ -3120,7 +3225,7 @@ mod tests {
             assert!(solution.error <= solver.options().residual_tolerance);
             assert_eq!(
                 solution
-                    .last_linear_solve
+                    .last_linear_attempt
                     .as_ref()
                     .expect("one correction must retain factorization diagnostics")
                     .effective
@@ -3150,7 +3255,7 @@ mod tests {
                 .solve(initial)
                 .expect("normalized variable coordinates should solve");
             let linear = solution
-                .last_linear_solve
+                .last_linear_attempt
                 .expect("one correction must report its scaled factorization");
 
             assert_eq!(solution.values["x"], 1.0);
@@ -3429,7 +3534,7 @@ mod tests {
             assert!((solution.values["x"] - 0.5).abs() < 1e-10);
             assert!((solution.values["y"] - 0.5).abs() < 1e-10);
             let linear = solution
-                .last_linear_solve
+                .last_linear_attempt
                 .expect("the accepted correction must retain SVD diagnostics");
             assert_eq!(linear.effective.rank, 1);
             assert_eq!(linear.regularization, None);
@@ -3467,7 +3572,7 @@ mod tests {
                     assert!(diagnostic.values["x"].abs() < 0.1);
                     assert!(diagnostic.error > 1e-12);
                     let linear = diagnostic
-                        .last_linear_solve
+                        .last_linear_attempt
                         .as_ref()
                         .expect("regularized correction diagnostics must be retained");
                     assert_eq!(linear.regularization, Some(1e-8));
