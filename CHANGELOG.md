@@ -15,8 +15,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `LinearSolveDiagnostic` to successful solutions and failed-run
   diagnostics, preserving the effective factorization and explicit ridge
   strength used for the accepted correction.
-- Added `SolverOptions` and `LeastSquaresOptions` as the documented sources of
-  nonlinear iteration, line-search, regularization, and rank policy.
+- Added `SolverOptions` as the documented source of nonlinear iteration,
+  Armijo, and explicit regularization policy.
 - Added structured equation diagnostics and optional caller-provided equation
   traces to make failed constraints identifiable without parsing messages.
 - Added structured matrix errors for invalid shapes and tolerances, overflowing
@@ -37,8 +37,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `solve_least_squares` operation returning a diagnostic result. Compatibility
   aliases from the pre-alpha API were intentionally removed.
 - Unified nonlinear Jacobian correction policy across all shapes. Full-rank
-  systems use Householder QR, rank-deficient systems use the SVD pseudoinverse,
-  and ill-conditioned retained subspaces use augmented ridge regularization.
+  systems use Householder QR and rank-deficient systems use the SVD
+  pseudoinverse; ridge regularization is caller-selected.
+- Replaced the public fixed rank cutoff with the factorization-derived relative
+  threshold `f64::EPSILON * max(rows, columns)`. `solve_least_squares` no longer
+  accepts `LeastSquaresOptions`; QR and SVD share one automatic policy.
 - Replaced condition-triggered regularization and retry schedules with one
   explicit policy: zero performs a direct QR/SVD solve and a positive value
   performs one augmented ridge solve at exactly the configured strength.
@@ -74,6 +77,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already-computed gradient measures in every `NoConvergence` diagnostic.
 - Prevented norm, column-scaled stationarity, and line-search slope calculations
   from overflowing or underflowing at extreme finite scales.
+- Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
+  algebraically independent small-coefficient directions above factorization
+  roundoff, preventing repeated zero corrections on solvable systems.
 - Corrected Householder reflector scaling and triangular condition estimation,
   including off-diagonal growth and uniform matrix rescaling.
 - Corrected LU pivot classification so every pivot, including the final one,

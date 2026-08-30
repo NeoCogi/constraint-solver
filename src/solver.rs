@@ -27,7 +27,7 @@ SOFTWARE.
 
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
-use crate::matrix::{LeastSquaresInfo, LeastSquaresOptions, Matrix, MatrixError};
+use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
 use crate::mode::{Mode, build_thread_pool};
 use rayon::ThreadPool;
 use std::collections::HashMap;
@@ -138,8 +138,6 @@ pub struct SolverOptions {
     pub initial_step_size: f64,
     /// Explicit ridge parameter; zero selects the unregularized QR/SVD solve.
     pub regularization: f64,
-    /// QR/SVD numerical-rank policy used by every Jacobian shape.
-    pub least_squares: LeastSquaresOptions,
     /// Armijo sufficient-decrease coefficient for every accepted update.
     pub armijo_coefficient: f64,
     /// Maximum number of candidate steps evaluated by one line search.
@@ -159,7 +157,6 @@ impl Default for SolverOptions {
             stationarity_tolerance: 1e-10,
             initial_step_size: 1.0,
             regularization: 0.0,
-            least_squares: LeastSquaresOptions::default(),
             armijo_coefficient: 1e-4,
             line_search_max_trials: 64,
             line_search_min_step: 1e-12,
@@ -843,7 +840,7 @@ impl NewtonRaphsonSolver {
             // The direct QR/SVD path returns the minimum-norm correction for
             // rank-deficient systems. Conditioning remains diagnostic data; it
             // never silently changes the equation being solved.
-            let result = j_matrix.solve_least_squares(rhs, self.options.least_squares, parallel)?;
+            let result = j_matrix.solve_least_squares(rhs, parallel)?;
             return Ok(LinearSolveResult {
                 solution: result.solution,
                 diagnostic: LinearSolveDiagnostic {
@@ -883,8 +880,7 @@ impl NewtonRaphsonSolver {
             augmented_j[(j_matrix.rows() + variable, variable)] = sqrt_regularization;
         }
 
-        let result =
-            augmented_j.solve_least_squares(&augmented_b, self.options.least_squares, parallel)?;
+        let result = augmented_j.solve_least_squares(&augmented_b, parallel)?;
         Ok(LinearSolveResult {
             solution: result.solution,
             diagnostic: LinearSolveDiagnostic {
@@ -960,8 +956,9 @@ impl NewtonRaphsonSolver {
         )?;
         Self::require_valid_option(
             self.options.stationarity_tolerance.is_finite()
-                && self.options.stationarity_tolerance > 0.0,
-            "stationarity_tolerance must be finite and greater than zero",
+                && self.options.stationarity_tolerance > 0.0
+                && self.options.stationarity_tolerance <= 1.0,
+            "stationarity_tolerance must be finite and in the interval (0, 1]",
         )?;
         Self::require_valid_option(
             self.options.initial_step_size.is_finite()
@@ -973,15 +970,6 @@ impl NewtonRaphsonSolver {
             self.options.regularization.is_finite() && self.options.regularization >= 0.0,
             "regularization must be finite and non-negative",
         )?;
-        Self::require_valid_option(
-            self.options
-                .least_squares
-                .relative_rank_tolerance
-                .is_finite()
-                && self.options.least_squares.relative_rank_tolerance >= 0.0,
-            "least_squares.relative_rank_tolerance must be finite and non-negative",
-        )?;
-
         Self::require_valid_option(
             self.options.armijo_coefficient.is_finite()
                 && self.options.armijo_coefficient > 0.0
@@ -1883,6 +1871,10 @@ mod tests {
                 Box::new(|solver| solver.with_stationarity_tolerance(f64::INFINITY)),
             ),
             (
+                "stationarity_tolerance",
+                Box::new(|solver| solver.with_stationarity_tolerance(2.0)),
+            ),
+            (
                 "initial_step_size",
                 Box::new(|solver| solver.with_initial_step_size(0.0)),
             ),
@@ -1901,14 +1893,6 @@ mod tests {
             (
                 "regularization",
                 Box::new(|solver| solver.with_regularization(f64::INFINITY)),
-            ),
-            (
-                "least_squares.relative_rank_tolerance",
-                Box::new(|solver| {
-                    configure_options(solver, |options| {
-                        options.least_squares.relative_rank_tolerance = f64::NAN
-                    })
-                }),
             ),
             (
                 "armijo_coefficient",
@@ -2788,6 +2772,43 @@ mod tests {
             }
             assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
             assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
+        }
+    }
+
+    /// Retain an independent direction whose coefficient is small because of
+    /// caller units rather than floating-point rank loss.
+    #[test]
+    fn test_solver_does_not_truncate_solvable_small_coefficient_direction() {
+        for mode in test_modes() {
+            // The exact root is x=1, y=1e13. The former fixed 1e-12 relative
+            // cutoff dropped the y direction, accepted 100 zero corrections,
+            // and reported NoConvergence with y still at zero.
+            let x = Exp::var("x");
+            let y = Exp::var("y");
+            let equations = vec![
+                Exp::sub(x, Exp::val(1.0)),
+                Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+            ];
+            let solver = solver_for_mode(equations, mode);
+            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+            let solution = solver
+                .solve(initial)
+                .expect("a direction above factorization roundoff must be retained");
+
+            assert_eq!(solution.iterations, 1);
+            assert_eq!(solution.values["x"], 1.0);
+            assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+            assert!(solution.error <= solver.options().residual_tolerance);
+            assert_eq!(
+                solution
+                    .last_linear_solve
+                    .as_ref()
+                    .expect("one correction must retain factorization diagnostics")
+                    .effective
+                    .rank,
+                2
+            );
         }
     }
 

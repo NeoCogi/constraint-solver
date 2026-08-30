@@ -34,10 +34,9 @@ current stable toolchain.
 
 The solver supports all three system shapes:
 
-- Square systems (equations == variables): solved by the same condition-aware
-  QR/SVD policy as rectangular Jacobians. Full-rank systems use QR,
-  rank-deficient systems use an SVD pseudoinverse, and an ill-conditioned
-  retained subspace can select augmented ridge regularization.
+- Square systems (equations == variables): solved by the same QR/SVD policy as
+  rectangular Jacobians. Full-rank systems use QR and rank-deficient systems use
+  an SVD pseudoinverse; ridge regularization occurs only when explicitly set.
 - Under-constrained systems (equations < variables): solved via QR/SVD least squares.
   The Moore-Penrose minimum-norm Newton correction preserves the current local
   Jacobian-null-space component for continuity.
@@ -241,7 +240,9 @@ decisions.
   preserving the current Jacobian-null-space component for continuity.
 - Least squares solving uses Householder QR for full-rank systems and a
   one-sided Jacobi SVD pseudoinverse for rank-deficient systems. Both paths
-  avoid forming normal equations.
+  avoid forming normal equations. Numerical rank uses the scale-relative
+  threshold `f64::EPSILON * max(rows, columns)` rather than a caller-provided
+  application-level cutoff.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
   to zero: zero solves the original Jacobian once, while a positive value solves

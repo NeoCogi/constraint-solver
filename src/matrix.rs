@@ -32,13 +32,6 @@ use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 16_384;
 
-/// Relative factor threshold used to classify numerical rank after QR or SVD.
-///
-/// The threshold is intentionally relative to the largest QR diagonal or
-/// singular value. An absolute floor would make rank depend on the units or
-/// scalar normalization chosen by the caller.
-const DEFAULT_NUMERICAL_RANK_RELATIVE_TOLERANCE: f64 = 1e-12;
-
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked linear solve began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +70,18 @@ fn numerical_rank_tolerance(max_factor_value: f64, relative_tolerance: f64) -> f
     // Multiplication, rather than `max_factor_value.max(1.0)`, preserves rank
     // under uniform scaling of the input matrix.
     relative_tolerance * max_factor_value
+}
+
+/// Derive the relative numerical-rank threshold from floating-point precision
+/// and matrix size.
+///
+/// Multiplying machine epsilon by the larger dimension accounts for roundoff
+/// accumulated across one factorization dimension without imposing a fixed
+/// application-scale cutoff. The resulting threshold is then multiplied by the
+/// factor scale through [`numerical_rank_tolerance`], preserving uniform-scale
+/// invariance.
+fn numerical_rank_relative_tolerance(rows: usize, cols: usize) -> f64 {
+    f64::EPSILON * rows.max(cols) as f64
 }
 
 /// Structured failure returned by all fallible matrix construction and linear
@@ -220,26 +225,6 @@ pub struct LeastSquaresSolution {
     pub solution: Matrix,
     /// Rank, retained-subspace condition estimate, and factorization method.
     pub info: LeastSquaresInfo,
-}
-
-/// Numerical policy shared by QR rank detection and the SVD pseudoinverse.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LeastSquaresOptions {
-    /// Non-negative finite threshold relative to the largest QR diagonal or
-    /// singular value. Directions at or below this fraction are treated as
-    /// numerically rank deficient and omitted from the pseudoinverse.
-    pub relative_rank_tolerance: f64,
-}
-
-impl Default for LeastSquaresOptions {
-    /// Return the crate's balanced default rank policy.
-    fn default() -> Self {
-        // Keep the historical threshold explicit in the public option value so
-        // callers can inspect and replace it without relying on a hidden const.
-        Self {
-            relative_rank_tolerance: DEFAULT_NUMERICAL_RANK_RELATIVE_TOLERANCE,
-        }
-    }
 }
 
 impl fmt::Display for MatrixError {
@@ -746,8 +731,8 @@ impl Matrix {
         Ok(x)
     }
 
-    /// Solve a possibly rectangular least-squares problem with explicit rank
-    /// and parallelism policy.
+    /// Solve a possibly rectangular least-squares problem with automatic rank
+    /// classification and explicit parallelism policy.
     ///
     /// Full-rank systems use Householder QR. If QR detects numerical rank loss,
     /// a one-sided Jacobi SVD computes the Moore-Penrose minimum-norm solution.
@@ -757,17 +742,8 @@ impl Matrix {
     pub fn solve_least_squares(
         &self,
         b: &Matrix,
-        options: LeastSquaresOptions,
         parallel: bool,
     ) -> Result<LeastSquaresSolution, MatrixError> {
-        // Rank tolerance participates in every QR/SVD classification, so reject
-        // invalid values once before either factorization can observe them.
-        if !options.relative_rank_tolerance.is_finite() || options.relative_rank_tolerance < 0.0 {
-            return Err(MatrixError::InvalidTolerance {
-                operation: "solve_least_squares",
-            });
-        }
-
         // Validate the vector shape before either factorization reads it. The
         // solve API intentionally accepts one right-hand side so its
         // minimum-norm and diagnostic contract remains unambiguous.
@@ -803,6 +779,11 @@ impl Matrix {
 
         let m = self.rows;
         let n = self.cols;
+        // One factorization-derived policy governs QR classification, local
+        // substitution guards, and SVD truncation. Callers cannot accidentally
+        // discard all directions with a normalized threshold of one or encode
+        // application-unit assumptions in a matrix-level option.
+        let relative_rank_tolerance = numerical_rank_relative_tolerance(m, n);
 
         // Trivial cases have a unique zero-length or minimum-norm zero solution
         // and require no numerical factorization.
@@ -818,19 +799,9 @@ impl Matrix {
         }
 
         let qr_result = if m >= n {
-            Self::solve_least_squares_qr_tall_with_info(
-                self,
-                b,
-                options.relative_rank_tolerance,
-                parallel,
-            )
+            Self::solve_least_squares_qr_tall_with_info(self, b, relative_rank_tolerance, parallel)
         } else {
-            Self::solve_least_squares_qr_wide_with_info(
-                self,
-                b,
-                options.relative_rank_tolerance,
-                parallel,
-            )
+            Self::solve_least_squares_qr_wide_with_info(self, b, relative_rank_tolerance, parallel)
         };
 
         // QR remains the efficient full-rank path. Numerical rank loss is not a
@@ -843,7 +814,7 @@ impl Matrix {
                 diagnostics,
             }) => (solution, diagnostics),
             Ok(QrLeastSquaresOutcome::RankDeficient) => {
-                Self::solve_least_squares_svd_with_info(self, b, options.relative_rank_tolerance)?
+                Self::solve_least_squares_svd_with_info(self, b, relative_rank_tolerance)?
             }
             Err(error) => return Err(error),
         };
@@ -2049,7 +2020,7 @@ mod tests {
         // Unwrap here so individual numerical tests can focus on their expected
         // solution and diagnostic fields.
         coefficients
-            .solve_least_squares(rhs, LeastSquaresOptions::default(), parallel)
+            .solve_least_squares(rhs, parallel)
             .expect("least-squares solve failed")
     }
 
@@ -2123,9 +2094,7 @@ mod tests {
             }
         );
         assert_eq!(
-            identity
-                .solve_least_squares(&nan_rhs, LeastSquaresOptions::default(), false)
-                .unwrap_err(),
+            identity.solve_least_squares(&nan_rhs, false).unwrap_err(),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
                 operand: MatrixOperand::RightHandSide,
@@ -2143,7 +2112,7 @@ mod tests {
         );
         assert_eq!(
             nan_coefficient
-                .solve_least_squares(&finite_rhs, LeastSquaresOptions::default(), false)
+                .solve_least_squares(&finite_rhs, false)
                 .unwrap_err(),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
@@ -2169,7 +2138,7 @@ mod tests {
         );
         assert_eq!(
             tiny_coefficient
-                .solve_least_squares(&huge_rhs, LeastSquaresOptions::default(), false)
+                .solve_least_squares(&huge_rhs, false)
                 .unwrap_err(),
             MatrixError::NonFiniteResult {
                 operation: "solve_least_squares",
@@ -2517,53 +2486,19 @@ mod tests {
         assert!((result.solution[(1, 0)] - 0.4).abs() < 1e-12);
     }
 
-    /// Verify that callers can deliberately change numerical-rank policy
-    /// instead of depending on an inaccessible crate constant.
+    /// Keep algebraic directions that are small in application units but remain
+    /// distinguishable from factorization roundoff.
     #[test]
-    fn test_solve_least_squares_honors_explicit_rank_tolerance() {
-        // The second diagonal is retained by the default 1e-12 threshold but
-        // discarded by the explicit 1e-3 policy.
-        let coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-6], 2, 2).unwrap();
-        let rhs = Matrix::from_vec(vec![1.0, 1e-6], 2, 1).unwrap();
-        let default_result = solve_default(&coefficients, &rhs, false);
-        let truncated_result = coefficients
-            .solve_least_squares(
-                &rhs,
-                LeastSquaresOptions {
-                    relative_rank_tolerance: 1e-3,
-                },
-                false,
-            )
-            .unwrap();
+    fn test_solve_least_squares_uses_precision_derived_rank_threshold() {
+        // For a 2x2 factor, eps*2 is far below 1e-13. A fixed application-level
+        // threshold of 1e-12 incorrectly discarded this independent direction.
+        let coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-13], 2, 2).unwrap();
+        let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
+        let result = solve_default(&coefficients, &rhs, false);
 
-        assert_eq!(default_result.info.rank, 2);
-        assert_eq!(truncated_result.info.rank, 1);
-        assert_eq!(truncated_result.info.method, LeastSquaresMethod::JacobiSvd);
-        assert!((truncated_result.solution[(0, 0)] - 1.0).abs() < 1e-12);
-        assert_eq!(truncated_result.solution[(1, 0)], 0.0);
-    }
-
-    /// Ensure invalid public rank policy is rejected before factorization.
-    #[test]
-    fn test_solve_least_squares_rejects_invalid_rank_tolerance() {
-        let coefficients = Matrix::identity(1);
-        let rhs = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
-        let error = coefficients
-            .solve_least_squares(
-                &rhs,
-                LeastSquaresOptions {
-                    relative_rank_tolerance: f64::NAN,
-                },
-                false,
-            )
-            .expect_err("NaN cannot define an ordered rank threshold");
-
-        assert_eq!(
-            error,
-            MatrixError::InvalidTolerance {
-                operation: "solve_least_squares",
-            }
-        );
+        assert_eq!(result.info.rank, 2);
+        assert!((result.solution[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((result.solution[(1, 0)] - 1e13).abs() < 1e-3);
     }
 
     /// Verify that reflector normalization does not overflow when a finite

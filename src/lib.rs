@@ -71,8 +71,7 @@ pub mod solver;
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
 pub use matrix::{
-    LeastSquaresInfo, LeastSquaresMethod, LeastSquaresOptions, LeastSquaresSolution, Matrix,
-    MatrixError, MatrixOperand,
+    LeastSquaresInfo, LeastSquaresMethod, LeastSquaresSolution, Matrix, MatrixError, MatrixOperand,
 };
 pub use mode::Mode;
 pub use solver::{

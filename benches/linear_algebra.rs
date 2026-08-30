@@ -1,4 +1,4 @@
-use constraint_solver::{LeastSquaresOptions, Matrix};
+use constraint_solver::Matrix;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::ThreadPoolBuilder;
 use std::hint::black_box;
@@ -189,13 +189,8 @@ fn bench_qr(c: &mut Criterion) {
         let n = size;
         let tall = random_matrix(m, n, &mut rng);
         let tall_b = random_matrix(m, 1, &mut rng);
-        let serial = tall
-            .solve_least_squares(&tall_b, LeastSquaresOptions::default(), false)
-            .unwrap();
-        let parallel = pool.install(|| {
-            tall.solve_least_squares(&tall_b, LeastSquaresOptions::default(), true)
-                .unwrap()
-        });
+        let serial = tall.solve_least_squares(&tall_b, false).unwrap();
+        let parallel = pool.install(|| tall.solve_least_squares(&tall_b, true).unwrap());
         assert_eq!(serial.info.rank, parallel.info.rank);
         assert_f64_close(serial.info.cond_est, parallel.info.cond_est, 1e-8, 1e-6);
         assert_matrix_close(&serial.solution, &parallel.solution, 1e-8, 1e-6);
@@ -204,13 +199,7 @@ fn bench_qr(c: &mut Criterion) {
             &tall,
             |bench, a| {
                 bench.iter(|| {
-                    let result = a
-                        .solve_least_squares(
-                            black_box(&tall_b),
-                            LeastSquaresOptions::default(),
-                            false,
-                        )
-                        .unwrap();
+                    let result = a.solve_least_squares(black_box(&tall_b), false).unwrap();
                     black_box(result);
                 })
             },
@@ -220,14 +209,8 @@ fn bench_qr(c: &mut Criterion) {
             &tall,
             |bench, a| {
                 bench.iter(|| {
-                    let result = pool.install(|| {
-                        a.solve_least_squares(
-                            black_box(&tall_b),
-                            LeastSquaresOptions::default(),
-                            true,
-                        )
-                        .unwrap()
-                    });
+                    let result =
+                        pool.install(|| a.solve_least_squares(black_box(&tall_b), true).unwrap());
                     black_box(result);
                 })
             },
@@ -235,13 +218,8 @@ fn bench_qr(c: &mut Criterion) {
 
         let wide = random_matrix(n, m, &mut rng);
         let wide_b = random_matrix(n, 1, &mut rng);
-        let serial = wide
-            .solve_least_squares(&wide_b, LeastSquaresOptions::default(), false)
-            .unwrap();
-        let parallel = pool.install(|| {
-            wide.solve_least_squares(&wide_b, LeastSquaresOptions::default(), true)
-                .unwrap()
-        });
+        let serial = wide.solve_least_squares(&wide_b, false).unwrap();
+        let parallel = pool.install(|| wide.solve_least_squares(&wide_b, true).unwrap());
         assert_eq!(serial.info.rank, parallel.info.rank);
         assert_f64_close(serial.info.cond_est, parallel.info.cond_est, 1e-8, 1e-6);
         assert_matrix_close(&serial.solution, &parallel.solution, 1e-8, 1e-6);
@@ -250,13 +228,7 @@ fn bench_qr(c: &mut Criterion) {
             &wide,
             |bench, a| {
                 bench.iter(|| {
-                    let result = a
-                        .solve_least_squares(
-                            black_box(&wide_b),
-                            LeastSquaresOptions::default(),
-                            false,
-                        )
-                        .unwrap();
+                    let result = a.solve_least_squares(black_box(&wide_b), false).unwrap();
                     black_box(result);
                 })
             },
@@ -266,14 +238,8 @@ fn bench_qr(c: &mut Criterion) {
             &wide,
             |bench, a| {
                 bench.iter(|| {
-                    let result = pool.install(|| {
-                        a.solve_least_squares(
-                            black_box(&wide_b),
-                            LeastSquaresOptions::default(),
-                            true,
-                        )
-                        .unwrap()
-                    });
+                    let result =
+                        pool.install(|| a.solve_least_squares(black_box(&wide_b), true).unwrap());
                     black_box(result);
                 })
             },
