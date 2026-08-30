@@ -255,6 +255,29 @@ Run the unit tests with:
 cargo test
 ```
 
+### Real-world validation traces
+
+The integration suite reuses shared electronic and geometric builders for 100
+warm-started samples per scenario. Electronic coverage includes an AC diode
+clipper, diode logic, saturated bipolar inverter/NAND logic, CMOS inverter/NAND
+logic, an RC low-pass filter, and a common-emitter amplifier. MOS devices are
+described as CMOS rather than TTL because TTL specifically denotes bipolar
+transistor logic. The compact smooth device models are solver validation
+fixtures, not a replacement for a production SPICE implementation.
+
+Geometry coverage tracks a common line tangent to two moving circles and a
+rigid six-circle triangular packing. Six planar circles cannot all be pairwise
+tangent; the packing realizes nine contact edges and checks every other pair
+for non-overlap.
+
+Successful output is captured during ordinary test runs. Show each complete
+CSV time series with:
+
+```bash
+cargo test --test real_world_electronics -- --show-output
+cargo test --test real_world_geometry -- --show-output
+```
+
 ## Benchmarks
 
 Benchmarks are in `benches/linear_algebra.rs` and compare the core matrix
