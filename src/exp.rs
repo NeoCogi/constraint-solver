@@ -247,12 +247,19 @@ impl Neg for &Exp {
 }
 
 impl fmt::Display for Exp {
+    /// Render the complete expression tree with quoted, escaped variable names.
+    ///
+    /// This output is diagnostic notation for people and logs, not a stable or
+    /// parseable expression serialization format.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Parenthesize binary operations consistently so the rendered tree is
-        // unambiguous without relying on precedence rules.
+        // Parenthesize composite operations consistently so the rendered tree
+        // does not rely on precedence rules. Variable names use the standard
+        // Rust Debug string representation, which distinguishes an arbitrary
+        // name from operator, numeric, or function syntax and escapes log
+        // controls.
         match self {
             Exp::Val(v) => write!(f, "{v}"),
-            Exp::Var(name) => write!(f, "{name}"),
+            Exp::Var(name) => write!(f, "{name:?}"),
             Exp::Add(l, r) => write!(f, "({l} + {r})"),
             Exp::Sub(l, r) => write!(f, "({l} - {r})"),
             Exp::Mul(l, r) => write!(f, "({l} * {r})"),
@@ -295,7 +302,22 @@ mod tests {
             Exp::val(1.0),
         );
 
-        assert_eq!(format!("{expr}"), "(((x^2) + (3 * y)) - 1)");
+        assert_eq!(format!("{expr}"), "(((\"x\"^2) + (3 * \"y\")) - 1)");
+    }
+
+    /// Quote and escape every public variable name instead of allowing its
+    /// contents to impersonate expression syntax or inject control characters.
+    #[test]
+    fn test_display_quotes_and_escapes_arbitrary_variable_names() {
+        // The compiler accepts every non-empty name, so display must remain
+        // unambiguous for operator text, quotes, path separators, and controls.
+        let variable = Exp::var("axis + \"sensor\"\\gain\n\t");
+        assert_eq!(variable.to_string(), r#""axis + \"sensor\"\\gain\n\t""#);
+
+        // Function-like and numeric-looking names receive the same rule as a
+        // plain identifier; no evolving reserved-word list is required.
+        assert_eq!(Exp::var("sin(x)").to_string(), r#""sin(x)""#);
+        assert_eq!(Exp::var("1").to_string(), r#""1""#);
     }
 
     /// Exercise every ownership and scalar position supported by the binary
