@@ -1345,7 +1345,18 @@ impl IndexMut<(usize, usize)> for Matrix {
 }
 
 impl fmt::Display for Matrix {
+    /// Render non-empty matrices by row and empty matrices as one shape token.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A zero-column matrix can have an arbitrarily large logical row count
+        // while owning no elements. Formatting one empty row per logical row
+        // would turn a constant-size value into an effectively unbounded write,
+        // so every zero-axis shape receives one explicit constant-size form.
+        if self.rows == 0 || self.cols == 0 {
+            return write!(f, "Matrix({}x{})", self.rows, self.cols);
+        }
+
+        // Keep the established row-oriented layout for physically populated
+        // matrices; all coordinates are valid under the constructor invariant.
         for i in 0..self.rows {
             write!(f, "[")?;
             for j in 0..self.cols {
@@ -1735,6 +1746,32 @@ mod tests {
         assert_eq!(product.rows(), usize::MAX);
         assert_eq!(product.cols(), 0);
         assert_eq!(product.norm(), 0.0);
+    }
+
+    /// Format every empty shape in constant work while retaining both logical
+    /// dimensions in the rendered value.
+    #[test]
+    fn test_display_is_bounded_and_shape_explicit_for_empty_matrices() {
+        // Zero storage does not imply zero logical dimensions. In particular,
+        // the maximum-axis cases must not iterate their enormous empty ranges.
+        let empty_shapes = [
+            (0, 0, "Matrix(0x0)".to_string()),
+            (0, 3, "Matrix(0x3)".to_string()),
+            (3, 0, "Matrix(3x0)".to_string()),
+            (usize::MAX, 0, format!("Matrix({}x0)", usize::MAX)),
+            (0, usize::MAX, format!("Matrix(0x{})", usize::MAX)),
+        ];
+        for (rows, cols, expected) in empty_shapes {
+            let matrix = Matrix::from_vec(Vec::new(), rows, cols)
+                .expect("a zero-axis shape requires no element storage");
+            assert_eq!(matrix.to_string(), expected);
+        }
+
+        // The bounded empty branch must not change the established row layout
+        // used for ordinary numerical debugging output.
+        let populated = Matrix::from_vec(vec![1.0, -2.0], 1, 2)
+            .expect("two values exactly fill a one-by-two matrix");
+        assert_eq!(populated.to_string(), "[  1.0000,  -2.0000]\n");
     }
 
     #[test]
