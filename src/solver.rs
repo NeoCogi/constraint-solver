@@ -784,6 +784,7 @@ impl NewtonRaphsonSolver {
                 0,
                 vars,
                 f_vals,
+                None,
             ));
         }
         if !jacobian_workspace.jacobian().all_finite() {
@@ -792,6 +793,7 @@ impl NewtonRaphsonSolver {
                 0,
                 vars,
                 f_vals,
+                None,
             ));
         }
         if !scaled_f_vals.all_finite() || !scaled_jacobian.all_finite() {
@@ -800,6 +802,7 @@ impl NewtonRaphsonSolver {
                 0,
                 vars,
                 f_vals,
+                None,
             ));
         }
         // The current state is always fully evaluated at loop entry. A mutable
@@ -884,6 +887,7 @@ impl NewtonRaphsonSolver {
                         iter,
                         vars,
                         f_vals,
+                        Some(gradient),
                     ),
                     last_linear_attempt,
                 ));
@@ -932,6 +936,7 @@ impl NewtonRaphsonSolver {
                         iter + 1,
                         vars,
                         f_vals,
+                        None,
                     ),
                     last_linear_attempt,
                 ));
@@ -944,6 +949,7 @@ impl NewtonRaphsonSolver {
                         iter + 1,
                         vars,
                         f_vals,
+                        None,
                     ),
                     last_linear_attempt,
                 ));
@@ -1339,23 +1345,30 @@ impl NewtonRaphsonSolver {
     }
 
     /// Build the dedicated error variant for non-finite numerical states while
-    /// preserving the current values and residual vector for diagnosis.
+    /// preserving every state-local measure already evaluated there.
+    ///
+    /// `gradient` is `Some` only after the current residual and Jacobian have
+    /// both passed their finite checks. Callers at an earlier boundary, or at a
+    /// newly accepted state whose Jacobian failed, pass `None` rather than
+    /// recomputing through the failing operation.
     fn non_finite_evaluation_error(
         &self,
         message: impl Into<String>,
         iterations: usize,
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
+        gradient: Option<ResidualGradientMeasure>,
     ) -> SolverError {
-        // `build_diagnostic` intentionally preserves a NaN or infinite residual
-        // norm; hiding it behind a finite sentinel would discard useful failure
-        // evidence.
+        // Preserve a NaN or infinite residual norm as direct failure evidence.
+        // Supplying the optional gradient here, instead of mutating the boxed
+        // diagnostic afterward, makes already-computed state impossible to drop
+        // at a non-finite return boundary.
         SolverError::NonFiniteEvaluation(Box::new(self.build_diagnostic(
             message.into(),
             iterations,
             vars,
             residuals,
-            None,
+            gradient,
             None,
         )))
     }
@@ -1452,6 +1465,7 @@ impl NewtonRaphsonSolver {
                 accepted_updates,
                 vars,
                 current_residuals,
+                Some(gradient),
             ));
         }
 
@@ -2475,6 +2489,45 @@ mod tests {
 
         assert_eq!(solution.values["x"], 1.0);
         assert_eq!(solution.error, 0.0);
+    }
+
+    /// Retain gradient evidence when a completed SVD slope exceeds `f64` range.
+    #[test]
+    fn test_non_finite_slope_retains_computed_gradient_diagnostics() {
+        // Two identical large residuals have a finite minimum-norm correction,
+        // but their residual norm and its full-step derivative exceed the
+        // representable range. The line-search boundary is reached only after
+        // both gradient measures and the successful SVD attempt are available.
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.5e308));
+        let solver = build_solver(vec![equation.clone(), equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the physical residual-norm slope is negative infinity");
+        let diagnostic = match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => *diagnostic,
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        };
+
+        // The accepted state is unchanged, and diagnostics computed before the
+        // slope check must not be discarded while building the typed failure.
+        assert_eq!(diagnostic.iterations, 0);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.error, f64::INFINITY);
+        assert_eq!(diagnostic.gradient_norm, Some(f64::INFINITY));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|value| (value - 1.0).abs() < 1e-12)
+        );
+        let attempt = diagnostic
+            .last_linear_attempt
+            .expect("the completed correction attempt must remain attached");
+        assert_eq!(attempt.rank, 1);
+        assert!((attempt.retained_rhs_projection_fraction - 1.0).abs() < 1e-12);
+        assert_eq!(attempt.residual_norm_slope, f64::NEG_INFINITY);
     }
 
     /// Verify that exhaustion preserves the current state and reports failure
