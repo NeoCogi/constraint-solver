@@ -39,8 +39,9 @@ The solver supports all three system shapes:
 - Square systems (equations == variables): solved by the same SVD pseudoinverse
   policy as rectangular Jacobians.
 - Under-constrained systems (equations < variables): solved via SVD least squares.
-  The Moore-Penrose minimum-norm Newton correction preserves the current local
-  Jacobian-null-space component for continuity.
+  The Moore-Penrose correction has minimum norm in normalized variable
+  coordinates. Unit variable scales preserve the current caller-coordinate
+  Jacobian-null-space component; configured scales weight that choice.
 - Over-constrained systems (equations > variables): solved via SVD least
   squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
   system whose residual is orthogonal to every Jacobian column returns
@@ -72,8 +73,13 @@ overflow or underflow.
 
 The scaled residual controls convergence, retained-model stationarity, Armijo
 acceptance, and least-squares weighting. A larger equation scale therefore
-reduces that equation's weight. Variable scaling changes numerical coordinates
-without changing caller-visible values.
+reduces that equation's weight. Variable scaling defines the correction metric:
+among corrections that minimize the equation-scaled linearized residual, the
+pseudoinverse selects one minimizing `sqrt(sum((delta_x[j] / t_j)^2))`.
+Corrections are converted back to caller units, but in a wide or rank-deficient
+model different variable scales can select a different point among the valid
+directions. This is useful for characteristic CAD dimensions, circuit unknowns,
+and robot joint motions; it is not merely an internal conditioning hint.
 
 ```rust
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
@@ -317,8 +323,10 @@ the harness on the target machine when making performance decisions.
 ## Notes
 
 - The solver supports square, under-constrained, and over-constrained systems.
-- Underdetermined systems use the Moore-Penrose minimum-norm Newton correction,
-  preserving the current Jacobian-null-space component for continuity.
+- Underdetermined systems use the Moore-Penrose minimum-norm Newton correction
+  in normalized coordinates. With unit variable scales it preserves the current
+  caller-coordinate Jacobian-null-space component; configured scales define a
+  weighted correction metric instead.
 - Least squares solving uses one one-sided Jacobi SVD pseudoinverse for every
   matrix shape and rank. This avoids normal equations and the former
   order-sensitive QR pre-classification. Rank uses the scale-relative threshold

@@ -45,9 +45,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added structured equation diagnostics and optional caller-provided equation
   traces to make failed constraints identifiable without parsing messages.
 - Added explicit positive equation and variable characteristic scales. Equation
-  scales define dimensionless residual weighting and success, while variable
-  scales normalize Jacobian columns and corrections without changing
-  caller-visible values.
+  scales define dimensionless residual weighting and success. Variable scales
+  define the minimum-norm correction metric in normalized coordinates, and
+  accepted corrections are converted back to caller units.
 - Added structured matrix errors for recoverable operand-shape mismatches,
   non-finite states, and failed convergence. Fatal dimension or allocation
   failures panic with the requested matrix shape.

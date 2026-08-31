@@ -182,7 +182,9 @@ pub struct NewtonRaphsonSolver {
     ///
     /// Entry order matches `variables`. Jacobian column `j` is multiplied by
     /// this value, and accepted normalized corrections are converted back to
-    /// caller units with the same factor.
+    /// caller units with the same factor. In a wide or rank-deficient model,
+    /// these values also define the pseudoinverse's minimum-norm tie-break after
+    /// the linearized residual is minimized.
     variable_scales: Vec<f64>,
     /// Numerical policy validated for the selected path at each solve boundary.
     options: SolverOptions,
@@ -578,6 +580,13 @@ impl NewtonRaphsonSolver {
     /// Variable `x_j` is normalized as `x_j / scale_j`, so the linearized
     /// Jacobian column is multiplied by `scale_j` and a normalized correction is
     /// multiplied by the same value before updating caller-visible variables.
+    /// Among corrections that minimize the equation-scaled linearized residual,
+    /// the pseudoinverse selects one minimizing the normalized Euclidean norm,
+    /// equivalently `sqrt(sum((delta_x_j / scale_j)^2))` in caller coordinates.
+    /// Variable scales can therefore select a different correction among the
+    /// valid directions of a wide or rank-deficient model; they are not merely
+    /// an internal conditioning hint.
+    ///
     /// Names omitted from the map retain their current scale, initially one.
     /// Unknown names and fixed parameters are rejected rather than ignored.
     pub fn with_variable_scales(
@@ -850,9 +859,10 @@ impl NewtonRaphsonSolver {
 
             // Step 2: Solve J * delta = -f(x) through one shape-independent
             // least-squares path. A wide Jacobian naturally yields the
-            // Moore-Penrose minimum-norm correction, which preserves the
-            // current null-space component without introducing a second point
-            // objective into nonlinear root finding.
+            // Moore-Penrose minimum-norm correction in normalized coordinates.
+            // Unit variable scales preserve the caller-coordinate null-space
+            // component; configured scales deliberately weight which correction
+            // is smallest when the model admits multiple choices.
             let linear_info = scaled_jacobian
                 .solve_least_squares_into(f_neg, delta, least_squares)
                 .map_err(|source| {
@@ -3103,6 +3113,35 @@ mod tests {
         assert!((linear.cond_est - 1.0).abs() < 1e-12);
         assert_eq!(solver.variable_scale("x"), Some(1.0));
         assert_eq!(solver.variable_scale("y"), Some(1e13));
+    }
+
+    /// Make the variable-scale weighting of underdetermined minimum-norm
+    /// corrections an explicit solver contract.
+    #[test]
+    fn test_variable_scales_define_minimum_norm_correction_metric() {
+        // From the origin, x+y=1 has infinitely many exact full-step
+        // corrections. Unit scales minimize x^2+y^2 and select [0.5, 0.5].
+        // Giving x scale two minimizes (x/2)^2+y^2 instead and selects [0.8,
+        // 0.2], with both results returned in the caller's original units.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+        let unit_solution = build_solver(vec![equation.clone()])
+            .solve_once(initial.clone())
+            .expect("unit scales should reach the affine root");
+        let weighted_solution = build_solver(vec![equation])
+            .with_variable_scales(HashMap::from([("x".to_string(), 2.0)]))
+            .expect("x has a positive finite characteristic scale")
+            .solve_once(initial)
+            .expect("weighted normalized coordinates should reach the same root set");
+
+        assert!((unit_solution.values["x"] - 0.5).abs() < 1e-12);
+        assert!((unit_solution.values["y"] - 0.5).abs() < 1e-12);
+        assert!((weighted_solution.values["x"] - 0.8).abs() < 1e-12);
+        assert!((weighted_solution.values["y"] - 0.2).abs() < 1e-12);
+        assert!(weighted_solution.error < 1e-12);
     }
 
     /// Preserve finite caller-unit corrections across extreme scaling and
