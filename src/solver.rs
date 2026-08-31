@@ -239,6 +239,11 @@ pub struct SolverWorkspace {
     equation_count: usize,
     /// Solved-variable count this workspace accepts.
     variable_count: usize,
+    /// Total compiled-variable count, including fixed parameter values.
+    ///
+    /// Unlike `variable_count`, this dimension determines the required capacity
+    /// of both name-translated value maps used during candidate evaluation.
+    compiled_variable_count: usize,
     /// Accepted internal variable values keyed by compact compiled IDs.
     vars: HashMap<VarId, f64>,
     /// Transaction buffer for line-search candidate variable values.
@@ -417,12 +422,13 @@ impl SolverWorkspace {
     /// Allocate every mutable numerical buffer required by one configured solver.
     ///
     /// This constructor stays behind [`NewtonRaphsonSolver::workspace`] so the
-    /// workspace always reflects the solver's equation and selected-variable
-    /// counts.
+    /// workspace always reflects the solver's equation, selected-variable, and
+    /// complete compiled-variable counts.
     #[track_caller]
     fn new(solver: &NewtonRaphsonSolver) -> Self {
         let equation_count = solver.jacobian.equation_count();
         let variable_count = solver.variables.len();
+        let compiled_variable_count = solver.var_table.len();
 
         // All matrices are constructed at their final direct-Jacobian shape, so
         // the sole correction path neither resizes nor replaces storage while a
@@ -430,8 +436,9 @@ impl SolverWorkspace {
         Self {
             equation_count,
             variable_count,
-            vars: HashMap::with_capacity(solver.var_table.len()),
-            candidate_vars: HashMap::with_capacity(solver.var_table.len()),
+            compiled_variable_count,
+            vars: HashMap::with_capacity(compiled_variable_count),
+            candidate_vars: HashMap::with_capacity(compiled_variable_count),
             jacobian: solver.jacobian.workspace(),
             residuals: Matrix::new(equation_count, 1),
             scaled_residuals: Matrix::new(equation_count, 1),
@@ -444,15 +451,20 @@ impl SolverWorkspace {
         }
     }
 
-    /// Return whether this workspace matches a solver's immutable numerical shape.
+    /// Return whether this workspace matches every allocation-bearing solver
+    /// dimension.
     fn is_compatible_with(&self, solver: &NewtonRaphsonSolver) -> bool {
         let equation_count = solver.jacobian.equation_count();
         let variable_count = solver.variables.len();
+        let compiled_variable_count = solver.var_table.len();
 
-        // Every numerical buffer derives from these two dimensions. Additional
-        // compatibility identity is added explicitly when a field depends on
-        // more than equation and selected-variable shape.
-        self.equation_count == equation_count && self.variable_count == variable_count
+        // Matrix buffers derive from equation and selected-variable counts.
+        // Value maps additionally hold fixed parameters, so accepting a
+        // workspace with a different complete count could force growth during
+        // initial-guess translation or candidate cloning.
+        self.equation_count == equation_count
+            && self.variable_count == variable_count
+            && self.compiled_variable_count == compiled_variable_count
     }
 }
 
@@ -712,7 +724,8 @@ impl NewtonRaphsonSolver {
         self.validate_configuration()?;
         if !workspace.is_compatible_with(self) {
             return Err(SolverError::InvalidInput(
-                "solver workspace does not match equation or selected-variable shape".to_string(),
+                "solver workspace does not match equation, selected-variable, or compiled-variable shape"
+                    .to_string(),
             ));
         }
         self.map_initial_guess_into(initial_guess, &mut workspace.vars)?;
@@ -1877,6 +1890,61 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// Treat fixed parameters as part of reusable workspace layout even though
+    /// they do not create Jacobian columns.
+    #[test]
+    fn test_solver_rejects_workspace_with_incompatible_compiled_variable_count() {
+        // This source workspace has one equation, one selected variable, and no
+        // fixed parameters. Its numerical matrix shape therefore matches the
+        // target solver below while its value-map layout does not.
+        let x = Exp::var("x");
+        let source_solver = build_solver(vec![Exp::sub(x, Exp::val(1.0))]);
+        let mut source_workspace = source_solver.workspace();
+        let original_capacities = (
+            source_workspace.vars.capacity(),
+            source_workspace.candidate_vars.capacity(),
+        );
+
+        // Geometry and circuit systems commonly solve one coordinate while
+        // retaining several dimensions or component values as fixed inputs.
+        // All five compiled values must fit both maps despite only x appearing
+        // as a correction coordinate.
+        let x = Exp::var("x");
+        let fixed_sum = Exp::add(
+            Exp::add(Exp::var("a"), Exp::var("b")),
+            Exp::add(Exp::var("c"), Exp::var("d")),
+        );
+        let target_solver = solver_for_with_vars(vec![Exp::sub(x, fixed_sum)], &["x"]);
+        let initial = HashMap::from([
+            ("x".to_string(), 0.0),
+            ("a".to_string(), 0.0),
+            ("b".to_string(), 0.0),
+            ("c".to_string(), 0.0),
+            ("d".to_string(), 0.0),
+        ]);
+
+        let error = target_solver
+            .solve(initial, &mut source_workspace)
+            .expect_err("fixed parameters require a matching value-map layout");
+        assert!(matches!(
+            error,
+            SolverError::InvalidInput(message)
+                if message.contains("compiled-variable shape")
+        ));
+
+        // Compatibility is checked before initial-guess translation, so a
+        // rejected cross-layout solve cannot mutate or grow either map.
+        assert!(source_workspace.vars.is_empty());
+        assert!(source_workspace.candidate_vars.is_empty());
+        assert_eq!(
+            original_capacities,
+            (
+                source_workspace.vars.capacity(),
+                source_workspace.candidate_vars.capacity(),
+            )
+        );
     }
 
     /// Exercise simultaneous immutable borrows of one reusable solver so its
