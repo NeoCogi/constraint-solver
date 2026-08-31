@@ -325,14 +325,20 @@ the harness on the target machine when making performance decisions.
   matrix shape and rank. This avoids normal equations and makes numerical rank
   independent of variable ordering. Rank uses the scale-relative threshold
   `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
-  level cutoff.
+  level cutoff. Binary-exponent accumulation is confined to reconstruction of
+  singular components, where large contributions can cancel to a finite
+  solution; it is not a general-purpose extended-precision number system.
 - Matrix arithmetic uses `add_into`, `sub_into`, `mul_into`, and `scale_into`
   with exact-shape caller-owned output buffers. Construct buffers once and
   reuse them; these operations never resize or allocate. Arithmetic rejects NaN
   and infinity before writing, and reports a non-finite completed result such as
-  overflow. `transpose_into` is a bitwise copy and therefore preserves special
-  values. Constructors remain the explicit allocation boundary and panic when
-  a requested shape or allocation is impossible.
+  overflow. Multiplication uses compensated ordinary `f64` dot products: it
+  improves finite summation error but deliberately does not rescue an
+  overflowing product or partial sum through hidden exponent-range extension.
+  Rescale the model or retry through solver policy after such an error.
+  `transpose_into` is a bitwise copy and therefore preserves special values.
+  Constructors remain the explicit allocation boundary and panic when a
+  requested shape or allocation is impossible.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
   to zero: zero solves the original Jacobian once, while a positive value solves
@@ -349,7 +355,13 @@ the harness on the target machine when making performance decisions.
   intentionally not mixed into the current backtracking policy as another mode.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
-  guess map; missing variables are treated as errors.
+  guess map; missing variables are treated as errors. Compiled expression trees
+  use direct `f64` operations in their written order; solver scaling does not
+  reassociate arbitrary user expressions. Thus `(f64::MAX * x) / f64::MAX` can
+  overflow at the multiplication even when its algebraic final value would be
+  representable. Rewrite such expressions to keep every intermediate in range,
+  for example as `x * (coefficient / scale)`, and choose physical equation and
+  variable scales that keep the resulting residuals and derivatives finite.
 - The solver differentiates and simplifies its symbolic Jacobian once during
   construction. Call `solver.workspace()` after configuration to allocate
   residual, Jacobian, candidate, correction, optional ridge, and Jacobi-SVD

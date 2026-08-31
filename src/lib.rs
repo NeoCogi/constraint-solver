@@ -39,6 +39,12 @@ SOFTWARE.
 //! expression's differentiable domain or rewrite the expression into a form
 //! whose derivative is finite at the intended starting point.
 //!
+//! Compiled expressions otherwise use direct `f64` arithmetic in syntax-tree
+//! order. Solver scaling protects its explicit residual, Jacobian, update, and
+//! SVD transformations; it does not reassociate arbitrary user expressions.
+//! Keep every written intermediate representable—for example, rewrite
+//! `(f64::MAX * x) / f64::MAX` as `x` or another physically scaled equivalent.
+//!
 //! # Quick start
 //!
 //! ```

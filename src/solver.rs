@@ -28,7 +28,7 @@ SOFTWARE.
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::{Jacobian, JacobianWorkspace};
 use crate::matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError};
-use crate::scaled::{ScaledSum, product_ratio};
+use crate::scaled::{CompensatedSum, product_ratio};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -250,6 +250,11 @@ pub struct Solution {
     pub error: f64,
     /// Norm of the normalized gradient `J_scaled^T f_scaled` at the returned
     /// values, measuring first-order least-squares stationarity.
+    ///
+    /// This diagnostic may be positive infinity when every underlying value and
+    /// relative stationarity decision is finite but the absolute physical
+    /// gradient magnitude exceeds `f64::MAX`. Such representational overflow is
+    /// not a non-finite solver state and does not invalidate a converged root.
     pub gradient_norm: f64,
     /// Largest absolute cosine between the residual and a Jacobian column.
     ///
@@ -353,7 +358,8 @@ pub struct SolverRunDiagnostic {
     /// Euclidean norm of all `EquationDiagnostic::scaled_residual` entries.
     pub error: f64,
     /// Norm of `J_scaled^T f_scaled` when the terminating path evaluated
-    /// stationarity.
+    /// stationarity. The contained value may be positive infinity when only the
+    /// reconstructed absolute diagnostic exceeds `f64` range.
     ///
     /// Other failures report `None` because computing a fresh Jacobian merely
     /// for diagnostics could itself fail or obscure the original error.
@@ -379,8 +385,13 @@ pub enum SolverError {
     /// The configured update budget or line search ended without convergence.
     /// The diagnostic is boxed to keep the error enum compact.
     NoConvergence(Box<SolverRunDiagnostic>),
-    /// Expression, Jacobian, update, or residual-gradient evaluation produced
-    /// NaN or infinity.
+    /// The accepted solver state, its expression or Jacobian evaluation, a
+    /// correction, or a required descent quantity became NaN or infinity.
+    ///
+    /// Non-finite line-search candidates are rejected transactionally and may
+    /// instead end as [`SolverError::NoConvergence`] after all backtracks. An
+    /// infinite absolute gradient *diagnostic* is also permitted when its
+    /// finite relative stationarity measure remains meaningful.
     /// The diagnostic is boxed to keep the error enum compact.
     NonFiniteEvaluation(Box<SolverRunDiagnostic>),
     /// The residual remains above its root tolerance while the first-order
@@ -1504,14 +1515,15 @@ impl NewtonRaphsonSolver {
             }
 
             let mut scaled_column_norm = 0.0_f64;
-            let mut dot = ScaledSum::default();
+            let mut dot = CompensatedSum::default();
             for row in 0..jacobian.rows() {
                 let scaled_jacobian = jacobian[(row, column)] / column_scale;
                 let scaled_residual = residuals[(row, 0)] / residual_scale;
                 scaled_column_norm = scaled_column_norm.hypot(scaled_jacobian);
-                // Route the normalized dot product through the same scaled
-                // compensated reduction as matrix and SVD reconstruction.
-                dot.add_product_ratio([scaled_jacobian, scaled_residual], []);
+                // Both normalized factors are bounded by one. Ordinary
+                // compensation is sufficient here; exponent extension is
+                // reserved for SVD reconstruction where it is indispensable.
+                dot.add(scaled_jacobian * scaled_residual);
             }
 
             let scaled_dot = dot.total();
@@ -1601,11 +1613,11 @@ impl NewtonRaphsonSolver {
         // Fuse J*p with the outer normalized-residual dot product. This keeps
         // the directional derivative allocation-free and avoids materializing a
         // residual-space vector that no later solver stage consumes.
-        let mut slope = ScaledSum::default();
+        let mut slope = CompensatedSum::default();
         for row in 0..scaled_residuals.rows() {
-            let mut velocity = ScaledSum::default();
+            let mut velocity = CompensatedSum::default();
             for column in 0..jacobian.cols() {
-                velocity.add_product_ratio([jacobian[(row, column)], direction[(column, 0)]], []);
+                velocity.add(jacobian[(row, column)] * direction[(column, 0)]);
             }
             let velocity = velocity.total();
             if !velocity.is_finite() {
@@ -1617,7 +1629,7 @@ impl NewtonRaphsonSolver {
                 ));
             }
             let normalized_residual = scaled_residuals[(row, 0)] / residual_norm;
-            slope.add_product_ratio([normalized_residual, velocity], []);
+            slope.add(normalized_residual * velocity);
         }
 
         let residual_norm_derivative = slope.total();
@@ -2826,7 +2838,11 @@ mod tests {
             match error {
                 SolverError::NoConvergence(diagnostic) => {
                     assert_eq!(diagnostic.iterations, 0);
-                    assert!(diagnostic.message.contains("after 2 rejected candidate steps"));
+                    assert!(
+                        diagnostic
+                            .message
+                            .contains("after 2 rejected candidate steps")
+                    );
                     assert!(diagnostic.message.contains("last tested step was 5.00e-1"));
                     assert!(diagnostic.message.contains("non-finite updates 0"));
                     assert!(diagnostic.message.contains("non-finite residuals 2"));
@@ -3285,7 +3301,6 @@ mod tests {
             assert_eq!(solution.error, 1.0);
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.last_linear_attempt, None);
-
         }
     }
 

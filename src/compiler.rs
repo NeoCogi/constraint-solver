@@ -155,27 +155,54 @@ impl fmt::Display for EvaluationError {
 
 impl std::error::Error for EvaluationError {}
 
+/// Variable-indexed expression evaluated exactly in its written tree order.
+///
+/// This representation improves lookup cost; it does not algebraically
+/// reassociate operations or extend their `f64` exponent range. Keeping that
+/// distinction explicit prevents solver-level scaling guarantees from being
+/// mistaken for arbitrary expression-range guarantees.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CompiledExp {
+    /// Literal floating-point value.
     Val(f64),
+    /// Variable name retained for diagnostics and its compact lookup ID.
     Var(String, VarId),
+    /// Left-to-right binary addition node.
     Add(Box<CompiledExp>, Box<CompiledExp>),
+    /// Left-to-right binary subtraction node.
     Sub(Box<CompiledExp>, Box<CompiledExp>),
+    /// Direct floating-point multiplication node.
     Mul(Box<CompiledExp>, Box<CompiledExp>),
+    /// Direct floating-point division node.
     Div(Box<CompiledExp>, Box<CompiledExp>),
+    /// Floating-point power with a literal exponent.
     Power(Box<CompiledExp>, f64),
+    /// Arithmetic negation node.
     Neg(Box<CompiledExp>),
+    /// Sine function node.
     Sin(Box<CompiledExp>),
+    /// Cosine function node.
     Cos(Box<CompiledExp>),
+    /// Natural-logarithm function node.
     Ln(Box<CompiledExp>),
+    /// Natural-exponential function node.
     Exp(Box<CompiledExp>),
 }
 
 impl CompiledExp {
+    /// Evaluate this tree with direct IEEE-754 operations in tree order.
+    ///
+    /// Only a missing internal variable is represented by the returned error.
+    /// Arithmetic NaN and infinity remain values here so the owning solver can
+    /// reject them with its complete accepted-state diagnostic. No allocation,
+    /// symbolic reassociation, or hidden extended-range arithmetic occurs.
     pub(crate) fn evaluate_checked(
         &self,
         vars: &HashMap<VarId, f64>,
     ) -> Result<f64, EvaluationError> {
+        // Recursion follows the compiled syntax tree exactly. For example,
+        // `(MAX * x) / MAX` forms the multiplication before the division and
+        // can therefore overflow even when the algebraic result is finite.
         match self {
             CompiledExp::Val(v) => Ok(*v),
             CompiledExp::Var(name, id) => vars

@@ -34,7 +34,7 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
-use crate::scaled::{ScaledSum, ScaledValue};
+use crate::scaled::{CompensatedSum, ScaledSum};
 
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked arithmetic or linear-solve operation began.
@@ -264,8 +264,8 @@ pub struct LeastSquaresWorkspace {
     right_vectors: Matrix,
     /// Euclidean norms of the rotated columns.
     singular_values: Vec<f64>,
-    /// Scale-preserving right-hand-side projections for reconstruction.
-    projections: Vec<ScaledValue>,
+    /// Right-hand-side projections formed after maximum-magnitude normalization.
+    projections: Vec<f64>,
 }
 
 impl LeastSquaresWorkspace {
@@ -292,7 +292,7 @@ impl LeastSquaresWorkspace {
             orthogonal_columns: Matrix::new(factor_rows, component_count),
             right_vectors: Matrix::new(component_count, component_count),
             singular_values: vec![0.0; component_count],
-            projections: vec![ScaledValue::ZERO; component_count],
+            projections: vec![0.0; component_count],
         }
     }
 }
@@ -448,9 +448,9 @@ impl Matrix {
 
     /// Reject a non-finite matrix operand before an arithmetic output is touched.
     ///
-    /// The scaled product accumulator and solver factorization both assume
-    /// finite state. Enforcing that assumption at this public boundary removes
-    /// build-profile-dependent assertions and gives callers a retryable error.
+    /// Every checked arithmetic and factorization path assumes finite accepted
+    /// state. Enforcing that invariant at the public boundary removes build-
+    /// profile-dependent assertions and gives callers a retryable error.
     fn require_finite_input(
         input: &Matrix,
         operation: &'static str,
@@ -625,6 +625,18 @@ impl Matrix {
             coefficient_scale
         };
 
+        // Normalize the right-hand side independently before projection. The
+        // singular vectors have unit-scale entries, so every projection term
+        // then stays in ordinary `f64` range. Its physical magnitude is restored
+        // exactly once during solution reconstruction. An all-zero right-hand
+        // side uses a neutral scale and therefore reconstructs exact zero.
+        let rhs_scale = b
+            .data
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let rhs_scale = if rhs_scale == 0.0 { 1.0 } else { rhs_scale };
+
         // Decomposing A^T for a wide system keeps the Jacobi kernel compact and
         // avoids manufacturing zero singular columns merely to make A tall.
         // Populate the workspace orientation directly so normalization,
@@ -678,11 +690,10 @@ impl Matrix {
         } else {
             max_singular_value / min_retained_singular_value
         };
-        // Project the right-hand side onto every retained singular direction
-        // without converting those intermediate coordinates back to `f64`.
-        // A projection may exceed the scalar exponent range even when division
-        // by its singular value and reconstruction produce finite variables.
-        workspace.projections.fill(ScaledValue::ZERO);
+        // Project the normalized right-hand side onto every retained singular
+        // direction. These bounded dot products use ordinary compensated
+        // `f64`; only reconstruction is permitted an extended exponent range.
+        workspace.projections.fill(0.0);
         for (component, projection) in workspace.projections.iter_mut().enumerate() {
             let singular_value = workspace.singular_values[component];
             if singular_value <= rank_tolerance {
@@ -695,12 +706,18 @@ impl Matrix {
                 // A*V=B=U*Sigma, so this coefficient is
                 // (U_component^T*b)/sigma. Normalizing B before the dot product
                 // prevents squaring a large or tiny singular value explicitly.
-                Self::scaled_column_dot(&workspace.orthogonal_columns, component, singular_value, b)
+                Self::normalized_column_dot(
+                    &workspace.orthogonal_columns,
+                    component,
+                    singular_value,
+                    b,
+                    rhs_scale,
+                )
             } else {
                 // A^T*V=B=U*Sigma implies A=V*Sigma*U^T. Project the right-hand
                 // side onto V, then map the scaled coefficient into U to obtain
                 // the minimum-norm variable vector.
-                Self::scaled_column_dot(&workspace.right_vectors, component, 1.0, b)
+                Self::normalized_column_dot(&workspace.right_vectors, component, 1.0, b, rhs_scale)
             };
         }
 
@@ -720,9 +737,12 @@ impl Matrix {
                     // V maps the projected coordinate back to the original
                     // variable space. The normalized singular value and the
                     // global coefficient scale together restore A's units.
-                    reconstructed.add_scaled_product_ratio(
-                        projection,
-                        [workspace.right_vectors[(row, component)]],
+                    reconstructed.add_product_ratio(
+                        [
+                            projection,
+                            workspace.right_vectors[(row, component)],
+                            rhs_scale,
+                        ],
                         [singular_value, coefficient_scale],
                     );
                 } else {
@@ -730,9 +750,12 @@ impl Matrix {
                     // column equals U*sigma. Dividing by sigma once recovers U,
                     // and dividing the projection by the original sigma adds a
                     // second normalized singular-value denominator.
-                    reconstructed.add_scaled_product_ratio(
-                        projection,
-                        [workspace.orthogonal_columns[(row, component)]],
+                    reconstructed.add_product_ratio(
+                        [
+                            projection,
+                            workspace.orthogonal_columns[(row, component)],
+                            rhs_scale,
+                        ],
                         [singular_value, singular_value, coefficient_scale],
                     );
                 }
@@ -825,15 +848,15 @@ impl Matrix {
                     // Form the two-by-two Gram matrix in scaled coordinates.
                     // Each summand is bounded, keeping the angle computation
                     // finite whenever the number of rows is representable.
-                    let mut left_norm_squared = ScaledSum::default();
-                    let mut right_norm_squared = ScaledSum::default();
-                    let mut cross_product = ScaledSum::default();
+                    let mut left_norm_squared = CompensatedSum::default();
+                    let mut right_norm_squared = CompensatedSum::default();
+                    let mut cross_product = CompensatedSum::default();
                     for row in 0..row_count {
                         let left = orthogonal_columns[(row, left_column)] / pair_scale;
                         let right = orthogonal_columns[(row, right_column)] / pair_scale;
-                        left_norm_squared.add_product_ratio([left, left], []);
-                        right_norm_squared.add_product_ratio([right, right], []);
-                        cross_product.add_product_ratio([left, right], []);
+                        left_norm_squared.add(left * left);
+                        right_norm_squared.add(right * right);
+                        cross_product.add(left * right);
                     }
                     let left_norm_squared = left_norm_squared.total();
                     let right_norm_squared = right_norm_squared.total();
@@ -942,31 +965,36 @@ impl Matrix {
         Ok(())
     }
 
-    /// Compute a scaled compensated dot product between one matrix column and a
-    /// single-column right-hand side.
+    /// Compute a compensated dot product between two explicitly normalized
+    /// columns.
     ///
     /// `column_scale` is normally the column's singular value, producing a unit
     /// left singular vector without allocating it. Passing one computes an
     /// ordinary column dot product for an already normalized orthogonal matrix.
-    fn scaled_column_dot(
+    /// `right_scale` similarly bounds every right-hand-side entry. Consequently
+    /// no term needs an exponent-extended representation.
+    fn normalized_column_dot(
         left: &Matrix,
         left_column: usize,
         column_scale: f64,
         right: &Matrix,
-    ) -> ScaledValue {
+        right_scale: f64,
+    ) -> f64 {
         debug_assert_eq!(left.rows, right.rows);
         debug_assert_eq!(right.cols, 1);
         debug_assert!(column_scale > 0.0 && column_scale.is_finite());
+        debug_assert!(right_scale > 0.0 && right_scale.is_finite());
 
-        // Carry each product's exponent into the shared accumulator instead of
-        // choosing a right-hand-side normalization specific to this one dot
-        // product. This is the same reduction policy used during reconstruction
-        // and matrix multiplication.
-        let mut dot = ScaledSum::default();
+        // Both factors have magnitude at most one apart from harmless singular-
+        // vector roundoff. Neumaier compensation improves the finite reduction
+        // without pretending that arbitrary dot products have a wider range.
+        let mut dot = CompensatedSum::default();
         for row in 0..left.rows {
-            dot.add_product_ratio([left[(row, left_column)], right[(row, 0)]], [column_scale]);
+            let left_value = left[(row, left_column)] / column_scale;
+            let right_value = right[(row, 0)] / right_scale;
+            dot.add(left_value * right_value);
         }
-        dot.scaled_total()
+        dot.total()
     }
 
     /// Return the Frobenius norm without introducing avoidable intermediate
@@ -1130,12 +1158,13 @@ impl Matrix {
         }
         for i in 0..self.rows {
             for j in 0..rhs.cols {
-                // Delay every product and partial-sum range check until the
-                // completed output cell is materialized. This prevents source
-                // order from rejecting finite results after cancellation.
-                let mut dot = ScaledSum::default();
+                // Ordinary matrix multiplication deliberately observes `f64`
+                // range. Compensation improves rounding of finite terms but
+                // does not rescue a product or partial sum that overflowed;
+                // callers receive `NonFiniteResult` and can rescale or retry.
+                let mut dot = CompensatedSum::default();
                 for k in 0..self.cols {
-                    dot.add_product_ratio([self[(i, k)], rhs[(k, j)]], []);
+                    dot.add(self[(i, k)] * rhs[(k, j)]);
                 }
                 let value = dot.total();
                 if !value.is_finite() {
@@ -1642,8 +1671,8 @@ mod tests {
     }
 
     /// Establish one profile-independent finite boundary for matrix arithmetic.
-    /// These are the special values that previously reached `ScaledSum` and
-    /// changed multiplication behavior between debug and release builds.
+    /// These are the special values that previously reached the internal scaled
+    /// accumulator and changed behavior between debug and release builds.
     #[test]
     fn test_arithmetic_rejects_non_finite_operands_before_writing_output() {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -1737,6 +1766,19 @@ mod tests {
         assert_eq!(
             maximum.scale_into(f64::NAN, &mut output).unwrap_err(),
             MatrixError::NonFiniteScalar { operation: "scale" }
+        );
+
+        // General multiplication is intentionally ordinary `f64` arithmetic,
+        // not a hidden arbitrary-range number system. Although these two exact
+        // products cancel mathematically, each product first exceeds the scalar
+        // range, so the checked operation asks its caller to rescale or retry.
+        let cancelling_left = Matrix::from_vec(vec![f64::MAX, f64::MAX], 1, 2).unwrap();
+        let cancelling_right = Matrix::from_vec(vec![2.0, -2.0], 2, 1).unwrap();
+        assert_eq!(
+            cancelling_left
+                .mul_into(&cancelling_right, &mut output)
+                .unwrap_err(),
+            MatrixError::NonFiniteResult { operation: "mul" }
         );
     }
 
