@@ -79,7 +79,7 @@ impl Geometry {
     /// Construct an empty geometric constraint system.
     pub fn new() -> Self {
         // All entities and constraints are explicit; the builder adds no hidden
-        // origin, orientation, or regularization assumptions.
+        // origin, orientation, or scale assumptions.
         Self {
             equations: Vec::new(),
             equation_scales: Vec::new(),

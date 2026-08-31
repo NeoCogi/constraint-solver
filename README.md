@@ -8,8 +8,8 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 - A compiler that maps variable names to internal IDs (`Compiler`).
 - A dense matrix type with recoverable shape errors, explicit fatal allocation
   diagnostics, and canonical Jacobi-SVD least squares (`Matrix`).
-- A Newton-Raphson solver with transactional Armijo backtracking and explicit
-  regularization (`NewtonRaphsonSolver`).
+- A Newton-Raphson solver with direct SVD corrections and transactional Armijo
+  backtracking (`NewtonRaphsonSolver`).
 
 This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
 
@@ -37,8 +37,7 @@ validating the repository with the current stable toolchain.
 The solver supports all three system shapes:
 
 - Square systems (equations == variables): solved by the same SVD pseudoinverse
-  policy as rectangular Jacobians; ridge regularization occurs only when
-  explicitly set.
+  policy as rectangular Jacobians.
 - Under-constrained systems (equations < variables): solved via SVD least squares.
   The Moore-Penrose minimum-norm Newton correction preserves the current local
   Jacobian-null-space component for continuity.
@@ -71,11 +70,10 @@ exponent scaling, so a representable normalized derivative or caller-unit
 update is not lost merely because one intermediate multiplication order would
 overflow or underflow.
 
-The scaled residual controls convergence, stationarity, Armijo acceptance, and
-least-squares weighting. A larger equation scale therefore reduces that
-equation's weight. Variable scaling changes numerical coordinates without
-changing caller-visible values. Explicit ridge regularization penalizes the
-normalized `delta_scaled`, so its meaning is stable across variable units.
+The scaled residual controls convergence, retained-model stationarity, Armijo
+acceptance, and least-squares weighting. A larger equation scale therefore
+reduces that equation's weight. Variable scaling changes numerical coordinates
+without changing caller-visible values.
 
 ```rust
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
@@ -228,10 +226,10 @@ moved into a solver. Optional equation traces are positional and must include
 exactly one entry per equation; attaching them is fallible. On failure,
 `SolverRunDiagnostic::equations` pairs every raw and scaled signed residual with
 its equation index and optional trace. Successful solutions and run diagnostics also expose
-`last_linear_attempt`, which reports the effective SVD rank and condition
-estimate and whether the caller explicitly selected ridge regularization. It is
-an attempt diagnostic: a later Armijo failure can reject the resulting
-correction without erasing the successfully completed factorization. A
+`last_linear_attempt`, which directly reports the SVD rank, retained condition
+estimate, retained right-hand-side projection fraction, and residual-norm
+slope. It is an attempt diagnostic: a later Armijo failure can reject the
+resulting correction without erasing the successfully completed factorization. A
 `SolverError::Matrix` retains both its typed `MatrixError` source and the
 complete `SolverRunDiagnostic` at the accepted state where the attempt failed.
 
@@ -339,11 +337,6 @@ the harness on the target machine when making performance decisions.
   `transpose_into` is a bitwise copy and therefore preserves special values.
   Constructors remain the explicit allocation boundary and panic when a
   requested shape or allocation is impossible.
-- Regularization uses the augmented ridge system
-  `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
-  to zero: zero solves the original Jacobian once, while a positive value solves
-  one augmented system using exactly that ridge strength. Condition estimates
-  are diagnostic and never silently replace the requested linear problem.
 - Line search has one deterministic Armijo policy over `||f_scaled||`: test the
   full Newton correction, then halve it after each rejection. The sufficient-
   decrease coefficient is fixed at `1e-4`; `SolverOptions::max_backtracks`
@@ -364,8 +357,8 @@ the harness on the target machine when making performance decisions.
   variable scales that keep the resulting residuals and derivatives finite.
 - The solver differentiates and simplifies its symbolic Jacobian once during
   construction. Call `solver.workspace()` after configuration to allocate
-  residual, Jacobian, candidate, correction, optional ridge, and Jacobi-SVD
-  buffers once. Passing that workspace to successive `solve` calls reuses every
+  residual, Jacobian, candidate, correction, and Jacobi-SVD buffers once.
+  Passing that workspace to successive `solve` calls reuses every
   numerical allocation; use one workspace per concurrent solve. Only the final
   owned `Solution` or terminal diagnostic allocates its name-keyed public data.
 - Derivatives are evaluated from the exact symbolic tree; the solver does not

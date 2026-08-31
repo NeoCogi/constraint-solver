@@ -18,7 +18,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unrepresentable completed results without hiding errors behind operator
   panics.
 - Added caller-owned `LeastSquaresWorkspace` and `SolverWorkspace` storage.
-  Least-squares factorization, regularized corrections, residual evaluation,
+  Least-squares factorization, SVD corrections, residual evaluation,
   and line-search candidates now reuse fixed allocations across iterations and
   repeated solve calls; the public solve API requires that storage explicitly.
 - Removed `Solution::convergence_history`; retaining an unbounded per-iteration
@@ -29,7 +29,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only when another candidate is permitted, and reports the exact final tested
   alpha rather than a newly computed untested value. Levenberg–Marquardt and
   trust-region globalization remain explicitly future work.
-
 ## [0.3.0] - 2026-08-30
 
 ### Added
@@ -38,18 +37,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   including minimum-norm Moore-Penrose solutions.
 - Added singular-value rank and condition metadata to the canonical
   `LeastSquaresSolution` result.
-- Added `LinearSolveDiagnostic` to successful solutions and failed-run
-  diagnostics, preserving the effective factorization and explicit ridge
-  strength used for the most recent successful solve attempt, even when line
-  search later rejected its correction.
-- Added `SolverOptions` as the documented source of nonlinear iteration,
-  Armijo, and explicit regularization policy.
+- Added `last_linear_attempt` diagnostics to successful solutions and failed
+  runs, preserving the most recent `LeastSquaresInfo` even when line search
+  later rejected its correction.
+- Added `SolverOptions` as the documented source of nonlinear iteration and
+  Armijo policy.
 - Added structured equation diagnostics and optional caller-provided equation
   traces to make failed constraints identifiable without parsing messages.
 - Added explicit positive equation and variable characteristic scales. Equation
   scales define dimensionless residual weighting and success, while variable
-  scales normalize Jacobian columns, corrections, and ridge penalties without
-  changing caller-visible values.
+  scales normalize Jacobian columns and corrections without changing
+  caller-visible values.
 - Added structured matrix errors for recoverable operand-shape mismatches,
   non-finite states, and failed convergence. Fatal dimension or allocation
   failures panic with the requested matrix shape.
@@ -81,14 +79,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exclusive error variants and tests. Canonical Jacobi SVD is now the only
   maintained matrix factorization policy.
 - Unified nonlinear Jacobian correction policy across every shape and rank.
-  The SVD pseudoinverse supplies direct corrections, while ridge regularization
-  remains explicitly caller-selected.
+  The SVD pseudoinverse supplies every correction directly.
 - Replaced the public fixed rank cutoff with the factorization-derived relative
   threshold `f64::EPSILON * max(rows, columns)`. `solve_least_squares` no longer
   accepts `LeastSquaresOptions`; SVD rank classification has one automatic policy.
-- Replaced condition-triggered regularization and retry schedules with one
-  explicit policy: zero performs a direct SVD solve and a positive value
-  performs one augmented ridge solve at exactly the configured strength.
+- Removed condition-triggered regularization, retry schedules, and the explicit
+  ridge alternate path. Rank and condition estimates remain diagnostics and do
+  not change the equation being solved.
 - Replaced the ordinary/adaptive-damping and optional-line-search split with one
   transactional Armijo update path for every `solve` call. Removed
   `solve_with_line_search`, `with_damping`, and `min_damping`; the explicit
@@ -97,8 +94,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   constructors. Callers now select the explicit enum variant through the single
   `with_mode` builder after ordinary solver construction.
 - Applied one numerical default policy to square, tall, and wide systems instead
-  of silently changing iteration, step-size, and regularization defaults based
-  on Jacobian shape.
+  of silently changing iteration or step-size defaults based on Jacobian shape.
 - Changed Armijo line search to operate directly on the scaled residual norm
   with a scale-safe directional derivative in normalized coordinates.
 - Removed origin-based point projection from nonlinear iteration; every wide
@@ -148,8 +144,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   measured cosine is exactly equal to the configured threshold.
 - Applied equation and variable scaling consistently to residual success,
   stationarity, Armijo acceptance, rank and condition diagnostics, the
-  linearized correction, and explicit ridge regularization. Failure diagnostics
-  retain both raw and scaled per-equation residuals.
+  linearized correction, and failure diagnostics, which retain both raw and
+  scaled per-equation residuals.
 - Made rank classification and Moore-Penrose solutions invariant under column
   permutation by removing the unpivoted QR pre-classification path. Uniform
   coefficient normalization also prevents finite extreme-scale systems from
@@ -163,8 +159,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   least-squares solution.
 - Stopped preallocating convergence history from an untrusted iteration limit;
   history now grows only as accepted updates are observed.
-- Checked all derived matrix element counts and augmented-system row counts
-  before allocation, with explicit fatal diagnostics for impossible shapes.
+- Checked all derived matrix element counts before allocation, with explicit
+  fatal diagnostics for impossible shapes.
 - Returned immediately from transpose and multiplication when their checked
   result has zero storage, so valid shapes such as `usize::MAX x 0` do not loop
   over logical dimensions that contain no elements.
@@ -176,9 +172,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Reused accepted Armijo residuals as the next solver state, eliminating
   repeated evaluation and an unreachable duplicate success branch. Corrections
   that cannot change any variable now terminate without consuming updates.
-- Allocated augmented ridge matrices only when a positive regularization value
-  actually requests that alternate linear problem; initial roots and default
-  direct solves no longer allocate unused `(m+n) x n` storage.
 - Made line-search trial limits and initial step sizes authoritative and stopped
   rejected candidates from being counted as accepted solver updates.
 - Documented exact symbolic differentiation at domain boundaries and added a

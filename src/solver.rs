@@ -22,8 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Globalized Newton-Raphson iteration, regularized least squares, convergence
-//! results, and structured failure diagnostics.
+//! Globalized Newton-Raphson iteration, SVD least-squares corrections,
+//! convergence results, and structured failure diagnostics.
 
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::{Jacobian, JacobianWorkspace};
@@ -60,8 +60,9 @@ struct LineSearchContext<'a> {
     ///
     /// For non-zero residual vector `f`, Jacobian `J`, and candidate direction
     /// `p`, this value is `(f_scaled / ||f_scaled||_2)^T J_scaled p`.
-    /// Computing this normalized form directly avoids overflowing the equivalent
-    /// unnormalized dot product before division can reduce its scale.
+    /// The SVD returns this value from its retained right-hand-side projection,
+    /// avoiding a second `J*p` reconstruction and an unnormalized dot product
+    /// that could overflow before division reduces its scale.
     residual_norm_directional_derivative: f64,
     /// Number of Newton updates accepted before this line search began.
     ///
@@ -100,9 +101,9 @@ struct LineSearchRejections {
 /// Absolute and column-scaled measures of the nonlinear least-squares gradient
 /// at one accepted solver state.
 ///
-/// Keeping the two values together prevents convergence checks from using the
-/// scale-sensitive absolute gradient while result diagnostics accidentally
-/// report a differently evaluated quantity.
+/// Keeping the two values together ensures successful and failed results report
+/// the same gradient geometry without recomputing it through a different
+/// floating-point order.
 #[derive(Debug, Clone, Copy)]
 struct ResidualGradientMeasure {
     /// Euclidean norm of `J_scaled^T f_scaled` in normalized variable units.
@@ -115,13 +116,6 @@ struct ResidualGradientMeasure {
     /// is derived from the retained singular subspace that also produces the
     /// Newton correction.
     relative_norm: Option<f64>,
-}
-
-/// Internal correction vector paired with the public diagnostic that describes
-/// how its linearized system was solved.
-struct LinearSolveResult {
-    /// Factorization and regularization details for caller-facing results.
-    diagnostic: LinearSolveDiagnostic,
 }
 
 /// Complete numerical policy for one reusable nonlinear solver.
@@ -137,9 +131,6 @@ pub struct SolverOptions {
     /// Inclusive maximum norm of equation-scale-normalized residuals for a
     /// successful [`Solution`].
     pub residual_tolerance: f64,
-    /// Explicit ridge parameter on the normalized variable correction; zero
-    /// selects the unregularized SVD solve.
-    pub regularization: f64,
     /// Maximum number of halvings after the full Newton step is rejected.
     ///
     /// Zero tests only `alpha = 1`; `n` permits exactly `n + 1` candidates:
@@ -156,7 +147,6 @@ impl Default for SolverOptions {
         Self {
             max_iterations: 100,
             residual_tolerance: 1e-10,
-            regularization: 0.0,
             max_backtracks: 40,
         }
     }
@@ -169,8 +159,8 @@ impl Default for SolverOptions {
 /// - Under-constrained systems (equations < variables) - uses least squares
 /// - Over-constrained systems (equations > variables) - uses least squares
 ///
-/// Every correction is accepted transactionally by Armijo backtracking, and
-/// callers may explicitly select ridge regularization in normalized units.
+/// Every correction is the retained Moore-Penrose minimum-norm result from the
+/// normalized Jacobian and is accepted transactionally by Armijo backtracking.
 pub struct NewtonRaphsonSolver {
     /// Residual expressions and their simplified symbolic partial derivatives.
     ///
@@ -235,7 +225,7 @@ pub struct Solution {
     /// `None` means the initial point already satisfied the root tolerance and
     /// therefore required no linearized solve. A failed factorization returns a
     /// [`SolverError`] and cannot produce `Solution`.
-    pub last_linear_attempt: Option<LinearSolveDiagnostic>,
+    pub last_linear_attempt: Option<LeastSquaresInfo>,
 }
 
 /// Caller-owned numerical storage reusable across solves of one system shape.
@@ -249,8 +239,6 @@ pub struct SolverWorkspace {
     equation_count: usize,
     /// Solved-variable count this workspace accepts.
     variable_count: usize,
-    /// Linear-system row count, including ridge rows when configured.
-    linear_row_count: usize,
     /// Accepted internal variable values keyed by compact compiled IDs.
     vars: HashMap<VarId, f64>,
     /// Transaction buffer for line-search candidate variable values.
@@ -271,10 +259,6 @@ pub struct SolverWorkspace {
     candidate_residuals: Matrix,
     /// Equation-scaled residuals at the current line-search candidate.
     candidate_scaled_residuals: Matrix,
-    /// Augmented ridge coefficient matrix, present only for regularized policy.
-    augmented_jacobian: Option<Matrix>,
-    /// Augmented ridge right-hand side, present only for regularized policy.
-    augmented_rhs: Option<Matrix>,
     /// Reusable Jacobi-SVD factorization and projection storage.
     least_squares: LeastSquaresWorkspace,
 }
@@ -305,18 +289,6 @@ pub struct EquationDiagnostic {
     pub trace: Option<EquationTrace>,
 }
 
-/// Numerical provenance for one successful linearized solve attempt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LinearSolveDiagnostic {
-    /// Rank and condition estimate from the matrix actually factorized to
-    /// produce the normalized correction: either the equation- and variable-
-    /// scaled Jacobian or its augmented `[J; sqrt(lambda) I]` ridge system.
-    pub effective: LeastSquaresInfo,
-    /// Explicit ridge parameter `lambda` used in `[J; sqrt(lambda) I]`, or
-    /// `None` when the direct Jacobian was solved.
-    pub regularization: Option<f64>,
-}
-
 /// Complete numerical state captured when a solver run fails.
 #[derive(Debug, Clone)]
 pub struct SolverRunDiagnostic {
@@ -343,7 +315,7 @@ pub struct SolverRunDiagnostic {
     /// an invalid initial residual or Jacobian evaluation. A stationary non-root
     /// has `Some` because its zero retained projection is established by a
     /// completed factorization.
-    pub last_linear_attempt: Option<LinearSolveDiagnostic>,
+    pub last_linear_attempt: Option<LeastSquaresInfo>,
     /// Variable values at the end of the run, keyed by compiled variable name.
     pub values: HashMap<String, f64>,
     /// Per-equation residuals enriched with any attached source metadata.
@@ -365,8 +337,8 @@ pub enum SolverError {
     /// finite relative column-alignment measure remains meaningful.
     /// The diagnostic is boxed to keep the error enum compact.
     NonFiniteEvaluation(Box<SolverRunDiagnostic>),
-    /// The residual remains above its root tolerance while its effective
-    /// linear correction model retains no reducible right-hand-side component.
+    /// The residual remains above its root tolerance while the retained
+    /// Jacobian model has no reducible right-hand-side component.
     ///
     /// This applies uniformly to square, underdetermined, and overdetermined
     /// systems. It describes the rank-truncated local linear model and does not
@@ -445,32 +417,19 @@ impl SolverWorkspace {
     /// Allocate every mutable numerical buffer required by one configured solver.
     ///
     /// This constructor stays behind [`NewtonRaphsonSolver::workspace`] so the
-    /// workspace always reflects equation count, selected variables, and the
-    /// configured direct-versus-ridge linear problem.
+    /// workspace always reflects the solver's equation and selected-variable
+    /// counts.
     #[track_caller]
     fn new(solver: &NewtonRaphsonSolver) -> Self {
         let equation_count = solver.jacobian.equation_count();
         let variable_count = solver.variables.len();
-        let regularized = solver.options.regularization > 0.0;
-        let linear_row_count = if regularized {
-            equation_count
-                .checked_add(variable_count)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "regularized least-squares row count overflows usize: {equation_count} + {variable_count}"
-                    )
-                })
-        } else {
-            equation_count
-        };
 
-        // All matrices are constructed at their final shape. Option-wrapped
-        // augmented buffers avoid paying ridge storage when direct SVD is the
-        // configured policy, while still keeping the selected hot path fixed.
+        // All matrices are constructed at their final direct-Jacobian shape, so
+        // the sole correction path neither resizes nor replaces storage while a
+        // solve is running.
         Self {
             equation_count,
             variable_count,
-            linear_row_count,
             vars: HashMap::with_capacity(solver.var_table.len()),
             candidate_vars: HashMap::with_capacity(solver.var_table.len()),
             jacobian: solver.jacobian.workspace(),
@@ -481,9 +440,7 @@ impl SolverWorkspace {
             correction: Matrix::new(variable_count, 1),
             candidate_residuals: Matrix::new(equation_count, 1),
             candidate_scaled_residuals: Matrix::new(equation_count, 1),
-            augmented_jacobian: regularized.then(|| Matrix::new(linear_row_count, variable_count)),
-            augmented_rhs: regularized.then(|| Matrix::new(linear_row_count, 1)),
-            least_squares: LeastSquaresWorkspace::new(linear_row_count, variable_count),
+            least_squares: LeastSquaresWorkspace::new(equation_count, variable_count),
         }
     }
 
@@ -491,20 +448,11 @@ impl SolverWorkspace {
     fn is_compatible_with(&self, solver: &NewtonRaphsonSolver) -> bool {
         let equation_count = solver.jacobian.equation_count();
         let variable_count = solver.variables.len();
-        let linear_row_count = if solver.options.regularization > 0.0 {
-            equation_count.checked_add(variable_count)
-        } else {
-            Some(equation_count)
-        };
 
-        // Option presence is implied by the linear row count but checked
-        // explicitly so a future workspace field change cannot weaken the
-        // direct-versus-ridge invariant.
-        self.equation_count == equation_count
-            && self.variable_count == variable_count
-            && Some(self.linear_row_count) == linear_row_count
-            && self.augmented_jacobian.is_some() == (solver.options.regularization > 0.0)
-            && self.augmented_rhs.is_some() == (solver.options.regularization > 0.0)
+        // Every numerical buffer derives from these two dimensions. Additional
+        // compatibility identity is added explicitly when a field depends on
+        // more than equation and selected-variable shape.
+        self.equation_count == equation_count && self.variable_count == variable_count
     }
 }
 
@@ -512,8 +460,8 @@ impl NewtonRaphsonSolver {
     /// Create a Newton-Raphson solver with one shape-independent policy.
     ///
     /// Square, tall, and wide systems begin with identical iteration,
-    /// backtracking, tolerance, and regularization settings. Callers can replace
-    /// those explicit defaults through [`NewtonRaphsonSolver::with_options`].
+    /// backtracking, and tolerance settings. Callers can replace those explicit
+    /// defaults through [`NewtonRaphsonSolver::with_options`].
     ///
     /// # Arguments
     /// * `compiled` - Compiled system of equations (each should evaluate to 0 at solution)
@@ -564,7 +512,7 @@ impl NewtonRaphsonSolver {
             variable_scales,
             // One numerical policy applies to square, tall, and wide systems.
             // Shape-specific hidden defaults would make otherwise identical
-            // APIs change iteration budgets and regularization unexpectedly.
+            // APIs change iteration or globalization behavior unexpectedly.
             options: SolverOptions::default(),
             equation_traces: Vec::new(),
         }
@@ -739,20 +687,6 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the finite non-negative ridge parameter applied to corrections.
-    ///
-    /// Zero solves each linearized Jacobian directly. A positive value augments
-    /// every linearized correction with that exact ridge strength; condition
-    /// estimates remain diagnostic and never activate regularization implicitly.
-    /// Configuration is validated when a solve begins, and negative values are
-    /// not converted to zero.
-    pub fn with_regularization(mut self, regularization: f64) -> Self {
-        // Retain non-finite and negative values until validation so the caller
-        // receives an explicit configuration error.
-        self.options.regularization = regularization;
-        self
-    }
-
     /// Allocate reusable numerical storage for this configured solver.
     ///
     /// Construct one workspace after applying all solver builders and reuse it
@@ -778,8 +712,7 @@ impl NewtonRaphsonSolver {
         self.validate_configuration()?;
         if !workspace.is_compatible_with(self) {
             return Err(SolverError::InvalidInput(
-                "solver workspace does not match equation, variable, or regularization shape"
-                    .to_string(),
+                "solver workspace does not match equation or selected-variable shape".to_string(),
             ));
         }
         self.map_initial_guess_into(initial_guess, &mut workspace.vars)?;
@@ -808,7 +741,7 @@ impl NewtonRaphsonSolver {
     /// # Algorithm
     /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
     /// 2. Check residual-based root termination
-    /// 3. Solve the configured normalized linear correction model by SVD
+    /// 3. Solve normalized `J * delta = -f(x)` by SVD
     /// 4. Use that factorization's retained residual projection to classify
     ///    model stationarity and derive the Armijo slope
     /// 5. Backtrack transactionally until sufficient decrease holds
@@ -820,7 +753,7 @@ impl NewtonRaphsonSolver {
         // Retain the most recent successful linear solve attempt independently
         // from line-search acceptance. This is attempt provenance, while `iter`
         // continues to count only accepted state changes.
-        let mut last_linear_attempt: Option<LinearSolveDiagnostic> = None;
+        let mut last_linear_attempt: Option<LeastSquaresInfo> = None;
 
         let num_equations = workspace.equation_count;
         let SolverWorkspace {
@@ -834,8 +767,6 @@ impl NewtonRaphsonSolver {
             correction: delta,
             candidate_residuals: candidate_f_vals,
             candidate_scaled_residuals: candidate_scaled_f_vals,
-            augmented_jacobian,
-            augmented_rhs,
             least_squares,
             ..
         } = workspace;
@@ -906,45 +837,24 @@ impl NewtonRaphsonSolver {
             // Moore-Penrose minimum-norm correction, which preserves the
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
-            let linear_solve = self
-                .solve_least_squares_system(
-                    scaled_jacobian,
-                    f_neg,
-                    delta,
-                    augmented_jacobian,
-                    augmented_rhs,
-                    least_squares,
-                )
+            let linear_info = scaled_jacobian
+                .solve_least_squares_into(f_neg, delta, least_squares)
                 .map_err(|source| {
-                    self.matrix_error(
-                        source,
-                        iter,
-                        vars,
-                        f_vals,
-                        gradient,
-                        last_linear_attempt.clone(),
-                    )
+                    self.matrix_error(source, iter, vars, f_vals, gradient, last_linear_attempt)
                 })?;
-            last_linear_attempt = Some(linear_solve.diagnostic.clone());
+            last_linear_attempt = Some(linear_info);
 
             // The dimensionless retained fraction is zero exactly when this SVD
-            // model has no representable component of its correction right hand
-            // side in the retained factor space. It remains the stationarity
-            // decision even when the corresponding physical slope is too small
-            // for `f64`. When ridge is configured, the effective factor space is
-            // the augmented linear system rather than the Jacobian alone.
-            if linear_solve
-                .diagnostic
-                .effective
-                .retained_rhs_projection_fraction
-                == 0.0
-            {
+            // model has no representable component of `-f` in the retained
+            // Jacobian column space. It remains the stationarity decision even
+            // when the corresponding physical slope is too small for `f64`.
+            if linear_info.retained_rhs_projection_fraction == 0.0 {
                 return Err(self.stationary_non_root_error(
                     iter,
                     vars,
                     f_vals,
                     gradient,
-                    linear_solve.diagnostic,
+                    linear_info,
                 ));
             }
 
@@ -984,8 +894,7 @@ impl NewtonRaphsonSolver {
             // products that can overflow before cancellation and avoids
             // squaring a tiny ratio before the residual's physical scale can
             // restore a representable slope.
-            let residual_norm_directional_derivative =
-                linear_solve.diagnostic.effective.residual_norm_slope;
+            let residual_norm_directional_derivative = linear_info.residual_norm_slope;
 
             // Armijo is the only update policy. It leaves the accepted state
             // untouched while populating candidate buffers, so failure cannot
@@ -1003,7 +912,7 @@ impl NewtonRaphsonSolver {
                 candidate_residuals: candidate_f_vals,
                 candidate_scaled_residuals: candidate_scaled_f_vals,
             })
-            .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
+            .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt))?;
 
             // The candidate residual has already passed finite and Armijo
             // checks. Swap both buffers together so variables and residuals
@@ -1045,81 +954,6 @@ impl NewtonRaphsonSolver {
             // loop entry, using the residual and Jacobian for exactly this
             // accepted state.
         }
-    }
-
-    /// Solve one linearized correction using the caller's explicit ridge policy.
-    ///
-    /// A zero ridge parameter solves the Jacobian directly. A positive value
-    /// solves the single augmented system `[J; sqrt(lambda) I] delta ~= [rhs; 0]`
-    /// without first computing and discarding an unregularized correction.
-    /// Both routes use the same canonical SVD implementation and preserve its
-    /// exact structured error on failure.
-    fn solve_least_squares_system(
-        &self,
-        j_matrix: &Matrix,
-        rhs: &Matrix,
-        solution: &mut Matrix,
-        augmented_jacobian: &mut Option<Matrix>,
-        augmented_rhs: &mut Option<Matrix>,
-        workspace: &mut LeastSquaresWorkspace,
-    ) -> Result<LinearSolveResult, MatrixError> {
-        if self.options.regularization == 0.0 {
-            // The direct SVD path returns the minimum-norm correction for every
-            // rank. Conditioning remains diagnostic data; it never silently
-            // changes the equation being solved.
-            let info = j_matrix.solve_least_squares_into(rhs, solution, workspace)?;
-            return Ok(LinearSolveResult {
-                diagnostic: LinearSolveDiagnostic {
-                    effective: info,
-                    regularization: None,
-                },
-            });
-        }
-
-        // Ridge regularization is an explicit alternate linear problem. Its
-        // buffers were allocated with the solver workspace and are guaranteed
-        // present by compatibility validation at the public solve boundary.
-        let augmented_j = augmented_jacobian
-            .as_mut()
-            .expect("regularized workspace must contain an augmented Jacobian");
-        let augmented_b = augmented_rhs
-            .as_mut()
-            .expect("regularized workspace must contain an augmented right-hand side");
-
-        // Reset complete reused buffers because a prior factorization consumed
-        // their previous contents and the lower ridge block contains structural
-        // zeros as well as its diagonal.
-        for row in 0..augmented_j.rows() {
-            for column in 0..augmented_j.cols() {
-                augmented_j[(row, column)] = 0.0;
-            }
-            augmented_b[(row, 0)] = 0.0;
-        }
-
-        // Copy the nonlinear linearization into the upper block. Fresh
-        // zero-filled matrices already contain the lower off-diagonal and
-        // right-hand-side zeros required by the ridge formulation.
-        for row in 0..j_matrix.rows() {
-            for column in 0..j_matrix.cols() {
-                augmented_j[(row, column)] = j_matrix[(row, column)];
-            }
-            augmented_b[(row, 0)] = rhs[(row, 0)];
-        }
-
-        // sqrt(lambda) on the appended diagonal makes the augmented
-        // least-squares objective exactly ||J delta-rhs||^2 + lambda||delta||^2.
-        let sqrt_regularization = self.options.regularization.sqrt();
-        for variable in 0..j_matrix.cols() {
-            augmented_j[(j_matrix.rows() + variable, variable)] = sqrt_regularization;
-        }
-
-        let info = augmented_j.solve_least_squares_into(augmented_b, solution, workspace)?;
-        Ok(LinearSolveResult {
-            diagnostic: LinearSolveDiagnostic {
-                effective: info,
-                regularization: Some(self.options.regularization),
-            },
-        })
     }
 
     /// Translate a public name-keyed initial guess into reusable compact storage.
@@ -1192,11 +1026,6 @@ impl NewtonRaphsonSolver {
             self.options.residual_tolerance.is_finite() && self.options.residual_tolerance > 0.0,
             "residual_tolerance must be finite and greater than zero",
         )?;
-        Self::require_valid_option(
-            self.options.regularization.is_finite() && self.options.regularization >= 0.0,
-            "regularization must be finite and non-negative",
-        )?;
-
         Ok(())
     }
 
@@ -1343,7 +1172,7 @@ impl NewtonRaphsonSolver {
         iterations: usize,
         error: f64,
         gradient: ResidualGradientMeasure,
-        last_linear_attempt: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LeastSquaresInfo>,
     ) -> Solution {
         // Convert internal IDs only after all numerical convergence checks have
         // succeeded, keeping the hot iteration path in its compact ID form.
@@ -1358,14 +1187,14 @@ impl NewtonRaphsonSolver {
     }
 
     /// Construct the shape-independent error returned when a non-root has no
-    /// reducible component in its effective retained linear correction model.
+    /// reducible component in the retained Jacobian model.
     fn stationary_non_root_error(
         &self,
         iterations: usize,
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
         gradient: ResidualGradientMeasure,
-        linear_attempt: LinearSolveDiagnostic,
+        linear_attempt: LeastSquaresInfo,
     ) -> SolverError {
         // Pass both the descriptive gradient and the decisive linear attempt into
         // the common constructor. The factorization's zero projection, rather
@@ -1395,7 +1224,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
         gradient: ResidualGradientMeasure,
-        last_linear_attempt: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LeastSquaresInfo>,
     ) -> SolverError {
         // The current loop state has already evaluated both residual and
         // gradient. Preserve them rather than forcing callers to choose between
@@ -1418,7 +1247,7 @@ impl NewtonRaphsonSolver {
     /// produced after that correction was available.
     fn attach_linear_attempt(
         mut error: SolverError,
-        last_linear_attempt: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LeastSquaresInfo>,
     ) -> SolverError {
         // Every numerical run-state variant owns the same boxed diagnostic
         // shape. Invalid configuration errors occur before correction and
@@ -1544,7 +1373,7 @@ impl NewtonRaphsonSolver {
         vars: &HashMap<VarId, f64>,
         residuals_matrix: &Matrix,
         gradient: Option<ResidualGradientMeasure>,
-        last_linear_attempt: Option<LinearSolveDiagnostic>,
+        last_linear_attempt: Option<LeastSquaresInfo>,
     ) -> SolverRunDiagnostic {
         // Residual row order matches compiled equation order. Clone optional
         // trace metadata into the owned diagnostic so it remains useful after
@@ -1814,8 +1643,8 @@ mod tests {
             .last_linear_attempt
             .as_ref()
             .expect("stationarity requires a completed SVD factorization");
-        assert_eq!(attempt.effective.retained_rhs_projection_fraction, 0.0);
-        assert_eq!(attempt.effective.residual_norm_slope, 0.0);
+        assert_eq!(attempt.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.residual_norm_slope, 0.0);
     }
 
     /// Compile equations and construct the sole serial solver policy used by
@@ -2007,22 +1836,26 @@ mod tests {
         );
     }
 
-    /// Reject a workspace whose linear-system shape no longer matches solver
-    /// configuration before either object mutates numerical state.
+    /// Reject a workspace whose equation shape does not match the solver before
+    /// either object mutates numerical state.
     #[test]
-    fn test_solver_rejects_workspace_from_incompatible_configuration() {
+    fn test_solver_rejects_workspace_from_incompatible_shape() {
         let compiled = Compiler::compile(&[Exp::var("x")]).unwrap();
-        let direct_solver = NewtonRaphsonSolver::new(compiled);
-        let mut direct_workspace = direct_solver.workspace();
+        let one_equation_solver = NewtonRaphsonSolver::new(compiled);
+        let mut one_equation_workspace = one_equation_solver.workspace();
 
-        let compiled = Compiler::compile(&[Exp::var("x")]).unwrap();
-        let regularized_solver = NewtonRaphsonSolver::new(compiled).with_regularization(1e-8);
-        let error = regularized_solver
+        // The second solver has the same named variable but two residual rows,
+        // so reusing the first solver's matrix storage would violate every
+        // exact-shape evaluation and factorization contract.
+        let x = Exp::var("x");
+        let compiled = Compiler::compile(&[x.clone(), x]).unwrap();
+        let two_equation_solver = NewtonRaphsonSolver::new(compiled);
+        let error = two_equation_solver
             .solve(
                 HashMap::from([("x".to_string(), 0.0)]),
-                &mut direct_workspace,
+                &mut one_equation_workspace,
             )
-            .expect_err("ridge policy requires a ridge-shaped workspace");
+            .expect_err("two equations require a two-row workspace");
 
         match error {
             SolverError::InvalidInput(message) => {
@@ -2086,8 +1919,7 @@ mod tests {
 
         let solver = build_solver(vec![eq1, eq2])
             .with_residual_tolerance(1e-8)
-            .with_max_iterations(50)
-            .with_regularization(1e-8);
+            .with_max_iterations(50);
 
         let mut initial = HashMap::new();
         initial.insert("x".to_string(), 0.5);
@@ -2171,14 +2003,6 @@ mod tests {
             (
                 "residual_tolerance",
                 Box::new(|solver| solver.with_residual_tolerance(f64::NAN)),
-            ),
-            (
-                "regularization",
-                Box::new(|solver| solver.with_regularization(-1.0)),
-            ),
-            (
-                "regularization",
-                Box::new(|solver| solver.with_regularization(f64::INFINITY)),
             ),
         ];
 
@@ -2307,9 +2131,7 @@ mod tests {
         // Candidate construction rejects the overflowing full step before
         // expression evaluation. Limiting the search to that one trial
         // makes preservation of the initial accepted state deterministic.
-        let solver = build_solver(vec![equation])
-            .with_regularization(0.0)
-            .with_max_backtracks(0);
+        let solver = build_solver(vec![equation]).with_max_backtracks(0);
         let error = solver
             .solve_once(initial)
             .expect_err("an overflowing line-search candidate must be rejected");
@@ -2592,8 +2414,7 @@ mod tests {
                     .last_linear_attempt
                     .as_ref()
                     .expect("the rejected candidate still followed a successful SVD attempt");
-                assert_eq!(attempt.effective.rank, 1);
-                assert_eq!(attempt.regularization, None);
+                assert_eq!(attempt.rank, 1);
             }
             other => panic!("expected NoConvergence, got {other:?}"),
         }
@@ -2841,8 +2662,7 @@ mod tests {
         let y = Exp::var("y");
         let x_residual = Exp::sub(x, Exp::val(1.0));
         let y_residual = Exp::mul(Exp::val(1e9), y);
-        let solver =
-            build_solver(vec![x_residual, y_residual.clone(), y_residual]).with_regularization(0.0);
+        let solver = build_solver(vec![x_residual, y_residual.clone(), y_residual]);
         let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
         let solution = solver
@@ -2884,7 +2704,6 @@ mod tests {
                 .last_linear_attempt
                 .as_ref()
                 .expect("one correction requires one factorization")
-                .effective
                 .rank,
             2
         );
@@ -2915,8 +2734,8 @@ mod tests {
         let attempt = diagnostic
             .last_linear_attempt
             .expect("stationarity is established by the final SVD attempt");
-        assert_eq!(attempt.effective.retained_rhs_projection_fraction, 0.0);
-        assert_eq!(attempt.effective.residual_norm_slope, 0.0);
+        assert_eq!(attempt.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.residual_norm_slope, 0.0);
     }
 
     /// Classify a non-root zero-Jacobian point as stationary without claiming it
@@ -2973,11 +2792,10 @@ mod tests {
                 .relative_gradient_norm
                 .is_some_and(|norm| norm < 1e-8)
         );
-        let linear = diagnostic
-            .last_linear_attempt
-            .as_ref()
-            .expect("stationarity reached after an SVD correction");
-        assert_eq!(linear.regularization, None);
+        assert!(
+            diagnostic.last_linear_attempt.is_some(),
+            "stationarity must retain its final SVD correction"
+        );
     }
 
     /// Confirm that line search uses the local least-squares slope rather than
@@ -3058,8 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn test_least_squares_svd_handles_ill_conditioned_overdetermined_system_without_regularization()
-    {
+    fn test_least_squares_svd_handles_ill_conditioned_overdetermined_system() {
         // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
         // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
         // lose the tiny distinguishing term and become singular in floating point. The
@@ -3082,7 +2899,6 @@ mod tests {
         );
 
         let solver = build_solver(vec![eq1, eq2, eq3])
-            .with_regularization(0.0)
             .with_max_iterations(10)
             .with_residual_tolerance(1e-10);
 
@@ -3133,14 +2949,13 @@ mod tests {
                 .last_linear_attempt
                 .as_ref()
                 .expect("one correction must retain factorization diagnostics")
-                .effective
                 .rank,
             2
         );
     }
 
-    /// Normalize variable coordinates so condition diagnostics and optional
-    /// ridge penalties do not depend on the caller's chosen units.
+    /// Normalize variable coordinates so correction geometry and condition
+    /// diagnostics do not depend on the caller's chosen units.
     #[test]
     fn test_variable_scales_normalize_jacobian_columns() {
         let x = Exp::var("x");
@@ -3163,8 +2978,8 @@ mod tests {
 
         assert_eq!(solution.values["x"], 1.0);
         assert!((solution.values["y"] - 1e13).abs() < 1e-3);
-        assert_eq!(linear.effective.rank, 2);
-        assert!((linear.effective.cond_est - 1.0).abs() < 1e-12);
+        assert_eq!(linear.rank, 2);
+        assert!((linear.cond_est - 1.0).abs() < 1e-12);
         assert_eq!(solver.variable_scale("x"), Some(1.0));
         assert_eq!(solver.variable_scale("y"), Some(1e13));
     }
@@ -3258,9 +3073,7 @@ mod tests {
         let x = Exp::var("x");
         let y = Exp::var("y");
         let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
-        let solver = build_solver(vec![equation])
-            .with_residual_tolerance(1e-12)
-            .with_regularization(0.0);
+        let solver = build_solver(vec![equation]).with_residual_tolerance(1e-12);
 
         let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
         let solution = solver
@@ -3334,10 +3147,10 @@ mod tests {
         assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
     }
 
-    /// Confirm that a rank-deficient Jacobian is directly solvable without
-    /// regularization when its Moore-Penrose correction is well conditioned.
+    /// Confirm that a rank-deficient Jacobian uses its Moore-Penrose correction
+    /// directly.
     #[test]
-    fn test_rank_deficient_overconstrained_converges_without_regularization() {
+    fn test_rank_deficient_overconstrained_uses_pseudoinverse() {
         // Every equation constrains x while multiplication by zero keeps y
         // present in the compiled variable table but absent from J's image.
         let x = Exp::var("x");
@@ -3355,7 +3168,6 @@ mod tests {
         );
 
         let solver = build_solver(vec![eq1, eq2, eq3])
-            .with_regularization(0.0)
             .with_residual_tolerance(1e-12)
             .with_max_iterations(10);
 
@@ -3365,15 +3177,14 @@ mod tests {
 
         let solution = solver
             .solve_once(initial)
-            .expect("the SVD pseudoinverse should solve without implicit regularization");
+            .expect("the SVD pseudoinverse should solve the dependent system");
         assert!((solution.values["x"] - 1.0).abs() < 1e-10);
         assert!(solution.values["y"].abs() < 1e-10);
     }
 
-    /// Confirm that a dependent square system uses the canonical SVD directly,
-    /// even when augmented regularization is disabled.
+    /// Confirm that a dependent square system uses the canonical SVD directly.
     #[test]
-    fn test_rank_deficient_square_system_converges_without_regularization() {
+    fn test_rank_deficient_square_system_uses_pseudoinverse() {
         // Both equations describe the same line. Their 2-by-2 Jacobian is
         // exactly rank one, so the Moore-Penrose correction selects
         // x = y = 1/2 from the zero initial point.
@@ -3382,7 +3193,6 @@ mod tests {
         let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
         let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
         let solver = build_solver(vec![first_equation, second_equation])
-            .with_regularization(0.0)
             .with_residual_tolerance(1e-12)
             .with_max_iterations(10);
 
@@ -3402,82 +3212,7 @@ mod tests {
         let linear = solution
             .last_linear_attempt
             .expect("the accepted correction must retain SVD diagnostics");
-        assert_eq!(linear.effective.rank, 1);
-        assert_eq!(linear.regularization, None);
-    }
-
-    /// Confirm that an explicitly regularized square solve uses the augmented
-    /// ridge system rather than first applying its direct correction.
-    #[test]
-    fn test_ill_conditioned_square_system_uses_regularized_least_squares() {
-        // This upper-triangular Jacobian has unit diagonal pivots but a
-        // condition estimate around 1e16. A direct square solve would jump
-        // to the exact root and bypass the configured ridge policy.
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let first_equation = Exp::sub(
-            Exp::add(x, Exp::mul(Exp::val(1e8), y.clone())),
-            Exp::val(1e8 + 1.0),
-        );
-        let second_equation = Exp::sub(y, Exp::val(1.0));
-        let solver = build_solver(vec![first_equation, second_equation])
-            .with_residual_tolerance(1e-12)
-            .with_regularization(1e-8)
-            .with_max_iterations(1);
-        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
-
-        let error = solver
-            .solve_once(initial)
-            .expect_err("one regularized update should not masquerade as an exact root");
-
-        match error {
-            SolverError::NoConvergence(diagnostic) => {
-                assert_eq!(diagnostic.iterations, 1);
-                assert!(diagnostic.values["x"].abs() < 0.1);
-                assert!(diagnostic.error > 1e-12);
-                let linear = diagnostic
-                    .last_linear_attempt
-                    .as_ref()
-                    .expect("regularized correction diagnostics must be retained");
-                assert_eq!(linear.regularization, Some(1e-8));
-            }
-            other => panic!("expected NoConvergence, got {other:?}"),
-        }
-    }
-
-    /// Verify that explicit regularization performs one predictable augmented
-    /// solve with exactly the caller's ridge strength.
-    #[test]
-    fn test_regularization_uses_exact_configured_strength() {
-        let x = Exp::var("x");
-        let y = Exp::var("y");
-        let solver = build_solver(vec![x, y]).with_regularization(1e-8);
-
-        // The fixture is deliberately ill-conditioned, but conditioning no
-        // longer selects or changes policy: positive regularization means the
-        // requested augmented problem is solved exactly once.
-        let jacobian = Matrix::from_vec(vec![1.0, 0.0, 0.0, 1e-8], 2, 2)
-            .expect("the fixture has a valid square shape");
-        let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1)
-            .expect("the fixture has a valid right-hand-side shape");
-        let mut workspace = solver.workspace();
-        let result = match solver.solve_least_squares_system(
-            &jacobian,
-            &rhs,
-            &mut workspace.correction,
-            &mut workspace.augmented_jacobian,
-            &mut workspace.augmented_rhs,
-            &mut workspace.least_squares,
-        ) {
-            Ok(result) => result,
-            Err(_) => panic!("finite ridge systems must remain solvable"),
-        };
-
-        let used_regularization = result
-            .diagnostic
-            .regularization
-            .expect("positive regularization must select an augmented solve");
-        assert_eq!(used_regularization, 1e-8);
+        assert_eq!(linear.rank, 1);
     }
 
     #[test]

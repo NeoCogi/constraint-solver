@@ -1151,8 +1151,8 @@ impl Matrix {
     /// value.
     ///
     /// Solver code uses this check at numerical boundaries so NaN and infinity
-    /// are reported as evaluation failures rather than flowing into rank,
-    /// convergence, or regularization logic.
+    /// are reported as evaluation failures rather than flowing into rank or
+    /// convergence logic.
     pub fn all_finite(&self) -> bool {
         // `Iterator::all` stops at the first invalid element and does not expose
         // the matrix's private storage to callers.

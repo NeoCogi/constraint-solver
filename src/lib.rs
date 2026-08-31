@@ -79,8 +79,8 @@ pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
 pub use matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError, MatrixOperand};
 pub use solver::{
-    EquationDiagnostic, EquationTrace, LinearSolveDiagnostic, NewtonRaphsonSolver, Solution,
-    SolverError, SolverOptions, SolverRunDiagnostic, SolverWorkspace,
+    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverOptions,
+    SolverRunDiagnostic, SolverWorkspace,
 };
 
 /// Documentation-only container that makes every Rust block in the repository
