@@ -1879,14 +1879,6 @@ mod tests {
     use crate::compiler::Compiler;
     use crate::exp::Exp;
 
-    /// Single deterministic execution case used while numerical tests retain
-    /// their shared case-oriented structure.
-    #[derive(Clone, PartialEq, Eq)]
-    enum Mode {
-        /// The solver's only serial execution policy.
-        Serial,
-    }
-
     /// Apply the documented inclusive maximum at the exact dimensionless
     /// stationarity boundary.
     #[test]
@@ -1909,75 +1901,48 @@ mod tests {
         assert!(!root_measure.is_stationary(1.0));
     }
 
+    /// Small deterministic generator used by numerical property regressions.
+    ///
+    /// Keeping the generator local and dependency-free makes every randomized
+    /// fixture repeatable across platforms and build profiles.
     struct TestRng {
+        /// Current linear-congruential state.
         state: u64,
     }
 
     impl TestRng {
+        /// Start one reproducible sequence from an explicit non-secret seed.
         fn new(seed: u64) -> Self {
             Self { state: seed }
         }
 
+        /// Advance the fixed linear-congruential recurrence and return its high
+        /// 32 bits, whose distribution is better than the low-order bits.
         fn next_u32(&mut self) -> u32 {
+            // Wrapping arithmetic defines the recurrence modulo 2^64 and is
+            // therefore intentional in debug as well as optimized builds.
             self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (self.state >> 32) as u32
         }
 
+        /// Map the next integer sample deterministically into `[-1, 1]`.
         fn next_f64(&mut self) -> f64 {
             let v = self.next_u32() as f64 / u32::MAX as f64;
             2.0 * v - 1.0
         }
     }
 
+    /// Build one dense linear residual `coeffs^T vars - rhs` for randomized
+    /// square and rectangular solver cases.
     fn linear_equation(coeffs: &[f64], vars: &[Exp], rhs: f64) -> Exp {
+        // Accumulate in stable slice order so seeded fixtures construct the
+        // identical expression tree on every run.
         let mut sum = Exp::val(0.0);
         for (coeff, var) in coeffs.iter().zip(vars.iter()) {
             let term = Exp::mul(Exp::val(*coeff), var.clone());
             sum = Exp::add(sum, term);
         }
         Exp::sub(sum, Exp::val(rhs))
-    }
-
-    fn test_modes() -> [Mode; 1] {
-        [Mode::Serial]
-    }
-
-    fn assert_solution_close(serial: &Solution, parallel: &Solution, tol: f64) {
-        assert_eq!(serial.values.len(), parallel.values.len());
-        for (name, value) in &serial.values {
-            let other = parallel.values.get(name).expect("missing variable");
-            let diff = (value - other).abs();
-            assert!(diff <= tol, "var {name} mismatch: {value} vs {other}");
-        }
-    }
-
-    fn assert_error_matches(serial: &SolverError, parallel: &SolverError) {
-        assert_eq!(
-            std::mem::discriminant(serial),
-            std::mem::discriminant(parallel)
-        );
-        match (serial, parallel) {
-            // Compare the structured payloads for variants whose data is not a
-            // floating-point run diagnostic covered by their focused tests.
-            (
-                SolverError::Matrix {
-                    source: left_source,
-                    diagnostic: left_diagnostic,
-                },
-                SolverError::Matrix {
-                    source: right_source,
-                    diagnostic: right_diagnostic,
-                },
-            ) => {
-                assert_eq!(left_source, right_source);
-                assert_eq!(left_diagnostic.iterations, right_diagnostic.iterations);
-                assert_eq!(left_diagnostic.values, right_diagnostic.values);
-            }
-            (SolverError::InvalidInput(left), SolverError::InvalidInput(right)) => {
-                assert_eq!(left, right);
-            }
-            _ => {}
-        }
     }
 
     /// Extract the structured state from the strict non-root stationarity error
@@ -1991,16 +1956,16 @@ mod tests {
         }
     }
 
-    fn solver_for_mode(equations: Vec<Exp>, _mode: Mode) -> NewtonRaphsonSolver {
+    /// Compile equations and construct the sole serial solver policy used by
+    /// focused numerical tests.
+    fn build_solver(equations: Vec<Exp>) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new(compiled)
     }
 
-    fn solver_for_with_vars_mode(
-        equations: Vec<Exp>,
-        variables: &[&str],
-        _mode: Mode,
-    ) -> NewtonRaphsonSolver {
+    /// Compile equations while selecting only the named variables as unknowns;
+    /// all other compiled variables remain fixed parameters.
+    fn solver_for_with_vars(equations: Vec<Exp>, variables: &[&str]) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new_with_variables(compiled, variables)
             .expect("failed to select solve variables")
@@ -2016,7 +1981,7 @@ mod tests {
         // already been evaluated at the accepted initial state.
         let x = Exp::var("x");
         let equation = Exp::sub(Exp::mul(Exp::val(f64::from_bits(1)), x), Exp::val(1.0));
-        let solver = solver_for_mode(vec![equation], Mode::Serial)
+        let solver = build_solver(vec![equation])
             .with_equation_traces(vec![Some(EquationTrace {
                 constraint_id: 41,
                 description: "unrepresentable correction fixture".to_string(),
@@ -2064,134 +2029,120 @@ mod tests {
     /// correction because of an overflowing intermediate value.
     #[test]
     fn test_solver_solves_extreme_rank_deficient_linearization() {
-        for mode in test_modes() {
-            // Every coefficient and residual is finite at the initial point,
-            // and the duplicated 1e308-scale Jacobian columns have the finite
-            // minimum-norm root x=y=-5e-309. The coefficient normalization in
-            // the SVD must keep that ordinary answer representable even though
-            // the unscaled largest singular value exceeds `f64::MAX`.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let huge_linear_form =
-                Exp::add(Exp::mul(Exp::val(-1e308), x), Exp::mul(Exp::val(-1e308), y));
-            let equations = vec![
-                Exp::sub(huge_linear_form.clone(), Exp::val(1.0)),
-                Exp::sub(huge_linear_form, Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        // Every coefficient and residual is finite at the initial point,
+        // and the duplicated 1e308-scale Jacobian columns have the finite
+        // minimum-norm root x=y=-5e-309. The coefficient normalization in
+        // the SVD must keep that ordinary answer representable even though
+        // the unscaled largest singular value exceeds `f64::MAX`.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let huge_linear_form =
+            Exp::add(Exp::mul(Exp::val(-1e308), x), Exp::mul(Exp::val(-1e308), y));
+        let equations = vec![
+            Exp::sub(huge_linear_form.clone(), Exp::val(1.0)),
+            Exp::sub(huge_linear_form, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("the finite extreme-scale pseudoinverse root must solve");
-            for variable in ["x", "y"] {
-                let relative_error = (solution.values[variable] / -5e-309 - 1.0).abs();
-                assert!(relative_error < 1e-12, "relative error: {relative_error}");
-            }
-            assert_eq!(solution.iterations, 1);
-            assert!(solution.error < 1e-12);
+        let solution = solver
+            .solve_once(initial)
+            .expect("the finite extreme-scale pseudoinverse root must solve");
+        for variable in ["x", "y"] {
+            let relative_error = (solution.values[variable] / -5e-309 - 1.0).abs();
+            assert!(relative_error < 1e-12, "relative error: {relative_error}");
         }
+        assert_eq!(solution.iterations, 1);
+        assert!(solution.error < 1e-12);
     }
 
     #[test]
     fn test_simple_system() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Test system: x^2 + y^2 = 1, xy = 0.25
-            // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+        // Test system: x^2 + y^2 = 1, xy = 0.25
+        // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            let eq1 = Exp::sub(
-                Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
-                Exp::val(1.0),
-            );
-            let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
+        let eq1 = Exp::sub(
+            Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
+            Exp::val(1.0),
+        );
+        let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode);
+        let solver = build_solver(vec![eq1, eq2]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.5);
-            initial.insert("y".to_string(), 0.866);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.866);
 
-            let solution = solver.solve_once(initial).expect("Failed to solve system");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
-            }
-            assert!(solution.error < 1e-10);
+        let solution = solver.solve_once(initial).expect("Failed to solve system");
+        assert!(solution.error < 1e-10);
 
-            let x_sol = solution.values.get("x").copied().unwrap();
-            let y_sol = solution.values.get("y").copied().unwrap();
-            assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
-            assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
-        }
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
+        assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
+        assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
     }
 
     /// Reuse every caller-owned numerical buffer across distinct solve calls.
     #[test]
     fn test_reused_solver_handles_distinct_initial_guesses() {
-        for mode in test_modes() {
-            // The two initial guesses converge to opposite roots of the same
-            // nonlinear equation. Reusing the solver proves that caching the
-            // derivative does not retain values from the first numeric run.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(20);
+        // The two initial guesses converge to opposite roots of the same
+        // nonlinear equation. Reusing the solver proves that caching the
+        // derivative does not retain values from the first numeric run.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+        let solver = build_solver(vec![equation])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(20);
 
-            let mut workspace = solver.workspace();
-            let mut matrix_addresses = [
-                workspace.residuals.storage_address() as usize,
-                workspace.scaled_residuals.storage_address() as usize,
-                workspace.correction_rhs.storage_address() as usize,
-                workspace.scaled_jacobian.storage_address() as usize,
-                workspace.correction.storage_address() as usize,
-                workspace.candidate_residuals.storage_address() as usize,
-                workspace.candidate_scaled_residuals.storage_address() as usize,
-                workspace.jacobian.jacobian().storage_address() as usize,
-            ];
-            matrix_addresses.sort_unstable();
-            let map_capacities = (
+        let mut workspace = solver.workspace();
+        let mut matrix_addresses = [
+            workspace.residuals.storage_address() as usize,
+            workspace.scaled_residuals.storage_address() as usize,
+            workspace.correction_rhs.storage_address() as usize,
+            workspace.scaled_jacobian.storage_address() as usize,
+            workspace.correction.storage_address() as usize,
+            workspace.candidate_residuals.storage_address() as usize,
+            workspace.candidate_scaled_residuals.storage_address() as usize,
+            workspace.jacobian.jacobian().storage_address() as usize,
+        ];
+        matrix_addresses.sort_unstable();
+        let map_capacities = (
+            workspace.vars.capacity(),
+            workspace.candidate_vars.capacity(),
+        );
+
+        // Both calls overwrite the same construction-time workspace. Owned
+        // result maps are created only after each numerical run terminates.
+        let positive_solution = solver
+            .solve(HashMap::from([("x".to_string(), 3.0)]), &mut workspace)
+            .expect("positive initial guess should converge");
+        let negative_solution = solver
+            .solve(HashMap::from([("x".to_string(), -3.0)]), &mut workspace)
+            .expect("negative initial guess should converge");
+
+        assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
+        assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
+        let mut reused_addresses = [
+            workspace.residuals.storage_address() as usize,
+            workspace.scaled_residuals.storage_address() as usize,
+            workspace.correction_rhs.storage_address() as usize,
+            workspace.scaled_jacobian.storage_address() as usize,
+            workspace.correction.storage_address() as usize,
+            workspace.candidate_residuals.storage_address() as usize,
+            workspace.candidate_scaled_residuals.storage_address() as usize,
+            workspace.jacobian.jacobian().storage_address() as usize,
+        ];
+        reused_addresses.sort_unstable();
+        assert_eq!(matrix_addresses, reused_addresses);
+        assert_eq!(
+            map_capacities,
+            (
                 workspace.vars.capacity(),
-                workspace.candidate_vars.capacity(),
-            );
-
-            // Both calls overwrite the same construction-time workspace. Owned
-            // result maps are created only after each numerical run terminates.
-            let positive_solution = solver
-                .solve(HashMap::from([("x".to_string(), 3.0)]), &mut workspace)
-                .expect("positive initial guess should converge");
-            let negative_solution = solver
-                .solve(HashMap::from([("x".to_string(), -3.0)]), &mut workspace)
-                .expect("negative initial guess should converge");
-
-            assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
-            assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
-            let mut reused_addresses = [
-                workspace.residuals.storage_address() as usize,
-                workspace.scaled_residuals.storage_address() as usize,
-                workspace.correction_rhs.storage_address() as usize,
-                workspace.scaled_jacobian.storage_address() as usize,
-                workspace.correction.storage_address() as usize,
-                workspace.candidate_residuals.storage_address() as usize,
-                workspace.candidate_scaled_residuals.storage_address() as usize,
-                workspace.jacobian.jacobian().storage_address() as usize,
-            ];
-            reused_addresses.sort_unstable();
-            assert_eq!(matrix_addresses, reused_addresses);
-            assert_eq!(
-                map_capacities,
-                (
-                    workspace.vars.capacity(),
-                    workspace.candidate_vars.capacity()
-                )
-            );
-        }
+                workspace.candidate_vars.capacity()
+            )
+        );
     }
 
     /// Reject a workspace whose linear-system shape no longer matches solver
@@ -2223,148 +2174,116 @@ mod tests {
     /// construction-time caches cannot hide shared mutable numerical storage.
     #[test]
     fn test_reused_solver_supports_concurrent_solve_calls() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(20);
-            let initial_values = [3.0, -3.0, 5.0, -5.0];
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+        let solver = build_solver(vec![equation])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(20);
+        let initial_values = [3.0, -3.0, 5.0, -5.0];
 
-            // Scoped threads borrow the same immutable symbolic solver while
-            // each thread owns a distinct mutable numerical workspace.
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = initial_values
-                    .into_iter()
-                    .map(|initial_value| {
-                        let solver = &solver;
-                        scope.spawn(move || {
-                            let mut workspace = solver.workspace();
-                            solver.solve(
-                                HashMap::from([("x".to_string(), initial_value)]),
-                                &mut workspace,
-                            )
-                        })
+        // Scoped threads borrow the same immutable symbolic solver while
+        // each thread owns a distinct mutable numerical workspace.
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = initial_values
+                .into_iter()
+                .map(|initial_value| {
+                    let solver = &solver;
+                    scope.spawn(move || {
+                        let mut workspace = solver.workspace();
+                        solver.solve(
+                            HashMap::from([("x".to_string(), initial_value)]),
+                            &mut workspace,
+                        )
                     })
-                    .collect();
+                })
+                .collect();
 
-                for (handle, initial_value) in handles.into_iter().zip(initial_values) {
-                    let solution = handle
-                        .join()
-                        .expect("concurrent solver thread must not panic")
-                        .expect("each concurrent initial guess should converge");
-                    let expected = if initial_value.is_sign_positive() {
-                        2.0
-                    } else {
-                        -2.0
-                    };
-                    assert!((solution.values["x"] - expected).abs() < 1e-10);
-                }
-            });
-        }
+            for (handle, initial_value) in handles.into_iter().zip(initial_values) {
+                let solution = handle
+                    .join()
+                    .expect("concurrent solver thread must not panic")
+                    .expect("each concurrent initial guess should converge");
+                let expected = if initial_value.is_sign_positive() {
+                    2.0
+                } else {
+                    -2.0
+                };
+                assert!((solution.values["x"] - expected).abs() < 1e-10);
+            }
+        });
     }
 
     #[test]
     fn test_transcendental_system() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Test transcendental system: sin(x) = 2y, cos(y) = x
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+        // Test transcendental system: sin(x) = 2y, cos(y) = x
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
-            let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
+        let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
+        let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_residual_tolerance(1e-8)
-                .with_max_iterations(50)
-                .with_regularization(1e-8);
+        let solver = build_solver(vec![eq1, eq2])
+            .with_residual_tolerance(1e-8)
+            .with_max_iterations(50)
+            .with_regularization(1e-8);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.5);
-            initial.insert("y".to_string(), 0.25);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.25);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("Failed to solve transcendental system");
+        let solution = solver
+            .solve_once(initial)
+            .expect("Failed to solve transcendental system");
 
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
-            }
-            let x_sol = solution.values.get("x").copied().unwrap();
-            let y_sol = solution.values.get("y").copied().unwrap();
-            assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
-            assert!((y_sol.cos() - x_sol).abs() < 1e-8);
-        }
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
+        assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
+        assert!((y_sol.cos() - x_sol).abs() < 1e-8);
     }
 
     #[test]
     fn test_solver_rejects_missing_fixed_parameter() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // System: x - a = 0, solving for x with a treated as a fixed parameter.
-            // Missing `a` should be an error (not implicitly treated as 0).
-            let x = Exp::var("x");
-            let a = Exp::var("a");
-            let eq = Exp::sub(x.clone(), a.clone());
+        // System: x - a = 0, solving for x with a treated as a fixed parameter.
+        // Missing `a` should be an error (not implicitly treated as 0).
+        let x = Exp::var("x");
+        let a = Exp::var("a");
+        let eq = Exp::sub(x.clone(), a.clone());
 
-            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 1.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 1.0);
 
-            let err = solver
-                .solve_once(initial)
-                .expect_err("expected missing variable error");
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+        let err = solver
+            .solve_once(initial)
+            .expect_err("expected missing variable error");
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("a"), "unexpected message: {msg}");
             }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("a"), "unexpected message: {msg}");
-                }
-                other => panic!("expected InvalidInput, got {:?}", other),
-            }
+            other => panic!("expected InvalidInput, got {:?}", other),
         }
     }
 
     #[test]
     fn test_solver_invalid_input_on_missing_initial_guess_variable() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 
-            let solver = solver_for_mode(vec![eq], mode);
+        let solver = build_solver(vec![eq]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
 
-            let err = solver
-                .solve_once(initial)
-                .expect_err("expected invalid input due to missing y");
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+        let err = solver
+            .solve_once(initial)
+            .expect_err("expected invalid input due to missing y");
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("y"), "unexpected message: {msg}");
             }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("y"), "unexpected message: {msg}");
-                }
-                other => panic!("expected InvalidInput, got {:?}", other),
-            }
+            other => panic!("expected InvalidInput, got {:?}", other),
         }
     }
 
@@ -2526,46 +2445,44 @@ mod tests {
     /// produced by either solver update path.
     #[test]
     fn test_solver_never_commits_non_finite_variable_updates() {
-        for mode in test_modes() {
-            // At x=1e308 the reciprocal expression and its derivative are both
-            // finite, but the undamped Newton correction is another 1e308. The
-            // resulting x would overflow to infinity while the reciprocal of
-            // that invalid value evaluates to the deceptively finite value zero.
-            let x = Exp::var("x");
-            let scaled_x = Exp::mul(Exp::val(1e-308), x);
-            let equation = Exp::div(Exp::val(1.0), scaled_x);
-            let initial = HashMap::from([("x".to_string(), 1e308)]);
+        // At x=1e308 the reciprocal expression and its derivative are both
+        // finite, but the undamped Newton correction is another 1e308. The
+        // resulting x would overflow to infinity while the reciprocal of
+        // that invalid value evaluates to the deceptively finite value zero.
+        let x = Exp::var("x");
+        let scaled_x = Exp::mul(Exp::val(1e-308), x);
+        let equation = Exp::div(Exp::val(1.0), scaled_x);
+        let initial = HashMap::from([("x".to_string(), 1e308)]);
 
-            // Candidate construction rejects the overflowing full step before
-            // expression evaluation. Limiting the search to that one trial
-            // makes preservation of the initial accepted state deterministic.
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_regularization(0.0)
-                .with_max_backtracks(0);
-            let error = solver
-                .solve_once(initial)
-                .expect_err("an overflowing line-search candidate must be rejected");
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert!(diagnostic.message.contains("Line search failed"));
-                    assert!(diagnostic.message.contains("non-finite updates 1"));
-                    assert!(diagnostic.message.contains("non-finite residuals 0"));
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("insufficient Armijo decrease 0")
-                    );
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("last finite candidate residual none")
-                    );
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert_eq!(diagnostic.values["x"], 1e308);
-                    assert!(diagnostic.values.values().all(|value| value.is_finite()));
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
+        // Candidate construction rejects the overflowing full step before
+        // expression evaluation. Limiting the search to that one trial
+        // makes preservation of the initial accepted state deterministic.
+        let solver = build_solver(vec![equation])
+            .with_regularization(0.0)
+            .with_max_backtracks(0);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("an overflowing line-search candidate must be rejected");
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert!(diagnostic.message.contains("Line search failed"));
+                assert!(diagnostic.message.contains("non-finite updates 1"));
+                assert!(diagnostic.message.contains("non-finite residuals 0"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 0")
+                );
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 1e308);
+                assert!(diagnostic.values.values().all(|value| value.is_finite()));
             }
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
@@ -2573,47 +2490,43 @@ mod tests {
     /// iteration exhaustion.
     #[test]
     fn test_solver_reports_non_finite_residual_evaluation() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
-            let equation = Exp::ln(x);
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), -1.0)]);
+        let x = Exp::var("x");
+        let equation = Exp::ln(x);
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), -1.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("ln of a negative value is outside the real domain");
-            match error {
-                SolverError::NonFiniteEvaluation(diagnostic) => {
-                    assert!(diagnostic.message.contains("Residual evaluation"));
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert!(diagnostic.error.is_nan());
-                }
-                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        let error = solver
+            .solve_once(initial)
+            .expect_err("ln of a negative value is outside the real domain");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Residual evaluation"));
+                assert_eq!(diagnostic.iterations, 0);
+                assert!(diagnostic.error.is_nan());
             }
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
         }
     }
 
     /// Detect a finite residual paired with a non-finite symbolic derivative.
     #[test]
     fn test_solver_reports_non_finite_jacobian_evaluation() {
-        for mode in test_modes() {
-            // sqrt(x)-1 is finite at x=0, but its derivative is positive
-            // infinity there.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::power(x, 0.5), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // sqrt(x)-1 is finite at x=0, but its derivative is positive
+        // infinity there.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 0.5), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("non-finite derivative must be reported explicitly");
-            match error {
-                SolverError::NonFiniteEvaluation(diagnostic) => {
-                    assert!(diagnostic.message.contains("Jacobian evaluation"));
-                    assert_eq!(diagnostic.error, 1.0);
-                }
-                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        let error = solver
+            .solve_once(initial)
+            .expect_err("non-finite derivative must be reported explicitly");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Jacobian evaluation"));
+                assert_eq!(diagnostic.error, 1.0);
             }
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
         }
     }
 
@@ -2621,75 +2534,63 @@ mod tests {
     /// singularity and demonstrate the caller-controlled algebraic rewrite.
     #[test]
     fn test_solver_requires_boundary_safe_expression_form() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
+        let x = Exp::var("x");
 
-            // Differentiating x*sqrt(x) with the product rule retains
-            // x*(0.5*x^-0.5). At x=0 that term evaluates as 0*infinity, so the
-            // exact symbolic Jacobian is NaN even though the residual is -1.
-            let boundary_singular = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::power(x.clone(), 0.5)), x.clone()),
-                Exp::val(1.0),
-            );
-            let solver = solver_for_mode(vec![boundary_singular], mode.clone());
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // Differentiating x*sqrt(x) with the product rule retains
+        // x*(0.5*x^-0.5). At x=0 that term evaluates as 0*infinity, so the
+        // exact symbolic Jacobian is NaN even though the residual is -1.
+        let boundary_singular = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::power(x.clone(), 0.5)), x.clone()),
+            Exp::val(1.0),
+        );
+        let solver = build_solver(vec![boundary_singular]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial.clone())
-                .expect_err("the written product has a non-finite derivative at zero");
-            match error {
-                SolverError::NonFiniteEvaluation(diagnostic) => {
-                    assert!(diagnostic.message.contains("Jacobian evaluation"));
-                    assert_eq!(diagnostic.error, 1.0);
-                }
-                other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        let error = solver
+            .solve_once(initial.clone())
+            .expect_err("the written product has a non-finite derivative at zero");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Jacobian evaluation"));
+                assert_eq!(diagnostic.error, 1.0);
             }
-
-            // x^(3/2) is algebraically identical for x>=0, but its symbolic
-            // derivative is finite at zero. This explicit model rewrite lets
-            // Newton iteration leave the domain boundary and certify the root.
-            let boundary_safe = Exp::sub(Exp::add(Exp::power(x.clone(), 1.5), x), Exp::val(1.0));
-            let solution = solver_for_mode(vec![boundary_safe], mode)
-                .solve_once(initial)
-                .expect("the rewritten expression has a finite boundary derivative");
-            assert!(solution.error < 1e-10);
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
         }
+
+        // x^(3/2) is algebraically identical for x>=0, but its symbolic
+        // derivative is finite at zero. This explicit model rewrite lets
+        // Newton iteration leave the domain boundary and certify the root.
+        let boundary_safe = Exp::sub(Exp::add(Exp::power(x.clone(), 1.5), x), Exp::val(1.0));
+        let solution = build_solver(vec![boundary_safe])
+            .solve_once(initial)
+            .expect("the rewritten expression has a finite boundary derivative");
+        assert!(solution.error < 1e-10);
     }
 
     #[test]
     fn test_with_equation_traces_rejects_invalid_length() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let x = Exp::var("x");
-            let eq = Exp::sub(x.clone(), Exp::val(1.0));
+        let x = Exp::var("x");
+        let eq = Exp::sub(x.clone(), Exp::val(1.0));
 
-            let solver = solver_for_mode(vec![eq], mode);
+        let solver = build_solver(vec![eq]);
 
-            let traces = vec![
-                Some(EquationTrace {
-                    constraint_id: 0,
-                    description: "eq0".to_string(),
-                }),
-                None,
-            ];
-            let err = match solver.with_equation_traces(traces) {
-                Ok(_) => panic!("expected invalid input for trace length mismatch"),
-                Err(err) => err,
-            };
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+        let traces = vec![
+            Some(EquationTrace {
+                constraint_id: 0,
+                description: "eq0".to_string(),
+            }),
+            None,
+        ];
+        let err = match solver.with_equation_traces(traces) {
+            Ok(_) => panic!("expected invalid input for trace length mismatch"),
+            Err(err) => err,
+        };
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("Equation trace length (2)"), "{}", msg);
+                assert!(msg.contains("number of equations (1)"), "{}", msg);
             }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("Equation trace length (2)"), "{}", msg);
-                    assert!(msg.contains("number of equations (1)"), "{}", msg);
-                }
-                other => panic!("expected InvalidInput, got {:?}", other),
-            }
+            other => panic!("expected InvalidInput, got {:?}", other),
         }
 
         // Empty systems must reject unreachable trace entries as strictly as
@@ -2755,119 +2656,96 @@ mod tests {
 
     #[test]
     fn test_line_search_preserves_fixed_variables() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Regression test: line search must preserve "fixed parameter" variables that are
-            // not part of `self.variables` but are referenced by equations.
-            //
-            // If line search drops them, evaluation errors and the solver fails.
-            let x = Exp::var("x");
-            let a = Exp::var("a");
-            let eq = Exp::sub(x.clone(), a.clone());
+        // Regression test: line search must preserve "fixed parameter" variables that are
+        // not part of `self.variables` but are referenced by equations.
+        //
+        // If line search drops them, evaluation errors and the solver fails.
+        let x = Exp::var("x");
+        let a = Exp::var("a");
+        let eq = Exp::sub(x.clone(), a.clone());
 
-            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("a".to_string(), 2.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("a".to_string(), 2.0);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("solver should converge when fixed variables are provided");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
-        }
+        let solution = solver
+            .solve_once(initial)
+            .expect("solver should converge when fixed variables are provided");
+        assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
     }
 
     /// Exercise a recoverable exponential Newton step that needs more than the
     /// former twenty backtracking trials.
     #[test]
     fn test_line_search_can_backtrack_beyond_twenty_trials() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
+        // At x=-20, exp(x)-1 has a Newton step of roughly 4.85e8. Steps as
+        // large as 2^-19 overflow or increase the residual, while a step of
+        // roughly 2^-25 enters a useful region and must be accepted.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+        let solver = build_solver(vec![equation])
+            .with_max_iterations(100)
+            .with_residual_tolerance(1e-10);
+        let initial = HashMap::from([("x".to_string(), -20.0)]);
 
-            // At x=-20, exp(x)-1 has a Newton step of roughly 4.85e8. Steps as
-            // large as 2^-19 overflow or increase the residual, while a step of
-            // roughly 2^-25 enters a useful region and must be accepted.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_max_iterations(100)
-                .with_residual_tolerance(1e-10);
-            let initial = HashMap::from([("x".to_string(), -20.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("deep backtracking should recover a finite step");
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("deep backtracking should recover a finite step");
-
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
-            }
-            assert!(solution.error < 1e-10);
-            assert!(solution.values["x"].abs() < 1e-8);
-        }
+        assert!(solution.error < 1e-10);
+        assert!(solution.values["x"].abs() < 1e-8);
     }
 
     /// Verify that the public line-search trial budget controls candidate
     /// exhaustion rather than serving as documentation-only metadata.
     #[test]
     fn test_line_search_honors_configured_trial_budget() {
-        for mode in test_modes() {
-            // The same exponential problem used by the deep-backtracking test
-            // cannot accept its first two Newton candidates. One permitted
-            // backtrack must test exactly alpha=1 and alpha=1/2 before failing.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode).with_max_backtracks(1);
-            let initial = HashMap::from([("x".to_string(), -20.0)]);
+        // The same exponential problem used by the deep-backtracking test
+        // cannot accept its first two Newton candidates. One permitted
+        // backtrack must test exactly alpha=1 and alpha=1/2 before failing.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_backtracks(1);
+        let initial = HashMap::from([("x".to_string(), -20.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("two rejected candidates must exhaust the configured search");
+        let error = solver
+            .solve_once(initial)
+            .expect_err("two rejected candidates must exhaust the configured search");
 
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("after 2 rejected candidate steps")
-                    );
-                    assert!(diagnostic.message.contains("last tested step was 5.00e-1"));
-                    assert!(diagnostic.message.contains("non-finite updates 0"));
-                    assert!(diagnostic.message.contains("non-finite residuals 2"));
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("insufficient Armijo decrease 0")
-                    );
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("last finite candidate residual none")
-                    );
-                    assert_eq!(diagnostic.values["x"], -20.0);
-                    assert!(diagnostic.gradient_norm.is_some());
-                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
-                    let attempt = diagnostic
-                        .last_linear_attempt
-                        .as_ref()
-                        .expect("the rejected candidate still followed a successful SVD attempt");
-                    assert_eq!(attempt.effective.rank, 1);
-                    assert_eq!(attempt.regularization, None);
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert_eq!(diagnostic.iterations, 0);
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("after 2 rejected candidate steps")
+                );
+                assert!(diagnostic.message.contains("last tested step was 5.00e-1"));
+                assert!(diagnostic.message.contains("non-finite updates 0"));
+                assert!(diagnostic.message.contains("non-finite residuals 2"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 0")
+                );
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.values["x"], -20.0);
+                assert!(diagnostic.gradient_norm.is_some());
+                assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
+                let attempt = diagnostic
+                    .last_linear_attempt
+                    .as_ref()
+                    .expect("the rejected candidate still followed a successful SVD attempt");
+                assert_eq!(attempt.effective.rank, 1);
+                assert_eq!(attempt.regularization, None);
             }
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
@@ -2875,37 +2753,35 @@ mod tests {
     /// domain failures in line-search exhaustion diagnostics.
     #[test]
     fn test_line_search_reports_insufficient_finite_decrease() {
-        for mode in test_modes() {
-            // At x=0.1, Newton's full correction for x^3-1 is about 33.3. The
-            // candidate remains finite but increases the residual substantially,
-            // so a one-trial budget must classify it as insufficient decrease.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::power(x, 3.0), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode).with_max_backtracks(0);
-            let initial = HashMap::from([("x".to_string(), 0.1)]);
+        // At x=0.1, Newton's full correction for x^3-1 is about 33.3. The
+        // candidate remains finite but increases the residual substantially,
+        // so a one-trial budget must classify it as insufficient decrease.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 3.0), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_backtracks(0);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("the finite full step must fail Armijo decrease");
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert!(diagnostic.message.contains("non-finite updates 0"));
-                    assert!(diagnostic.message.contains("non-finite residuals 0"));
-                    assert!(
-                        diagnostic
-                            .message
-                            .contains("insufficient Armijo decrease 1")
-                    );
-                    assert!(
-                        !diagnostic
-                            .message
-                            .contains("last finite candidate residual none")
-                    );
-                    assert_eq!(diagnostic.iterations, 0);
-                    assert_eq!(diagnostic.values["x"], 0.1);
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the finite full step must fail Armijo decrease");
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert!(diagnostic.message.contains("non-finite updates 0"));
+                assert!(diagnostic.message.contains("non-finite residuals 0"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 1")
+                );
+                assert!(
+                    !diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 0.1);
             }
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
@@ -2913,149 +2789,139 @@ mod tests {
     /// directional derivative.
     #[test]
     fn test_line_search_avoids_raw_directional_derivative_overflow() {
-        for mode in test_modes() {
-            // The raw objective derivative at x=0 is -1e400, but the derivative
-            // of the residual norm is the representable value -1e200. The full
-            // Newton step reaches the exact root and must not fail merely because
-            // the unused squared-residual objective has an unrepresentable slope.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::mul(Exp::val(1e200), x), Exp::val(1e200));
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // The raw objective derivative at x=0 is -1e400, but the derivative
+        // of the residual norm is the representable value -1e200. The full
+        // Newton step reaches the exact root and must not fail merely because
+        // the unused squared-residual objective has an unrepresentable slope.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(1e200), x), Exp::val(1e200));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("scale-safe residual-norm slope should permit the Newton step");
+        let solution = solver
+            .solve_once(initial)
+            .expect("scale-safe residual-norm slope should permit the Newton step");
 
-            assert_eq!(solution.values["x"], 1.0);
-            assert_eq!(solution.error, 0.0);
-        }
+        assert_eq!(solution.values["x"], 1.0);
+        assert_eq!(solution.error, 0.0);
     }
 
     /// Verify that exhaustion preserves the current state and reports failure
     /// instead of applying an untested minimum-step fallback.
     #[test]
     fn test_line_search_reports_constant_residual_as_stationary_non_root() {
-        for mode in test_modes() {
-            // Multiplying x by zero registers it as a solve variable while the
-            // residual remains exactly one for every possible candidate.
-            let x = Exp::var("x");
-            let equation = Exp::add(Exp::mul(x, Exp::val(0.0)), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode).with_max_iterations(2);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // Multiplying x by zero registers it as a solve variable while the
+        // residual remains exactly one for every possible candidate.
+        let x = Exp::var("x");
+        let equation = Exp::add(Exp::mul(x, Exp::val(0.0)), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_iterations(2);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("a constant residual is stationary but not a root");
-            let diagnostic = expect_stationary_non_root(error);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("a constant residual is stationary but not a root");
+        let diagnostic = expect_stationary_non_root(error);
 
-            // Stationarity is visible before line search attempts an unusable
-            // zero correction, so the unchanged initial state has zero updates.
-            assert_eq!(diagnostic.iterations, 0);
-            assert_eq!(diagnostic.values["x"], 0.0);
-            assert_eq!(diagnostic.error, 1.0);
-            assert_eq!(diagnostic.gradient_norm, Some(0.0));
-            assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
-        }
+        // Stationarity is visible before line search attempts an unusable
+        // zero correction, so the unchanged initial state has zero updates.
+        assert_eq!(diagnostic.iterations, 0);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.error, 1.0);
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
     }
 
     /// Confirm that a tiny Newton update reports diagnostics from the returned
     /// point rather than retaining the residual from before the update.
     #[test]
     fn test_tiny_update_recomputes_returned_residual() {
-        for mode in test_modes() {
-            // The exact update is only 1e-20, below the default tolerance, but
-            // it moves x from residual one to the exact root.
-            let x = Exp::var("x");
-            let equation = Exp::add(Exp::mul(Exp::val(1e20), x), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // The exact update is only 1e-20, below the default tolerance, but
+        // it moves x from residual one to the exact root.
+        let x = Exp::var("x");
+        let equation = Exp::add(Exp::mul(Exp::val(1e20), x), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("scaled linear root should solve");
+        let solution = solver
+            .solve_once(initial)
+            .expect("scaled linear root should solve");
 
-            let returned_residual = 1e20 * solution.values["x"] + 1.0;
-            assert_eq!(solution.iterations, 1);
-            assert_eq!(solution.error, returned_residual.abs());
-            assert_eq!(solution.error, 0.0);
-        }
+        let returned_residual = 1e20 * solution.values["x"] + 1.0;
+        assert_eq!(solution.iterations, 1);
+        assert_eq!(solution.error, returned_residual.abs());
+        assert_eq!(solution.error, 0.0);
     }
 
     /// Distinguish a stationary non-root error from a successful constraint root
     /// in an inconsistent overdetermined system.
     #[test]
     fn test_inconsistent_overdetermined_system_reports_stationarity() {
-        for mode in test_modes() {
-            // No x satisfies both equations. Their least-squares objective is
-            // stationary at x=0 with residual norm sqrt(2).
-            let x = Exp::var("x");
-            let equations = vec![
-                Exp::sub(x.clone(), Exp::val(1.0)),
-                Exp::add(x, Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // No x satisfies both equations. Their least-squares objective is
+        // stationary at x=0 with residual norm sqrt(2).
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("stationary least-squares state is not a constraint root");
-            let diagnostic = expect_stationary_non_root(error);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("stationary least-squares state is not a constraint root");
+        let diagnostic = expect_stationary_non_root(error);
 
-            assert_eq!(diagnostic.iterations, 0);
-            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
-            assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-10));
-            assert!(
-                diagnostic
-                    .relative_gradient_norm
-                    .is_some_and(|norm| norm < 1e-10)
-            );
-        }
+        assert_eq!(diagnostic.iterations, 0);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+        assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-10));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|norm| norm < 1e-10)
+        );
     }
 
     /// Verify strict stationary-non-root semantics do not depend on the number
     /// of equations relative to solve variables.
     #[test]
     fn test_stationary_non_root_error_is_shape_independent() {
-        for mode in test_modes() {
-            // Square case: two incompatible equations constrain x while y is a
-            // registered but unused solve variable. Their gradient cancels at
-            // the initial point even though neither residual is zero.
-            let square_x = Exp::var("square_x");
-            let square_y = Exp::var("square_y");
-            let square_zero_y = Exp::mul(square_y, Exp::val(0.0));
-            let square_equations = vec![
-                Exp::add(Exp::sub(square_x.clone(), Exp::val(1.0)), square_zero_y),
-                Exp::add(square_x, Exp::val(1.0)),
-            ];
-            let square_initial =
-                HashMap::from([("square_x".to_string(), 0.0), ("square_y".to_string(), 0.0)]);
+        // Square case: two incompatible equations constrain x while y is a
+        // registered but unused solve variable. Their gradient cancels at
+        // the initial point even though neither residual is zero.
+        let square_x = Exp::var("square_x");
+        let square_y = Exp::var("square_y");
+        let square_zero_y = Exp::mul(square_y, Exp::val(0.0));
+        let square_equations = vec![
+            Exp::add(Exp::sub(square_x.clone(), Exp::val(1.0)), square_zero_y),
+            Exp::add(square_x, Exp::val(1.0)),
+        ];
+        let square_initial =
+            HashMap::from([("square_x".to_string(), 0.0), ("square_y".to_string(), 0.0)]);
 
-            // Underdetermined case: the positive residual x^2 + 1 has a zero
-            // derivative at x=0, and multiplication by zero registers a second
-            // solve variable without changing the equation.
-            let wide_x = Exp::var("wide_x");
-            let wide_y = Exp::var("wide_y");
-            let wide_equations = vec![Exp::add(
-                Exp::add(Exp::power(wide_x, 2.0), Exp::val(1.0)),
-                Exp::mul(wide_y, Exp::val(0.0)),
-            )];
-            let wide_initial =
-                HashMap::from([("wide_x".to_string(), 0.0), ("wide_y".to_string(), 0.0)]);
+        // Underdetermined case: the positive residual x^2 + 1 has a zero
+        // derivative at x=0, and multiplication by zero registers a second
+        // solve variable without changing the equation.
+        let wide_x = Exp::var("wide_x");
+        let wide_y = Exp::var("wide_y");
+        let wide_equations = vec![Exp::add(
+            Exp::add(Exp::power(wide_x, 2.0), Exp::val(1.0)),
+            Exp::mul(wide_y, Exp::val(0.0)),
+        )];
+        let wide_initial =
+            HashMap::from([("wide_x".to_string(), 0.0), ("wide_y".to_string(), 0.0)]);
 
-            for (shape, equations, initial) in [
-                ("square", square_equations, square_initial),
-                ("underdetermined", wide_equations, wide_initial),
-            ] {
-                let error = solver_for_mode(equations, mode.clone())
-                    .solve_once(initial)
-                    .expect_err("a stationary non-root must never be successful");
-                let diagnostic = expect_stationary_non_root(error);
+        for (shape, equations, initial) in [
+            ("square", square_equations, square_initial),
+            ("underdetermined", wide_equations, wide_initial),
+        ] {
+            let error = build_solver(equations)
+                .solve_once(initial)
+                .expect_err("a stationary non-root must never be successful");
+            let diagnostic = expect_stationary_non_root(error);
 
-                assert_eq!(diagnostic.iterations, 0, "unexpected {shape} update");
-                assert!(diagnostic.error > 0.0, "missing {shape} residual");
-                assert_eq!(diagnostic.gradient_norm, Some(0.0));
-            }
+            assert_eq!(diagnostic.iterations, 0, "unexpected {shape} update");
+            assert!(diagnostic.error > 0.0, "missing {shape} residual");
+            assert_eq!(diagnostic.gradient_norm, Some(0.0));
         }
     }
 
@@ -3063,391 +2929,333 @@ mod tests {
     /// and residual-gradient products exceed the finite `f64` range.
     #[test]
     fn test_scaled_stationary_system_avoids_raw_gradient_overflow() {
-        for mode in test_modes() {
-            // At x=0 the residual and Jacobian norms are both infinite in f64,
-            // while their residual-gradient contributions are -1e616 and
-            // +1e616. Max-scaling the entries first exposes their exact finite
-            // cancellation instead of falling back from an undefined norm.
-            let x = Exp::var("x");
-            let scaled_x = Exp::mul(Exp::val(1.3e308), x);
-            let equations = vec![
-                Exp::sub(scaled_x.clone(), Exp::val(1.3e308)),
-                Exp::add(scaled_x, Exp::val(1.3e308)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // At x=0 the residual and Jacobian norms are both infinite in f64,
+        // while their residual-gradient contributions are -1e616 and
+        // +1e616. Max-scaling the entries first exposes their exact finite
+        // cancellation instead of falling back from an undefined norm.
+        let x = Exp::var("x");
+        let scaled_x = Exp::mul(Exp::val(1.3e308), x);
+        let equations = vec![
+            Exp::sub(scaled_x.clone(), Exp::val(1.3e308)),
+            Exp::add(scaled_x, Exp::val(1.3e308)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("normalized stationary non-root should survive raw overflow");
-            let diagnostic = expect_stationary_non_root(error);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("normalized stationary non-root should survive raw overflow");
+        let diagnostic = expect_stationary_non_root(error);
 
-            assert_eq!(diagnostic.gradient_norm, Some(0.0));
-            assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
-            assert!(diagnostic.error.is_infinite());
-        }
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert!(diagnostic.error.is_infinite());
     }
 
     /// Preserve a representable public gradient norm when reconstructing it
     /// requires three factors whose naive association underflows.
     #[test]
     fn test_gradient_diagnostic_uses_scale_safe_factor_reconstruction() {
-        for mode in test_modes() {
-            // At x=0, J^T*f is exactly 1e-308: only the first equation depends
-            // on x. Max-normalized stationarity remains correct, but multiplying
-            // scaled_dot by the tiny column scale before the large residual
-            // scale used to underflow the public absolute diagnostic to zero.
-            let x = Exp::var("x");
-            let equations = vec![
-                Exp::add(Exp::mul(Exp::val(1e-308), x), Exp::val(1.0)),
-                Exp::val(1e308),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // At x=0, J^T*f is exactly 1e-308: only the first equation depends
+        // on x. Max-normalized stationarity remains correct, but multiplying
+        // scaled_dot by the tiny column scale before the large residual
+        // scale used to underflow the public absolute diagnostic to zero.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::add(Exp::mul(Exp::val(1e-308), x), Exp::val(1.0)),
+            Exp::val(1e308),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("the non-zero residual is stationary at the initial point");
-            let diagnostic = expect_stationary_non_root(error);
-            let gradient_norm = diagnostic
-                .gradient_norm
-                .expect("stationarity evaluation must include its absolute norm");
-            let relative_error = (gradient_norm / 1e-308 - 1.0).abs();
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the non-zero residual is stationary at the initial point");
+        let diagnostic = expect_stationary_non_root(error);
+        let gradient_norm = diagnostic
+            .gradient_norm
+            .expect("stationarity evaluation must include its absolute norm");
+        let relative_error = (gradient_norm / 1e-308 - 1.0).abs();
 
-            assert!(gradient_norm > 0.0);
-            assert!(relative_error < 1e-12, "relative error: {relative_error:e}");
-        }
+        assert!(gradient_norm > 0.0);
+        assert!(relative_error < 1e-12, "relative error: {relative_error:e}");
     }
 
     /// Ensure one high-scale variable cannot hide a descent direction belonging
     /// to another variable before an exactly solvable system's first update.
     #[test]
     fn test_scaled_consistent_overdetermined_system_does_not_false_converge() {
-        for mode in test_modes() {
-            // At the origin the x column is exactly anti-parallel to the
-            // residual, but two unrelated y equations dominate the Jacobian's
-            // global Frobenius norm by nine orders of magnitude. A global
-            // normalization falls below the configured 1e-8 threshold even
-            // though the x=1 root is one ordinary Newton correction away.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let x_residual = Exp::sub(x, Exp::val(1.0));
-            let y_residual = Exp::mul(Exp::val(1e9), y);
-            let solver = solver_for_mode(vec![x_residual, y_residual.clone(), y_residual], mode)
-                .with_stationarity_tolerance(1e-8)
-                .with_regularization(0.0);
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        // At the origin the x column is exactly anti-parallel to the
+        // residual, but two unrelated y equations dominate the Jacobian's
+        // global Frobenius norm by nine orders of magnitude. A global
+        // normalization falls below the configured 1e-8 threshold even
+        // though the x=1 root is one ordinary Newton correction away.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let x_residual = Exp::sub(x, Exp::val(1.0));
+        let y_residual = Exp::mul(Exp::val(1e9), y);
+        let solver = build_solver(vec![x_residual, y_residual.clone(), y_residual])
+            .with_stationarity_tolerance(1e-8)
+            .with_regularization(0.0);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("a scaled consistent linear system should reach its root");
+        let solution = solver
+            .solve_once(initial)
+            .expect("a scaled consistent linear system should reach its root");
 
-            assert_eq!(solution.iterations, 1);
-            assert!((solution.values["x"] - 1.0).abs() < 1e-12);
-            assert_eq!(solution.values["y"], 0.0);
-            assert!(solution.error < 1e-12);
-        }
+        assert_eq!(solution.iterations, 1);
+        assert!((solution.values["x"] - 1.0).abs() < 1e-12);
+        assert_eq!(solution.values["y"], 0.0);
+        assert!(solution.error < 1e-12);
     }
 
     /// Classify a non-root zero-Jacobian point as stationary without claiming it
     /// is a successful least-squares minimum.
     #[test]
     fn test_zero_jacobian_nonminimum_is_stationary_non_root() {
-        for mode in test_modes() {
-            // Both equations have exact roots at +/-1. At x=0 their residual is
-            // non-zero and the squared-residual objective has a local maximum,
-            // even though the raw first derivative is zero.
-            let x = Exp::var("x");
-            let residual = Exp::sub(Exp::power(x, 2.0), Exp::val(1.0));
-            let solver =
-                solver_for_mode(vec![residual.clone(), residual], mode).with_max_iterations(1);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // Both equations have exact roots at +/-1. At x=0 their residual is
+        // non-zero and the squared-residual objective has a local maximum,
+        // even though the raw first derivative is zero.
+        let x = Exp::var("x");
+        let residual = Exp::sub(Exp::power(x, 2.0), Exp::val(1.0));
+        let solver = build_solver(vec![residual.clone(), residual]).with_max_iterations(1);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("a zero-Jacobian local maximum must not be successful");
+        let error = solver
+            .solve_once(initial)
+            .expect_err("a zero-Jacobian local maximum must not be successful");
 
-            let diagnostic = expect_stationary_non_root(error);
-            assert_eq!(diagnostic.iterations, 0);
-            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
-            assert_eq!(diagnostic.values["x"], 0.0);
-            assert_eq!(diagnostic.gradient_norm, Some(0.0));
-            assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
-        }
+        let diagnostic = expect_stationary_non_root(error);
+        assert_eq!(diagnostic.iterations, 0);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
     }
 
     /// Ensure Armijo reaches a non-zero residual floor without confusing small
     /// objective changes with failure.
     #[test]
     fn test_inconsistent_overdetermined_system_reaches_stationarity_from_away() {
-        let mut serial_diagnostic: Option<SolverRunDiagnostic> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
+        // The least-squares objective for these incompatible equations has
+        // its unique stationary point at x=0 and residual norm sqrt(2). The
+        // A former absolute residual-change rule stopped before `J^T f`
+        // met tolerance even though valid descent remained.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            // The least-squares objective for these incompatible equations has
-            // its unique stationary point at x=0 and residual norm sqrt(2). The
-            // A former absolute residual-change rule stopped before `J^T f`
-            // met tolerance even though valid descent remained.
-            let x = Exp::var("x");
-            let equations = vec![
-                Exp::sub(x.clone(), Exp::val(1.0)),
-                Exp::add(x, Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.1)]);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("Armijo should identify a stationary non-root");
+        let diagnostic = expect_stationary_non_root(error);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("Armijo should identify a stationary non-root");
-            let diagnostic = expect_stationary_non_root(error);
-
-            if is_serial {
-                serial_diagnostic = Some(diagnostic.clone());
-            } else {
-                let serial = serial_diagnostic
-                    .as_ref()
-                    .expect("serial diagnostic missing");
-                assert!((serial.values["x"] - diagnostic.values["x"]).abs() < 1e-10);
-                assert!((serial.error - diagnostic.error).abs() < 1e-10);
-            }
-            assert!(diagnostic.values["x"].abs() < 1e-8);
-            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
-            assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-8));
-            assert!(
-                diagnostic
-                    .relative_gradient_norm
-                    .is_some_and(|norm| norm < 1e-8)
-            );
-            let linear = diagnostic
-                .last_linear_attempt
-                .as_ref()
-                .expect("stationarity reached after an SVD correction");
-            assert_eq!(linear.regularization, None);
-        }
+        assert!(diagnostic.values["x"].abs() < 1e-8);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
+        assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-8));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|norm| norm < 1e-8)
+        );
+        let linear = diagnostic
+            .last_linear_attempt
+            .as_ref()
+            .expect("stationarity reached after an SVD correction");
+        assert_eq!(linear.regularization, None);
     }
 
     /// Confirm that line search uses the local least-squares slope rather than
     /// demanding an impossible fixed reduction near a non-zero residual floor.
     #[test]
     fn test_line_search_reaches_inconsistent_least_squares_stationarity() {
-        let mut serial_diagnostic: Option<SolverRunDiagnostic> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
+        // Moving from x=0.1 to x=0 only improves the residual norm by about
+        // half a percent because sqrt(2) is unavoidable. A valid Armijo test
+        // accepts that slope-consistent improvement, whereas the former 50%
+        // requirement rejected every possible positive step.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            // Moving from x=0.1 to x=0 only improves the residual norm by about
-            // half a percent because sqrt(2) is unavoidable. A valid Armijo test
-            // accepts that slope-consistent improvement, whereas the former 50%
-            // requirement rejected every possible positive step.
-            let x = Exp::var("x");
-            let equations = vec![
-                Exp::sub(x.clone(), Exp::val(1.0)),
-                Exp::add(x, Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.1)]);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("Armijo line search should reach a stationary non-root");
+        let diagnostic = expect_stationary_non_root(error);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("Armijo line search should reach a stationary non-root");
-            let diagnostic = expect_stationary_non_root(error);
-
-            if is_serial {
-                serial_diagnostic = Some(diagnostic.clone());
-            } else {
-                let serial = serial_diagnostic
-                    .as_ref()
-                    .expect("serial diagnostic missing");
-                assert!((serial.values["x"] - diagnostic.values["x"]).abs() < 1e-10);
-                assert!((serial.error - diagnostic.error).abs() < 1e-10);
-            }
-            assert!(diagnostic.values["x"].abs() < 1e-8);
-            assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
-        }
+        assert!(diagnostic.values["x"].abs() < 1e-8);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
     }
 
     /// Verify that the iteration count measures accepted updates rather than
     /// residual evaluations.
     #[test]
     fn test_exact_initial_root_reports_zero_iterations() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
-            let equation = Exp::sub(x, Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), 1.0)]);
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
 
-            let solution = solver.solve_once(initial).expect("initial point is a root");
+        let solution = solver.solve_once(initial).expect("initial point is a root");
 
-            assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.last_linear_attempt, None);
-        }
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.last_linear_attempt, None);
     }
 
     /// Enforce the documented inclusive residual threshold both before and
     /// after a Newton correction.
     #[test]
     fn test_residual_tolerance_boundary_is_successful() {
-        for mode in test_modes() {
-            // The initial residual norm is exactly one. Equality with the
-            // configured tolerance must certify this point without a linear
-            // solve or an accepted update.
-            let x = Exp::var("x");
-            let solver =
-                solver_for_mode(vec![x.clone()], mode.clone()).with_residual_tolerance(1.0);
-            let initial = HashMap::from([("x".to_string(), 1.0)]);
-            let solution = solver
-                .solve_once(initial)
-                .expect("a residual equal to tolerance must be successful");
+        // The initial residual norm is exactly one. Equality with the
+        // configured tolerance must certify this point without a linear
+        // solve or an accepted update.
+        let x = Exp::var("x");
+        let solver = build_solver(vec![x.clone()]).with_residual_tolerance(1.0);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("a residual equal to tolerance must be successful");
 
-            assert_eq!(solution.error, 1.0);
-            assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.last_linear_attempt, None);
-        }
+        assert_eq!(solution.error, 1.0);
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.last_linear_attempt, None);
     }
 
     /// Ensure an intentionally unbounded-looking iteration budget does not
     /// affect fixed-shape workspace construction before convergence is checked.
     #[test]
     fn test_large_iteration_budget_does_not_change_workspace_allocation() {
-        for mode in test_modes() {
-            // The initial point is an exact root, so only one history entry is
-            // required regardless of the permitted maximum number of updates.
-            let x = Exp::var("x");
-            let equation = Exp::sub(x, Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode).with_max_iterations(usize::MAX);
-            let initial = HashMap::from([("x".to_string(), 1.0)]);
+        // The initial point is an exact root, so only one history entry is
+        // required regardless of the permitted maximum number of updates.
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_iterations(usize::MAX);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("an exact root must not reserve the full update budget");
+        let solution = solver
+            .solve_once(initial)
+            .expect("an exact root must not reserve the full update budget");
 
-            assert_eq!(solution.iterations, 0);
-        }
+        assert_eq!(solution.iterations, 0);
     }
 
     #[test]
     fn test_least_squares_svd_handles_ill_conditioned_overdetermined_system_without_regularization()
     {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
-            // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
-            // lose the tiny distinguishing term and become singular in floating point. The
-            // canonical SVD should still retain and solve both singular directions.
-            let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
+        // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
+        // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
+        // lose the tiny distinguishing term and become singular in floating point. The
+        // canonical SVD should still retain and solve both singular directions.
+        let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
 
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
-            // b corresponds to solution (x,y) = (1,1)
-            let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
-            let eq2 = Exp::sub(
-                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
-                Exp::val(2.0 + eps),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
-                Exp::val(2.0 - eps),
-            );
+        // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
+        // b corresponds to solution (x,y) = (1,1)
+        let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
+        let eq2 = Exp::sub(
+            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
+            Exp::val(2.0 + eps),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
+            Exp::val(2.0 - eps),
+        );
 
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_regularization(0.0)
-                .with_max_iterations(10)
-                .with_residual_tolerance(1e-10);
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_regularization(0.0)
+            .with_max_iterations(10)
+            .with_residual_tolerance(1e-10);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("expected solver to converge with SVD least squares");
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge with SVD least squares");
 
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
-            }
-            // The matrix condition is roughly 2/eps, so a few ulps in the
-            // factorization can move the individual coordinates by more than
-            // the residual tolerance. Require accurate variables at the scale
-            // justified by that conditioning and retain the stricter root test
-            // through the solver's residual assertion.
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-7);
-            assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-7);
-            assert!(solution.error < 1e-10);
-        }
+        // The matrix condition is roughly 2/eps, so a few ulps in the
+        // factorization can move the individual coordinates by more than
+        // the residual tolerance. Require accurate variables at the scale
+        // justified by that conditioning and retain the stricter root test
+        // through the solver's residual assertion.
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-7);
+        assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-7);
+        assert!(solution.error < 1e-10);
     }
 
     /// Retain an independent direction whose coefficient is small because of
     /// caller units rather than floating-point rank loss.
     #[test]
     fn test_solver_does_not_truncate_solvable_small_coefficient_direction() {
-        for mode in test_modes() {
-            // The exact root is x=1, y=1e13. The former fixed 1e-12 relative
-            // cutoff dropped the y direction, accepted 100 zero corrections,
-            // and reported NoConvergence with y still at zero.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let equations = vec![
-                Exp::sub(x, Exp::val(1.0)),
-                Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode);
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        // The exact root is x=1, y=1e13. The former fixed 1e-12 relative
+        // cutoff dropped the y direction, accepted 100 zero corrections,
+        // and reported NoConvergence with y still at zero.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![
+            Exp::sub(x, Exp::val(1.0)),
+            Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("a direction above factorization roundoff must be retained");
+        let solution = solver
+            .solve_once(initial)
+            .expect("a direction above factorization roundoff must be retained");
 
-            assert_eq!(solution.iterations, 1);
-            assert_eq!(solution.values["x"], 1.0);
-            assert!((solution.values["y"] - 1e13).abs() < 1e-3);
-            assert!(solution.error <= solver.options().residual_tolerance);
-            assert_eq!(
-                solution
-                    .last_linear_attempt
-                    .as_ref()
-                    .expect("one correction must retain factorization diagnostics")
-                    .effective
-                    .rank,
-                2
-            );
-        }
+        assert_eq!(solution.iterations, 1);
+        assert_eq!(solution.values["x"], 1.0);
+        assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+        assert!(solution.error <= solver.options().residual_tolerance);
+        assert_eq!(
+            solution
+                .last_linear_attempt
+                .as_ref()
+                .expect("one correction must retain factorization diagnostics")
+                .effective
+                .rank,
+            2
+        );
     }
 
     /// Normalize variable coordinates so condition diagnostics and optional
     /// ridge penalties do not depend on the caller's chosen units.
     #[test]
     fn test_variable_scales_normalize_jacobian_columns() {
-        for mode in test_modes() {
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let equations = vec![
-                Exp::sub(x, Exp::val(1.0)),
-                Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
-            ];
-            let solver = solver_for_mode(equations, mode)
-                .with_variable_scales(HashMap::from([("y".to_string(), 1e13)]))
-                .expect("y has a positive finite characteristic scale");
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![
+            Exp::sub(x, Exp::val(1.0)),
+            Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations)
+            .with_variable_scales(HashMap::from([("y".to_string(), 1e13)]))
+            .expect("y has a positive finite characteristic scale");
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("normalized variable coordinates should solve");
-            let linear = solution
-                .last_linear_attempt
-                .expect("one correction must report its scaled factorization");
+        let solution = solver
+            .solve_once(initial)
+            .expect("normalized variable coordinates should solve");
+        let linear = solution
+            .last_linear_attempt
+            .expect("one correction must report its scaled factorization");
 
-            assert_eq!(solution.values["x"], 1.0);
-            assert!((solution.values["y"] - 1e13).abs() < 1e-3);
-            assert_eq!(linear.effective.rank, 2);
-            assert!((linear.effective.cond_est - 1.0).abs() < 1e-12);
-            assert_eq!(solver.variable_scale("x"), Some(1.0));
-            assert_eq!(solver.variable_scale("y"), Some(1e13));
-        }
+        assert_eq!(solution.values["x"], 1.0);
+        assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+        assert_eq!(linear.effective.rank, 2);
+        assert!((linear.effective.cond_est - 1.0).abs() < 1e-12);
+        assert_eq!(solver.variable_scale("x"), Some(1.0));
+        assert_eq!(solver.variable_scale("y"), Some(1e13));
     }
 
     /// Preserve finite caller-unit corrections across extreme scaling and
@@ -3474,296 +3282,255 @@ mod tests {
     /// scales span the complete finite exponent range.
     #[test]
     fn test_jacobian_scaling_does_not_underflow_representable_derivative() {
-        for mode in test_modes() {
-            // The normalized derivative is
-            // 1e308 * 1e-308 / 1e308 = 1e-308. Forming the scale ratio first
-            // underflows it to zero and falsely classifies x=0 as stationary;
-            // the normalized Newton correction is 1e308 and restores the
-            // ordinary caller-unit update x=1.
-            let x = Exp::var("x");
-            let equation = Exp::sub(Exp::mul(Exp::val(1e308), x), Exp::val(1e308));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_equation_scales(vec![1e308])
-                .expect("the equation has one positive characteristic scale")
-                .with_variable_scales(HashMap::from([("x".to_string(), 1e-308)]))
-                .expect("the solve variable has one positive characteristic scale");
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // The normalized derivative is
+        // 1e308 * 1e-308 / 1e308 = 1e-308. Forming the scale ratio first
+        // underflows it to zero and falsely classifies x=0 as stationary;
+        // the normalized Newton correction is 1e308 and restores the
+        // ordinary caller-unit update x=1.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(1e308), x), Exp::val(1e308));
+        let solver = build_solver(vec![equation])
+            .with_equation_scales(vec![1e308])
+            .expect("the equation has one positive characteristic scale")
+            .with_variable_scales(HashMap::from([("x".to_string(), 1e-308)]))
+            .expect("the solve variable has one positive characteristic scale");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("the representable normalized derivative must reach the root");
+        let solution = solver
+            .solve_once(initial)
+            .expect("the representable normalized derivative must reach the root");
 
-            assert_eq!(solution.iterations, 1);
-            assert!((solution.values["x"] - 1.0).abs() < 1e-12);
-            assert!(solution.error < 1e-12);
-        }
+        assert_eq!(solution.iterations, 1);
+        assert!((solution.values["x"] - 1.0).abs() < 1e-12);
+        assert!(solution.error < 1e-12);
     }
 
     /// Use equation characteristic scales consistently for least-squares
     /// weighting, convergence, stationarity, Armijo, and diagnostics.
     #[test]
     fn test_equation_scales_define_dimensionless_residual_objective() {
-        for mode in test_modes() {
-            // Raw least squares would let the second equation's factor 1000
-            // dominate and place x near two. Dividing it by its characteristic
-            // scale gives both physical constraints equal dimensionless weight,
-            // whose stationary point is x=1.5.
-            let x = Exp::var("x");
-            let equations = vec![
-                Exp::sub(x.clone(), Exp::val(1.0)),
-                Exp::mul(Exp::val(1000.0), Exp::sub(x, Exp::val(2.0))),
-            ];
-            let solver = solver_for_mode(equations, mode)
-                .with_equation_scales(vec![1.0, 1000.0])
-                .expect("one positive scale is supplied per equation");
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
+        // Raw least squares would let the second equation's factor 1000
+        // dominate and place x near two. Dividing it by its characteristic
+        // scale gives both physical constraints equal dimensionless weight,
+        // whose stationary point is x=1.5.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::mul(Exp::val(1000.0), Exp::sub(x, Exp::val(2.0))),
+        ];
+        let solver = build_solver(equations)
+            .with_equation_scales(vec![1.0, 1000.0])
+            .expect("one positive scale is supplied per equation");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("the equally weighted equations are inconsistent");
-            let diagnostic = expect_stationary_non_root(error);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the equally weighted equations are inconsistent");
+        let diagnostic = expect_stationary_non_root(error);
 
-            assert!((diagnostic.values["x"] - 1.5).abs() < 1e-12);
-            assert!((diagnostic.error - 0.5_f64.sqrt()).abs() < 1e-12);
-            assert!((diagnostic.equations[0].residual - 0.5).abs() < 1e-12);
-            assert!((diagnostic.equations[0].scaled_residual - 0.5).abs() < 1e-12);
-            assert!((diagnostic.equations[1].residual + 500.0).abs() < 1e-9);
-            assert!((diagnostic.equations[1].scaled_residual + 0.5).abs() < 1e-12);
-            assert_eq!(solver.equation_scales(), &[1.0, 1000.0]);
-        }
+        assert!((diagnostic.values["x"] - 1.5).abs() < 1e-12);
+        assert!((diagnostic.error - 0.5_f64.sqrt()).abs() < 1e-12);
+        assert!((diagnostic.equations[0].residual - 0.5).abs() < 1e-12);
+        assert!((diagnostic.equations[0].scaled_residual - 0.5).abs() < 1e-12);
+        assert!((diagnostic.equations[1].residual + 500.0).abs() < 1e-9);
+        assert!((diagnostic.equations[1].scaled_residual + 0.5).abs() < 1e-12);
+        assert_eq!(solver.equation_scales(), &[1.0, 1000.0]);
     }
 
     /// Ensure a nonlinear wide system certifies roots before mutation and still
     /// makes genuine minimum-norm residual corrections away from a root.
     #[test]
     fn test_nonlinear_underdetermined_solver_never_starves_corrections() {
-        for mode in test_modes() {
-            // The Jacobian row [y, x] rotates as either coordinate changes. The
-            // removed point-projection phase chased that row space and could
-            // starve residual corrections indefinitely.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_residual_tolerance(1e-12)
-                .with_regularization(0.0);
+        // The Jacobian row [y, x] rotates as either coordinate changes. The
+        // removed point-projection phase chased that row space and could
+        // starve residual corrections indefinitely.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
+        let solver = build_solver(vec![equation])
+            .with_residual_tolerance(1e-12)
+            .with_regularization(0.0);
 
-            let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
-            let solution = solver
-                .solve_once(exact_root)
-                .expect("an exact nonlinear root must remain unchanged");
-            assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.values["x"], 2.0);
-            assert_eq!(solution.values["y"], 0.5);
+        let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
+        let solution = solver
+            .solve_once(exact_root)
+            .expect("an exact nonlinear root must remain unchanged");
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.values["x"], 2.0);
+        assert_eq!(solution.values["y"], 0.5);
 
-            // Reuse the same compiled solver away from the root. Every accepted
-            // iteration must be a residual-reducing Newton correction.
-            let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
-            let solution = solver
-                .solve_once(initial)
-                .expect("a nonlinear wide system must execute Newton corrections");
-            assert!(solution.iterations > 0);
-            assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
-        }
+        // Reuse the same compiled solver away from the root. Every accepted
+        // iteration must be a residual-reducing Newton correction.
+        let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("a nonlinear wide system must execute Newton corrections");
+        assert!(solution.iterations > 0);
+        assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
     }
 
     /// Confirm that a wide solve preserves the initial Jacobian-null-space
     /// component by applying the unique minimum-norm Newton correction.
     #[test]
     fn test_underconstrained_solver_preserves_null_space_component() {
-        for mode in test_modes() {
-            // The initial point has x+y=0 and a large component in the [1,-1]
-            // null-space direction. The minimum correction is [0.5,0.5].
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode);
-            let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
+        // The initial point has x+y=0 and a large component in the [1,-1]
+        // null-space direction. The minimum correction is [0.5,0.5].
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("linear constraint should solve");
+        let solution = solver
+            .solve_once(initial)
+            .expect("linear constraint should solve");
 
-            assert!((solution.values["x"] - 10.5).abs() < 1e-10);
-            assert!((solution.values["y"] + 9.5).abs() < 1e-10);
-        }
+        assert!((solution.values["x"] - 10.5).abs() < 1e-10);
+        assert!((solution.values["y"] + 9.5).abs() < 1e-10);
     }
 
     /// Confirm that default settings accept a well-conditioned retained SVD
     /// subspace without changing policy merely because a variable is unused.
     #[test]
     fn test_rank_deficient_overconstrained_converges_with_default_settings() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+        // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-            let eq2 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
-                Exp::val(2.0),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
-                Exp::val(3.0),
-            );
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+            Exp::val(2.0),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+            Exp::val(3.0),
+        );
 
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(10);
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
-            assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
-        }
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge");
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+        assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
     }
 
     /// Confirm that a rank-deficient Jacobian is directly solvable without
     /// regularization when its Moore-Penrose correction is well conditioned.
     #[test]
     fn test_rank_deficient_overconstrained_converges_without_regularization() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Every equation constrains x while multiplication by zero keeps y
-            // present in the compiled variable table but absent from J's image.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+        // Every equation constrains x while multiplication by zero keeps y
+        // present in the compiled variable table but absent from J's image.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
 
-            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-            let eq2 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
-                Exp::val(2.0),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
-                Exp::val(3.0),
-            );
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+            Exp::val(2.0),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+            Exp::val(3.0),
+        );
 
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_regularization(0.0)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(10);
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_regularization(0.0)
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("the SVD pseudoinverse should solve without implicit regularization");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!((solution.values["x"] - 1.0).abs() < 1e-10);
-            assert!(solution.values["y"].abs() < 1e-10);
-        }
+        let solution = solver
+            .solve_once(initial)
+            .expect("the SVD pseudoinverse should solve without implicit regularization");
+        assert!((solution.values["x"] - 1.0).abs() < 1e-10);
+        assert!(solution.values["y"].abs() < 1e-10);
     }
 
     /// Confirm that a dependent square system uses the canonical SVD directly,
     /// even when augmented regularization is disabled.
     #[test]
     fn test_rank_deficient_square_system_converges_without_regularization() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
+        // Both equations describe the same line. Their 2-by-2 Jacobian is
+        // exactly rank one, so the Moore-Penrose correction selects
+        // x = y = 1/2 from the zero initial point.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
+        let solver = build_solver(vec![first_equation, second_equation])
+            .with_regularization(0.0)
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
 
-            // Both equations describe the same line. Their 2-by-2 Jacobian is
-            // exactly rank one, so the Moore-Penrose correction selects
-            // x = y = 1/2 from the zero initial point.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
-            let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
-            let solver = solver_for_mode(vec![first_equation, second_equation], mode)
-                .with_regularization(0.0)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(10);
+        // A symmetric initial point makes the pseudoinverse's minimum-norm
+        // choice deterministic and easy to distinguish from an arbitrary
+        // diagonal perturbation of the singular Jacobian.
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("the canonical SVD should solve dependent equations");
 
-            // A symmetric initial point makes the pseudoinverse's minimum-norm
-            // choice deterministic and easy to distinguish from an arbitrary
-            // diagonal perturbation of the singular Jacobian.
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
-            let solution = solver
-                .solve_once(initial)
-                .expect("the canonical SVD should solve dependent equations");
-
-            // Both execution modes must select the same pseudoinverse solution
-            // and terminate by satisfying the actual residual equations.
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!(solution.error < 1e-12);
-            assert!((solution.values["x"] - 0.5).abs() < 1e-10);
-            assert!((solution.values["y"] - 0.5).abs() < 1e-10);
-            let linear = solution
-                .last_linear_attempt
-                .expect("the accepted correction must retain SVD diagnostics");
-            assert_eq!(linear.effective.rank, 1);
-            assert_eq!(linear.regularization, None);
-        }
+        // The canonical serial traversal must select the pseudoinverse
+        // solution and terminate by satisfying the residual equations.
+        assert!(solution.error < 1e-12);
+        assert!((solution.values["x"] - 0.5).abs() < 1e-10);
+        assert!((solution.values["y"] - 0.5).abs() < 1e-10);
+        let linear = solution
+            .last_linear_attempt
+            .expect("the accepted correction must retain SVD diagnostics");
+        assert_eq!(linear.effective.rank, 1);
+        assert_eq!(linear.regularization, None);
     }
 
     /// Confirm that an explicitly regularized square solve uses the augmented
     /// ridge system rather than first applying its direct correction.
     #[test]
     fn test_ill_conditioned_square_system_uses_regularized_least_squares() {
-        for mode in test_modes() {
-            // This upper-triangular Jacobian has unit diagonal pivots but a
-            // condition estimate around 1e16. A direct square solve would jump
-            // to the exact root and bypass the configured ridge policy.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let first_equation = Exp::sub(
-                Exp::add(x, Exp::mul(Exp::val(1e8), y.clone())),
-                Exp::val(1e8 + 1.0),
-            );
-            let second_equation = Exp::sub(y, Exp::val(1.0));
-            let solver = solver_for_mode(vec![first_equation, second_equation], mode)
-                .with_residual_tolerance(1e-12)
-                .with_regularization(1e-8)
-                .with_max_iterations(1);
-            let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        // This upper-triangular Jacobian has unit diagonal pivots but a
+        // condition estimate around 1e16. A direct square solve would jump
+        // to the exact root and bypass the configured ridge policy.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let first_equation = Exp::sub(
+            Exp::add(x, Exp::mul(Exp::val(1e8), y.clone())),
+            Exp::val(1e8 + 1.0),
+        );
+        let second_equation = Exp::sub(y, Exp::val(1.0));
+        let solver = build_solver(vec![first_equation, second_equation])
+            .with_residual_tolerance(1e-12)
+            .with_regularization(1e-8)
+            .with_max_iterations(1);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-            let error = solver
-                .solve_once(initial)
-                .expect_err("one regularized update should not masquerade as an exact root");
+        let error = solver
+            .solve_once(initial)
+            .expect_err("one regularized update should not masquerade as an exact root");
 
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert_eq!(diagnostic.iterations, 1);
-                    assert!(diagnostic.values["x"].abs() < 0.1);
-                    assert!(diagnostic.error > 1e-12);
-                    let linear = diagnostic
-                        .last_linear_attempt
-                        .as_ref()
-                        .expect("regularized correction diagnostics must be retained");
-                    assert_eq!(linear.regularization, Some(1e-8));
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert_eq!(diagnostic.iterations, 1);
+                assert!(diagnostic.values["x"].abs() < 0.1);
+                assert!(diagnostic.error > 1e-12);
+                let linear = diagnostic
+                    .last_linear_attempt
+                    .as_ref()
+                    .expect("regularized correction diagnostics must be retained");
+                assert_eq!(linear.regularization, Some(1e-8));
             }
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
@@ -3773,7 +3540,7 @@ mod tests {
     fn test_regularization_uses_exact_configured_strength() {
         let x = Exp::var("x");
         let y = Exp::var("y");
-        let solver = solver_for_mode(vec![x, y], Mode::Serial).with_regularization(1e-8);
+        let solver = build_solver(vec![x, y]).with_regularization(1e-8);
 
         // The fixture is deliberately ill-conditioned, but conditioning no
         // longer selects or changes policy: positive regularization means the
@@ -3804,184 +3571,147 @@ mod tests {
 
     #[test]
     fn test_overconstrained_consistent_system_solves() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Overdetermined but consistent system: x = 1 and 2x = 2.
-            let x = Exp::var("x");
-            let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
-            let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
+        // Overdetermined but consistent system: x = 1 and 2x = 2.
+        let x = Exp::var("x");
+        let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
+        let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_residual_tolerance(1e-12)
-                .with_max_iterations(10);
+        let solver = build_solver(vec![eq1, eq2])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
 
-            let solution = solver
-                .solve_once(initial)
-                .expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
-        }
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge");
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_random_square_linear_systems() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
-            for case_index in 0..5 {
-                let n = 3;
-                let mut a = vec![vec![0.0; n]; n];
-                for (diagonal_index, row) in a.iter_mut().enumerate() {
-                    for coefficient in row.iter_mut() {
-                        *coefficient = rng.next_f64();
-                    }
-                    row[diagonal_index] += 2.0;
+        let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
+        for _ in 0..5 {
+            let n = 3;
+            let mut a = vec![vec![0.0; n]; n];
+            for (diagonal_index, row) in a.iter_mut().enumerate() {
+                for coefficient in row.iter_mut() {
+                    *coefficient = rng.next_f64();
                 }
+                row[diagonal_index] += 2.0;
+            }
 
-                let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
-                let mut b = vec![0.0; n];
-                for (rhs, row) in b.iter_mut().zip(&a) {
-                    *rhs = row
-                        .iter()
-                        .zip(x_true.iter())
-                        .map(|(coefficient, value)| coefficient * value)
-                        .sum();
-                }
+            let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let mut b = vec![0.0; n];
+            for (rhs, row) in b.iter_mut().zip(&a) {
+                *rhs = row
+                    .iter()
+                    .zip(x_true.iter())
+                    .map(|(coefficient, value)| coefficient * value)
+                    .sum();
+            }
 
-                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-                let equations: Vec<Exp> = (0..n)
-                    .map(|i| linear_equation(&a[i], &vars, b[i]))
-                    .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+            let equations: Vec<Exp> = (0..n)
+                .map(|i| linear_equation(&a[i], &vars, b[i]))
+                .collect();
 
-                let solver = solver_for_mode(equations, mode.clone())
-                    .with_residual_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(equations)
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
+            }
 
-                let solution = solver.solve_once(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
-                }
-                for (i, expected_value) in x_true.iter().enumerate() {
-                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - expected_value).abs() < 1e-8);
-                }
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            for (i, expected_value) in x_true.iter().enumerate() {
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - expected_value).abs() < 1e-8);
             }
         }
     }
 
     #[test]
     fn test_random_overconstrained_linear_systems() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0xa11c_e551_dead_beef);
-            let m = 5;
-            let n = 3;
+        let mut rng = TestRng::new(0xa11c_e551_dead_beef);
+        let m = 5;
+        let n = 3;
 
-            for case_index in 0..5 {
-                let mut a = vec![vec![0.0; n]; m];
-                for row in &mut a {
-                    for coefficient in row {
-                        *coefficient = rng.next_f64();
-                    }
+        for _ in 0..5 {
+            let mut a = vec![vec![0.0; n]; m];
+            for row in &mut a {
+                for coefficient in row {
+                    *coefficient = rng.next_f64();
                 }
-                for (diagonal_index, row) in a.iter_mut().take(n).enumerate() {
-                    row[diagonal_index] += 2.0;
-                }
+            }
+            for (diagonal_index, row) in a.iter_mut().take(n).enumerate() {
+                row[diagonal_index] += 2.0;
+            }
 
-                let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
-                let mut b = vec![0.0; m];
-                for (rhs, row) in b.iter_mut().zip(&a) {
-                    *rhs = row
-                        .iter()
-                        .zip(x_true.iter())
-                        .map(|(coefficient, value)| coefficient * value)
-                        .sum();
-                }
+            let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let mut b = vec![0.0; m];
+            for (rhs, row) in b.iter_mut().zip(&a) {
+                *rhs = row
+                    .iter()
+                    .zip(x_true.iter())
+                    .map(|(coefficient, value)| coefficient * value)
+                    .sum();
+            }
 
-                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-                let equations: Vec<Exp> = (0..m)
-                    .map(|i| linear_equation(&a[i], &vars, b[i]))
-                    .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+            let equations: Vec<Exp> = (0..m)
+                .map(|i| linear_equation(&a[i], &vars, b[i]))
+                .collect();
 
-                let solver = solver_for_mode(equations, mode.clone())
-                    .with_residual_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(equations)
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
+            }
 
-                let solution = solver.solve_once(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
-                }
-                for (i, expected_value) in x_true.iter().enumerate() {
-                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - expected_value).abs() < 1e-8);
-                }
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            for (i, expected_value) in x_true.iter().enumerate() {
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - expected_value).abs() < 1e-8);
             }
         }
     }
 
     #[test]
     fn test_random_underdetermined_min_norm_structure() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
-            let _m = 2;
-            let n = 4;
-            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+        let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
+        let _m = 2;
+        let n = 4;
+        let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
 
-            for case_index in 0..5 {
-                let b0 = rng.next_f64();
-                let b1 = rng.next_f64();
-                let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
-                let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
-                let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
-                let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
+        for _ in 0..5 {
+            let b0 = rng.next_f64();
+            let b1 = rng.next_f64();
+            let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
+            let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
+            let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
+            let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
 
-                let solver = solver_for_mode(vec![eq1, eq2], mode.clone())
-                    .with_residual_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(vec![eq1, eq2])
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
-
-                let solution = solver.solve_once(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-10);
-                }
-                assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
-                assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
-                assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
-                assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
             }
+
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
+            assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
+            assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
+            assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
         }
     }
 }
