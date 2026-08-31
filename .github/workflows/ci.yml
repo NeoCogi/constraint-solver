@@ -47,7 +47,7 @@ jobs:
       # Linux builds GLFW from its bundled source because the crate's
       # `prebuilt-libs` feature only supplies binaries on Windows and macOS.
       # Install every X11 development header required by GLFW's CMake checks so
-      # all-target validation can compile the interactive IK example.
+      # the following feature-enabled IK validation can compile the example.
       - name: Install GLFW X11 build dependencies
         run: |
           sudo apt-get update
@@ -133,9 +133,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # Clippy and all-target tests compile the GLFW example on Linux. The
-      # runner image does not include the X11 development headers needed when
-      # glfw-sys falls back to its bundled source build.
+      # All-feature Clippy and the explicit GLFW example tests compile the
+      # native example on Linux. The runner image does not include the X11
+      # development headers needed when glfw-sys builds its bundled source.
       - name: Install GLFW X11 build dependencies
         run: |
           sudo apt-get update

@@ -717,9 +717,10 @@ impl Matrix {
         )?;
 
         // A relative threshold keeps the cutoff tied to the computed spectrum
-        // under uniform unit changes instead of imposing an application-scale
-        // floor. The strict comparison deliberately classifies an all-zero
-        // factor as rank zero when both the maximum and tolerance are zero.
+        // under uniform coefficient scaling instead of imposing an
+        // application-scale floor. The strict comparison deliberately
+        // classifies an all-zero factor as rank zero when both the maximum and
+        // tolerance are zero.
         let max_singular_value = workspace
             .singular_values
             .iter()

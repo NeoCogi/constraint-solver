@@ -13,6 +13,10 @@ A small `f64` constraint-solving core for nonlinear systems. This crate provides
 
 This crate is intentionally CAD-agnostic and focuses on the math/solver core. Architected by humans and coded with LLM.
 
+Version 0.3 is pre-alpha. APIs and numerical contracts may be replaced when
+concrete geometry, electronics, or robotics cases show that a simpler or more
+useful model is needed.
+
 ## Usage
 
 Add the 0.3 release to your `Cargo.toml`:
@@ -43,16 +47,19 @@ The solver supports all three system shapes:
   coordinates. Unit variable scales preserve the current caller-coordinate
   Jacobian-null-space component; configured scales weight that choice.
 - Over-constrained systems (equations > variables): solved via SVD least
-  squares. `Ok(Solution)` still requires the residual tolerance; an inconsistent
-  system whose residual is orthogonal to every Jacobian column returns
-  `SolverError::StationaryNonRoot` with its residual and gradient diagnostics.
+  squares. `Ok(Solution)` still requires the residual tolerance; a non-root with
+  no representable right-hand-side projection into the retained SVD column space
+  returns `SolverError::StationaryNonRoot` with its residual, gradient, and
+  factorization diagnostics.
 
 Every system shape has the same success contract: `Ok(Solution)` means the
 returned equation-scale-normalized residual norm is less than or equal to
 `SolverOptions::residual_tolerance`. All scales default to one, so this is the
-ordinary residual norm unless scaling is explicitly configured. A first-order
-stationary point whose scaled residual remains too large is an error even for a
-square or under-constrained system.
+ordinary residual norm unless scaling is explicitly configured. A non-root
+whose retained SVD model has zero representable right-hand-side
+projection is an error, even for a square or under-constrained system. This does
+not claim that the nonlinear point is a local minimum; maxima and saddles can
+have the same retained-model result.
 
 ## Scaling and units
 
@@ -285,17 +292,17 @@ cargo test
 ### Real-world validation traces
 
 The integration suite reuses shared electronic and geometric builders for 100
-warm-started samples per scenario. Electronic coverage includes an AC diode
-clipper, diode logic, saturated bipolar inverter/NAND logic, CMOS inverter/NAND
-logic, an RC low-pass filter, and a common-emitter amplifier. MOS devices are
-described as CMOS rather than TTL because TTL specifically denotes bipolar
-transistor logic. The compact smooth device models are solver validation
+samples per scenario, using each accepted solution as the next sample's warm
+start. Electronic coverage includes an AC diode clipper, diode logic, bipolar
+inverter/NAND logic, CMOS inverter/NAND logic, an RC low-pass filter, and a
+common-emitter amplifier. TTL names a specific bipolar logic family and does not
+describe MOS networks. The compact smooth device models are solver validation
 fixtures, not a replacement for a production SPICE implementation.
 
-Geometry coverage tracks a common line tangent to two moving circles and a
-rigid six-circle triangular packing. Six planar circles cannot all be pairwise
-tangent; the packing realizes nine contact edges and checks every other pair
-for non-overlap.
+Geometry coverage tracks a common line tangent to one fixed and one moving
+circle and a rigid six-circle triangular packing. Six planar circles cannot all
+be pairwise tangent; the packing realizes nine contact edges and checks every
+other pair for non-overlap.
 
 Successful output is captured during ordinary test runs. Show each complete
 CSV time series with:
@@ -308,9 +315,9 @@ cargo test --test real_world_geometry -- --show-output
 ## Benchmarks
 
 Benchmarks are in `benches/linear_algebra.rs` and measure the core matrix
-operations used by the solver. Dense multiplication and transpose cover square
-and long-inner-dimension workloads; bounded square, tall, wide, and
-rank-deficient groups measure the canonical Jacobi SVD.
+operations used by the solver. Dense multiplication covers square and
+long-inner-dimension workloads, transpose covers square matrices, and bounded
+square, tall, wide, and rank-deficient groups measure the canonical Jacobi SVD.
 
 ```bash
 cargo bench --features benchmarks
@@ -329,14 +336,14 @@ the harness on the target machine when making performance decisions.
   weighted correction metric instead.
 - Least squares solving uses one one-sided Jacobi SVD pseudoinverse for every
   matrix shape and rank. This avoids normal equations and the former
-  order-sensitive QR pre-classification. Rank uses the scale-relative threshold
-  `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
-  level cutoff. Column permutations have the same mathematical singular
-  spectrum, while uniform unit changes multiply that spectrum by one common
-  factor; practical fixtures away from the cutoff retain the same directions. A
-  singular value near the cutoff can still cross it because of ordinary input
-  rounding or Jacobi traversal order, so the reported numerical rank is a
-  diagnostic rather than an exact algebraic proof.
+  order-sensitive QR pre-classification. The relative rank factor is
+  `f64::EPSILON * max(rows, columns)`; a direction is retained only when
+  `sigma_i > sigma_max * factor`. Column permutations have the same mathematical
+  singular spectrum, while uniform coefficient scaling multiplies that spectrum
+  by one common factor; practical fixtures away from the cutoff retain the same
+  directions. A singular value near the cutoff can still cross it because of
+  ordinary input rounding or Jacobi traversal order, so the reported numerical
+  rank is a diagnostic rather than an exact algebraic proof.
   Each singular solution contribution forms its products and quotients through
   binary-exponent scaling, then rounds to `f64` before an ordinary compensated
   component-order sum. A non-finite contribution or partial total is a
@@ -349,7 +356,7 @@ the harness on the target machine when making performance decisions.
   overflow. Multiplication uses compensated ordinary `f64` dot products: it
   improves finite summation error but deliberately does not rescue an
   overflowing product or partial sum through hidden exponent-range extension.
-  Rescale the model or retry through solver policy after such an error.
+  Rescale the model before retrying after such an error.
   `transpose_into` is a bitwise copy and therefore preserves special values.
   Constructors remain the explicit allocation boundary and panic when a
   requested shape or allocation is impossible.

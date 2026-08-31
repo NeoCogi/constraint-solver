@@ -6,187 +6,110 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- Removed the `Mode` abstraction, dedicated Rayon pools, and parallel matrix
-  entry points. Solver arithmetic now has one serial traversal order, Rayon is
-  no longer a default dependency, and independent solves remain safe to run on
-  separate application threads.
-- Replaced allocating matrix arithmetic and infallible operator traits with
-  checked `*_into` operations over caller-owned buffers. Arithmetic now rejects
-  non-finite operands consistently in debug and release builds and reports
-  unrepresentable completed results without hiding errors behind operator
-  panics.
-- Added caller-owned `LeastSquaresWorkspace` and `SolverWorkspace` storage.
-  Least-squares factorization, SVD corrections, residual evaluation,
-  and line-search candidates now reuse fixed allocations across iterations and
-  repeated solve calls; the public solve API requires that storage explicitly.
-- Removed `Solution::convergence_history`; retaining an unbounded per-iteration
-  vector conflicts with fixed numerical storage, while final error, gradient,
-  accepted-update count, and last linear attempt remain explicit diagnostics.
-- Reduced line-search configuration to one `max_backtracks` count. Every search
-  now tests `alpha = 1` first, uses a fixed Armijo coefficient of `1e-4`, halves
-  only when another candidate is permitted, and reports the exact final tested
-  alpha rather than a newly computed untested value. Levenberg–Marquardt and
-  trust-region globalization remain explicitly future work.
-## [0.3.0] - 2026-08-30
+## [0.3.0] - 2026-08-31
 
 ### Added
 
-- Added a one-sided Jacobi SVD for square, tall, and wide least-squares systems,
-  including minimum-norm Moore-Penrose solutions.
-- Added singular-value rank and condition metadata to the canonical
-  `LeastSquaresSolution` result.
-- Added `last_linear_attempt` diagnostics to successful solutions and failed
-  runs, preserving the most recent `LeastSquaresInfo` even when line search
-  later rejected its correction.
-- Added `SolverOptions` as the documented source of nonlinear iteration and
-  Armijo policy.
-- Added structured equation diagnostics and optional caller-provided equation
-  traces to make failed constraints identifiable without parsing messages.
-- Added explicit positive equation and variable characteristic scales. Equation
-  scales define dimensionless residual weighting and success. Variable scales
-  define the minimum-norm correction metric in normalized coordinates, and
-  accepted corrections are converted back to caller units.
-- Added structured matrix errors for recoverable operand-shape mismatches,
-  non-finite states, and failed convergence. Fatal dimension or allocation
-  failures panic with the requested matrix shape.
+- Added one-sided Jacobi-SVD least-squares solving through
+  `Matrix::solve_least_squares_into` for square, tall, and wide systems. The
+  caller supplies `LeastSquaresWorkspace`, and `LeastSquaresInfo` reports the
+  retained rank, condition estimate, right-hand-side projection fraction, and
+  residual-norm slope.
+- Added caller-owned `SolverWorkspace` storage and made the public `solve` API
+  use it explicitly. Residual, Jacobian, candidate, correction, and SVD buffers
+  are allocated once and reused across iterations and sequential solves.
+- Added `SolverOptions` with the three current policy fields:
+  `max_iterations`, `residual_tolerance`, and `max_backtracks`.
+- Added positive equation and variable characteristic scales. Equation scales
+  define residual weighting and success; variable scales define the
+  minimum-norm correction metric in normalized coordinates before corrections
+  are converted back to caller units.
+- Added compiled-system metadata, optional equation traces, raw and scaled
+  per-equation failure diagnostics, and direct `LeastSquaresInfo` attempt
+  provenance on successful and failed runs.
+- Added structured matrix and solver errors for recoverable shape, finite-state,
+  factorization, and nonlinear-run failures. Impossible `Matrix` shapes and
+  `Matrix` storage requests remain explicit fatal panics.
+- Added arithmetic operators for owned and borrowed `Exp` values and `f64`
+  constants, plus quoted and escaped expression-variable diagnostics.
 - Added executable crate documentation, compiled README examples, complete
-  public API documentation, and the `missing_docs` lint.
-- Added an explicit package allowlist so repository workflows, ignore rules,
-  and future local tooling files are not published with the crate.
-- Added arithmetic operator implementations for owned and borrowed `Exp`
-  values and `f64` constants so equations can mirror their mathematical form.
-- Added shared modified-nodal-analysis integration infrastructure and 100-step
-  diode, bipolar, MOS, RC, and amplifier waveform validations.
-- Added shared geometric entities and tangency constraints with 100-step common
-  tangent-line and rigid six-circle packing validations.
-- Added CI gates for Rust 1.86, current stable Rust, Windows and macOS library
-  builds, RustSec advisories, formatting, Clippy, debug and optimized tests,
-  headless examples, documentation tests, warning-free all-feature public docs,
-  benchmark fixture execution, and package verification.
+  public API documentation, an explicit package allowlist, and a `missing_docs`
+  lint.
+- Added 100-sample KCL-based electronics and geometric continuation fixtures,
+  five headless inverse-kinematics model tests, and self-checking CAD and circuit
+  examples.
+- Added locked CI gates for Rust 1.86 on Linux, Windows, and macOS; RustSec;
+  formatting; all-feature Clippy; debug and optimized tests; the optional GLFW
+  model; headless examples; doctests and warning-free public docs; benchmark
+  fixtures; and package verification.
 
 ### Changed
 
-- Made success strict and shape-independent: `Ok(Solution)` now certifies only
-  `residual_norm <= residual_tolerance`; every stationary non-root returns
-  `SolverError::StationaryNonRoot`, including square and underdetermined cases.
-- Replaced the overlapping least-squares entry points and competing QR/SVD
-  dispatcher with one canonical `solve_least_squares` SVD operation returning a
-  diagnostic result. Compatibility aliases from the pre-alpha API were
-  intentionally removed.
-- Removed the standalone LU decomposition and solve API together with its
-  exclusive error variants and tests. Canonical Jacobi SVD is now the only
-  maintained matrix factorization policy.
-- Unified nonlinear Jacobian correction policy across every shape and rank.
-  The SVD pseudoinverse supplies every correction directly.
-- Replaced the public fixed rank cutoff with the factorization-derived relative
-  threshold `f64::EPSILON * max(rows, columns)`. `solve_least_squares` no longer
-  accepts `LeastSquaresOptions`; SVD rank classification has one automatic policy.
-- Removed condition-triggered regularization, retry schedules, and the explicit
-  ridge alternate path. Rank and condition estimates remain diagnostics and do
-  not change the equation being solved.
-- Replaced the ordinary/adaptive-damping and optional-line-search split with one
-  transactional Armijo update path for every `solve` call. Removed
-  `solve_with_line_search`, `with_damping`, and `min_damping`; the explicit
-  `initial_step_size` now caps the first candidate tested on each correction.
-- Removed redundant `Mode` convenience constructors and mode-specific solver
-  constructors. Callers now select the explicit enum variant through the single
-  `with_mode` builder after ordinary solver construction.
-- Applied one numerical default policy to square, tall, and wide systems instead
-  of silently changing iteration or step-size defaults based on Jacobian shape.
-- Changed Armijo line search to operate directly on the scaled residual norm
-  with a scale-safe directional derivative in normalized coordinates.
-- Removed origin-based point projection from nonlinear iteration; every wide
-  system now uses one minimum-norm Newton correction per accepted update.
-- Cached simplified symbolic derivatives at solver construction while keeping
-  independent reusable numerical workspaces for every solve invocation.
-- Restricted the compiled-expression Jacobian to crate scope and removed the
-  unreachable public `MatrixError::RankDeficient` variant.
-- Based parallel multiplication scheduling on complete scalar work. The compact
-  Jacobi SVD is deterministic and serial in both solver execution modes.
-- Made Criterion benchmarks opt-in through the `benchmarks` feature and removed
-  machine-specific timing tables from the README.
-- Made the interactive GLFW inverse-kinematics example and its native windowing
-  dependencies opt-in through `glfw-example`; ordinary builds and tests no
-  longer require platform window-system development packages, while CI enables
-  the feature explicitly for its five headless model regressions.
-- Added bounded canonical Jacobi-SVD benchmarks for full-rank square, tall,
-  wide, and rank-deficient systems, separate from larger dense-operation sizes.
-- Declared Rust 1.86 as the MSRV, refreshed all compatible locked dependencies,
-  and required CI builds to use the committed dependency graph.
-- Extended the Rust 1.86 all-target gate to Windows and macOS so the MSRV claim
-  covers platform-specific examples and development dependencies rather than a
-  Linux-only repository graph.
+- Replaced the former LU/QR dispatcher, damping and ridge paths, and overlapping
+  least-squares entry points with one normalized Jacobi-SVD pseudoinverse path.
+  Rank and condition are diagnostics and do not select another equation or
+  factorization policy.
+- Made nonlinear success strict and shape-independent: `Ok(Solution)` certifies
+  only that the equation-scaled residual norm is at or below
+  `residual_tolerance`. A non-root with no representable right-hand-side
+  projection into the retained SVD column space returns
+  `SolverError::StationaryNonRoot`.
+- Derived the nonlinear correction, retained-model reducibility decision, and
+  Armijo residual-norm slope from the same SVD attempt. Gradient norms remain
+  descriptive diagnostics rather than an independently tuned termination rule.
+- Replaced competing nonlinear update modes with one transactional Armijo
+  policy: test the full correction, then permit at most `max_backtracks`
+  deterministic halvings. Rejected candidates never mutate the accepted state
+  or consume an accepted-update count.
+- Removed `Mode`, dedicated Rayon pools, parallel matrix entry points, and
+  mode-specific constructors. Solver arithmetic now has one serial traversal;
+  applications can still run independent solves on separate threads with
+  distinct workspaces.
+- Replaced allocating matrix arithmetic and infallible operator traits with
+  checked `add_into`, `sub_into`, `mul_into`, `scale_into`, and
+  `transpose_into` operations over exact-shape caller buffers.
+- Removed unbounded convergence history and alternate solver entry points.
+  Final residual, gradient, accepted-update count, equation state, and last SVD
+  attempt remain available as concrete diagnostics.
+- Replaced the caller-selected rank cutoff with one spectrum-relative policy.
+  With `factor = f64::EPSILON * max(rows, columns)`, a direction is retained only
+  when `sigma_i > sigma_max * factor`. The reported rank is a floating-point
+  diagnostic: column permutations preserve the exact singular spectrum and
+  uniform coefficient scaling multiplies it by one common factor, but rounding
+  can change classification near the cutoff.
+- Declared Rust 1.86 as the MSRV, made Criterion benchmarks and the native GLFW
+  example opt-in features, and removed machine-specific benchmark timings from
+  the README.
 
 ### Fixed
 
-- Corrected the documented `f64` scalar scope, factorization allocation
-  behavior, underdetermined policy, and line-search example.
-- Replaced self-comparison in randomized Jacobian coverage with an analytical
-  oracle and added a headless end-to-end solve for the graphical IK model.
-- Preserved structured `MatrixError` values through contextual
-  `SolverError::Matrix` failures, including the complete accepted variable,
-  residual, gradient, equation-trace, iteration, and prior-attempt state.
-  Already-computed gradient measures are also retained in every
-  `NoConvergence` diagnostic.
-- Prevented avoidable factor-order range failures in Jacobian normalization,
-  physical updates, residual-norm slopes, and individual SVD reconstruction
-  contributions through binary-exponent product and quotient formation. Dot
-  products and cross-component reconstruction remain ordinary compensated
-  `f64`: a non-finite term or partial total is rejected even if later
-  cancellation could produce a finite mathematical result.
-- Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
-  algebraically independent small-coefficient directions above factorization
-  roundoff, preventing repeated zero corrections on solvable systems.
-- Made the documented maximum stationarity tolerance inclusive, matching the
-  residual-tolerance boundary instead of consuming another iteration when the
-  measured cosine is exactly equal to the configured threshold.
-- Applied equation and variable scaling consistently to residual success,
-  stationarity, Armijo acceptance, rank and condition diagnostics, the
-  linearized correction, and failure diagnostics, which retain both raw and
-  scaled per-equation residuals.
-- Removed the unpivoted QR pre-classification that made the former dispatcher
-  strongly column-order-sensitive. Rank and correction now come from the same
-  Jacobi SVD, with ordinary floating-point sensitivity when a singular value is
-  near the cutoff. Uniform coefficient normalization also prevents finite
-  extreme-scale systems from overflowing during factorization, including cases
-  whose unscaled largest singular value exceeds `f64::MAX` while the final
-  solution remains finite.
-- Deflated roundoff-sized Jacobi columns at the same numerical-rank boundary
-  used by the pseudoinverse, preventing exact rank-deficient systems such as the
-  graphical IK startup pose from cycling until factorization exhaustion.
-- Scaled right-hand sides before compensated singular-vector projection so
-  large intermediate terms cannot overflow when cancellation leaves a finite
-  least-squares solution.
-- Stopped preallocating convergence history from an untrusted iteration limit;
-  history now grows only as accepted updates are observed.
-- Checked all derived matrix element counts before allocation, with explicit
-  fatal diagnostics for impossible shapes.
-- Returned immediately from transpose and multiplication when their checked
-  result has zero storage, so valid shapes such as `usize::MAX x 0` do not loop
-  over logical dimensions that contain no elements.
-- Rejected NaN, infinity, and finite-input arithmetic overflow at expression,
-  Jacobian, update, and matrix-solve boundaries.
-- Corrected accepted-iteration accounting and refreshed residuals after every
-  update so returned values, errors, histories, and diagnostics describe the
-  same numerical state.
-- Reused accepted Armijo residuals as the next solver state, eliminating
-  repeated evaluation and an unreachable duplicate success branch. Corrections
-  that cannot change any variable now terminate without consuming updates.
-- Made line-search trial limits and initial step sizes authoritative and stopped
-  rejected candidates from being counted as accepted solver updates.
-- Documented exact symbolic differentiation at domain boundaries and added a
-  regression distinguishing a non-finite written derivative from a safe
-  algebraic rewrite; no hidden finite-difference fallback is performed.
-- Corrected the Matrix documentation to distinguish recoverable operand-shape
-  errors, fatal resource failures, general arithmetic, and the stricter
-  finite-value contract enforced by factorization and solver boundaries.
-- Made every headless example assert its known numerical outcome and removed a
-  duplicated legacy matrix-test module with stale nonlinear-LU assumptions.
-- Hardened the GLFW inverse-kinematics example's failure reporting, recovery,
-  buffer synchronization, target geometry, and OpenGL resource cleanup.
-- Updated the locked `crossbeam-epoch` dependency to resolve RUSTSEC-2026-0204.
+- Prevented avoidable intermediate overflow or underflow caused by association
+  in scale-heavy Jacobian, update, slope, and individual SVD reconstruction
+  products through binary-exponent factor formation. SVD reconstruction then
+  uses ordinary compensated `f64` across components and rejects a non-finite
+  contribution or partial total even if later cancellation could recover a
+  finite mathematical value.
+- Preserved typed `MatrixError` causes and every already-computed gradient and
+  SVD diagnostic at solver failure boundaries without recomputing through an
+  invalid state.
+- Included fixed parameters in reusable solver-workspace compatibility, so a
+  same-Jacobian-shape workspace cannot silently grow its variable maps.
+- Corrected accepted-update accounting and state reuse so returned values,
+  residuals, gradients, traces, and attempt provenance describe the same
+  accepted state.
+- Checked matrix axes and element counts before flattening or allocation, and
+  made zero-storage transpose, multiplication, and display complete from
+  physical storage rather than enormous empty logical ranges.
+- Rejected non-finite completed residuals and Jacobians, non-finite solver
+  updates, invalid checked add/subtract/multiply/scale operands or results, and
+  invalid factorization inputs or results. Expression intermediates retain their
+  direct written-order IEEE-754 behavior.
+- Documented exact symbolic differentiation at domain boundaries and the lack of
+  a hidden finite-difference fallback. Expression display now quotes every
+  variable name and escapes controls instead of allowing names to impersonate
+  expression syntax.
+- Updated the locked `crossbeam-epoch` dependency to resolve
+  RUSTSEC-2026-0204.
 
 ## [0.1.1] - 2026-02-12
 
@@ -212,6 +135,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   overdetermined systems with optional line search and adaptive regularization.
 - Added CAD and circuit command-line examples and the initial unit-test suite.
 
+[Unreleased]: https://github.com/NeoCogi/constraint-solver/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/NeoCogi/constraint-solver/releases/tag/v0.3.0
 [0.1.1]: https://github.com/NeoCogi/constraint-solver/tree/47403f77f99ed122bc9a052f4a4a53f071bdd33e
 [0.1.0]: https://github.com/NeoCogi/constraint-solver/tree/f95a5e74d24d76a1b08464b078b91318ee2e2331

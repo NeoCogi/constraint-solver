@@ -53,7 +53,7 @@ fn sample_distance(sample: &common::Sample, first: &str, second: &str) -> f64 {
     dx.hypot(dy)
 }
 
-/// Track one continuously selected common tangent of two moving circles.
+/// Track one common tangent while one circle stays fixed and the other moves.
 #[test]
 fn common_tangent_line_tracks_two_circles_for_one_hundred_steps() {
     let first_center_x = 0.0;
@@ -118,7 +118,7 @@ fn common_tangent_line_tracks_two_circles_for_one_hundred_steps() {
     assert!(trace.covariance("second_y", "tangent_a") < 0.0);
 }
 
-/// Animate a rigid triangular packing of six mutually contacting circles.
+/// Animate a rigid triangular six-circle packing with nine selected contacts.
 #[test]
 fn six_circle_tangent_packing_tracks_one_hundred_steps() {
     // Six circles cannot all be pairwise tangent in the plane because circle

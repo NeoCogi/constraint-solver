@@ -22,9 +22,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Small modified-nodal-analysis helpers shared by electronic integration
+//! Small KCL-based nodal-analysis helpers shared by electronic integration
 //! tests. These models favor smooth, deterministic solver validation over the
-//! exhaustive device behavior of a production circuit simulator.
+//! separate branch-current unknowns, ideal-source equations, and exhaustive
+//! device behavior of a production circuit simulator.
 
 use crate::common::Sample;
 use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError, SolverWorkspace};
