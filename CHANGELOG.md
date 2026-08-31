@@ -24,6 +24,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Removed `Solution::convergence_history`; retaining an unbounded per-iteration
   vector conflicts with fixed numerical storage, while final error, gradient,
   accepted-update count, and last linear attempt remain explicit diagnostics.
+- Reduced line-search configuration to one `max_backtracks` count. Every search
+  now tests `alpha = 1` first, uses a fixed Armijo coefficient of `1e-4`, halves
+  only when another candidate is permitted, and reports the exact final tested
+  alpha rather than a newly computed untested value. Levenberg–Marquardt and
+  trust-region globalization remain explicitly future work.
 
 ## [0.3.0] - 2026-08-30
 

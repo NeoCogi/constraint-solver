@@ -32,6 +32,13 @@ use crate::scaled::{ScaledSum, product_ratio};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Fixed sufficient-decrease fraction for the solver's single Armijo policy.
+///
+/// This standard small value asks each accepted step to realize a modest part
+/// of the local predicted decrease without exposing a tuning parameter whose
+/// interaction with scaling and backtrack limits would create another mode.
+const ARMIJO_COEFFICIENT: f64 = 1e-4;
+
 /// Borrowed numerical state required to test line-search candidates for one
 /// Newton iteration.
 ///
@@ -161,17 +168,15 @@ pub struct SolverOptions {
     pub residual_tolerance: f64,
     /// Maximum residual/Jacobian-column cosine used for `StationaryNonRoot`.
     pub stationarity_tolerance: f64,
-    /// First and largest step multiplier tested for each Newton correction.
-    pub initial_step_size: f64,
     /// Explicit ridge parameter on the normalized variable correction; zero
     /// selects the unregularized SVD solve.
     pub regularization: f64,
-    /// Armijo sufficient-decrease coefficient for every accepted update.
-    pub armijo_coefficient: f64,
-    /// Maximum number of candidate steps evaluated by one line search.
-    pub line_search_max_trials: usize,
-    /// Smallest positive candidate step evaluated before reporting stagnation.
-    pub line_search_min_step: f64,
+    /// Maximum number of halvings after the full Newton step is rejected.
+    ///
+    /// Zero tests only `alpha = 1`; `n` permits exactly `n + 1` candidates:
+    /// `1, 1/2, ..., 1/2^n`, unless an earlier candidate is accepted or can no
+    /// longer change the floating-point variable state.
+    pub max_backtracks: usize,
 }
 
 impl Default for SolverOptions {
@@ -183,11 +188,8 @@ impl Default for SolverOptions {
             max_iterations: 100,
             residual_tolerance: 1e-10,
             stationarity_tolerance: 1e-10,
-            initial_step_size: 1.0,
             regularization: 0.0,
-            armijo_coefficient: 1e-4,
-            line_search_max_trials: 64,
-            line_search_min_step: 1e-12,
+            max_backtracks: 40,
         }
     }
 }
@@ -756,15 +758,14 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the finite first Armijo trial multiplier in `(0, 1]`.
+    /// Override the number of halvings permitted after a rejected full step.
     ///
-    /// A value below one deliberately caps every correction before
-    /// backtracking. Configuration is validated when a solve begins; invalid
-    /// values are retained so the caller receives a deterministic error.
-    pub fn with_initial_step_size(mut self, initial_step_size: f64) -> Self {
-        // Store the exact policy value rather than silently clamping it into the
-        // valid interval and hiding configuration mistakes.
-        self.options.initial_step_size = initial_step_size;
+    /// The complete candidate budget is `max_backtracks + 1`; zero therefore
+    /// retains one tested full step rather than disabling globalization.
+    pub fn with_max_backtracks(mut self, max_backtracks: usize) -> Self {
+        // Store the exact count. Floating-point no-change detection terminates
+        // even an intentionally enormous budget once further halving is useless.
+        self.options.max_backtracks = max_backtracks;
         self
     }
 
@@ -1215,30 +1216,8 @@ impl NewtonRaphsonSolver {
             "stationarity_tolerance must be finite and in the interval (0, 1]",
         )?;
         Self::require_valid_option(
-            self.options.initial_step_size.is_finite()
-                && self.options.initial_step_size > 0.0
-                && self.options.initial_step_size <= 1.0,
-            "initial_step_size must be finite and in the interval (0, 1]",
-        )?;
-        Self::require_valid_option(
             self.options.regularization.is_finite() && self.options.regularization >= 0.0,
             "regularization must be finite and non-negative",
-        )?;
-        Self::require_valid_option(
-            self.options.armijo_coefficient.is_finite()
-                && self.options.armijo_coefficient > 0.0
-                && self.options.armijo_coefficient < 1.0,
-            "armijo_coefficient must be finite and in the interval (0, 1)",
-        )?;
-        Self::require_valid_option(
-            self.options.line_search_max_trials > 0,
-            "line_search_max_trials must be greater than zero",
-        )?;
-        Self::require_valid_option(
-            self.options.line_search_min_step.is_finite()
-                && self.options.line_search_min_step > 0.0
-                && self.options.line_search_min_step <= self.options.initial_step_size,
-            "line_search_min_step must be finite, positive, and no greater than initial_step_size",
         )?;
 
         Ok(())
@@ -1786,17 +1765,19 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // Begin with the caller's configured maximum step. The reusable
-        // candidate map is restored from accepted state for every trial so fixed
-        // parameters remain present and rejected values never leak forward.
-        let mut alpha = self.options.initial_step_size;
+        // Always test the unmodified Newton correction first. Each rejection
+        // permits one deterministic halving, so there is no competing initial-
+        // step or minimum-step policy to reconcile with the backtrack budget.
+        let mut alpha = 1.0;
+        let mut last_tested_alpha = alpha;
         let mut attempted_trials = 0;
         // Retain only aggregate rejection evidence. Candidate vectors and
         // residuals continue to use the existing reusable transaction buffers.
         let mut rejections = LineSearchRejections::default();
 
-        for _ in 0..self.options.line_search_max_trials {
+        for backtrack_index in 0..=self.options.max_backtracks {
             attempted_trials += 1;
+            last_tested_alpha = alpha;
             candidate_vars.clone_from(vars);
 
             // Build the candidate transactionally. Variable overflow is rejected
@@ -1828,9 +1809,7 @@ impl NewtonRaphsonSolver {
                 self.scale_residuals_into(candidate_residuals, candidate_scaled_residuals);
                 let new_error = candidate_scaled_residuals.norm();
                 let required_error = current_residual_norm
-                    + self.options.armijo_coefficient
-                        * alpha
-                        * residual_norm_directional_derivative;
+                    + ARMIJO_COEFFICIENT * alpha * residual_norm_directional_derivative;
                 if !new_error.is_finite() {
                     // A smaller candidate may return to the expression domain,
                     // so record the cause and continue backtracking.
@@ -1849,13 +1828,12 @@ impl NewtonRaphsonSolver {
                 rejections.non_finite_updates += 1;
             }
 
-            // Stop only after the current minimum-sized candidate has actually
-            // been tested and rejected. This ensures every returned success is
-            // backed by an evaluated candidate.
-            if alpha <= self.options.line_search_min_step {
-                break;
+            // Halve only when the caller's explicit backtrack budget permits a
+            // subsequent candidate. The diagnostic therefore never observes an
+            // alpha value that the solver did not evaluate.
+            if backtrack_index < self.options.max_backtracks {
+                alpha *= 0.5;
             }
-            alpha = (alpha * 0.5).max(self.options.line_search_min_step);
         }
 
         // Applying any rejected fallback could increase the residual or leave
@@ -1868,7 +1846,7 @@ impl NewtonRaphsonSolver {
             .map_or_else(|| "none".to_string(), |value| format!("{value:.2e}"));
         let diagnostic = self.build_diagnostic(
             format!(
-                "Line search failed after {attempted_trials} rejected trial steps; smallest tested step was {alpha:.2e}; rejections: non-finite updates {}, non-finite residuals {}, insufficient Armijo decrease {}; last finite candidate residual {last_finite_residual}",
+                "Line search failed after {attempted_trials} rejected candidate steps; last tested step was {last_tested_alpha:.2e}; rejections: non-finite updates {}, non-finite residuals {}, insufficient Armijo decrease {}; last finite candidate residual {last_finite_residual}",
                 rejections.non_finite_updates,
                 rejections.non_finite_residuals,
                 rejections.insufficient_decrease,
@@ -1999,20 +1977,6 @@ mod tests {
             SolverError::StationaryNonRoot(diagnostic) => *diagnostic,
             other => panic!("expected StationaryNonRoot, got {other:?}"),
         }
-    }
-
-    /// Clone, mutate, and reinstall a solver's shape-adjusted numerical policy
-    /// for focused configuration tests.
-    fn configure_options(
-        solver: NewtonRaphsonSolver,
-        configure: impl FnOnce(&mut SolverOptions),
-    ) -> NewtonRaphsonSolver {
-        // Begin from the solver's actual policy rather than `Default`, because
-        // overdetermined construction intentionally adjusts three workload and
-        // stabilization values.
-        let mut options = solver.options().clone();
-        configure(&mut options);
-        solver.with_options(options)
     }
 
     fn solver_for_mode(equations: Vec<Exp>, _mode: Mode) -> NewtonRaphsonSolver {
@@ -2428,42 +2392,12 @@ mod tests {
                 Box::new(|solver| solver.with_stationarity_tolerance(2.0)),
             ),
             (
-                "initial_step_size",
-                Box::new(|solver| solver.with_initial_step_size(0.0)),
-            ),
-            (
-                "initial_step_size",
-                Box::new(|solver| solver.with_initial_step_size(1.1)),
-            ),
-            (
-                "initial_step_size",
-                Box::new(|solver| solver.with_initial_step_size(f64::INFINITY)),
-            ),
-            (
                 "regularization",
                 Box::new(|solver| solver.with_regularization(-1.0)),
             ),
             (
                 "regularization",
                 Box::new(|solver| solver.with_regularization(f64::INFINITY)),
-            ),
-            (
-                "armijo_coefficient",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.armijo_coefficient = 1.0)
-                }),
-            ),
-            (
-                "line_search_max_trials",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.line_search_max_trials = 0)
-                }),
-            ),
-            (
-                "line_search_min_step",
-                Box::new(|solver| {
-                    configure_options(solver, |options| options.line_search_min_step = 0.0)
-                }),
             ),
         ];
 
@@ -2593,10 +2527,9 @@ mod tests {
             // Candidate construction rejects the overflowing full step before
             // expression evaluation. Limiting the search to that one trial
             // makes preservation of the initial accepted state deterministic.
-            let solver = configure_options(
-                solver_for_mode(vec![equation], mode).with_regularization(0.0),
-                |options| options.line_search_max_trials = 1,
-            );
+            let solver = solver_for_mode(vec![equation], mode)
+                .with_regularization(0.0)
+                .with_max_backtracks(0);
             let error = solver
                 .solve_once(initial)
                 .expect_err("an overflowing line-search candidate must be rejected");
@@ -2879,25 +2812,24 @@ mod tests {
     fn test_line_search_honors_configured_trial_budget() {
         for mode in test_modes() {
             // The same exponential problem used by the deep-backtracking test
-            // cannot accept its full Newton step. Restricting the search to one
-            // candidate must therefore preserve the initial point and fail.
+            // cannot accept its first two Newton candidates. One permitted
+            // backtrack must test exactly alpha=1 and alpha=1/2 before failing.
             let x = Exp::var("x");
             let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
-            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
-                options.line_search_max_trials = 1
-            });
+            let solver = solver_for_mode(vec![equation], mode).with_max_backtracks(1);
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let error = solver
                 .solve_once(initial)
-                .expect_err("one rejected candidate must exhaust the configured search");
+                .expect_err("two rejected candidates must exhaust the configured search");
 
             match error {
                 SolverError::NoConvergence(diagnostic) => {
                     assert_eq!(diagnostic.iterations, 0);
-                    assert!(diagnostic.message.contains("after 1 rejected trial steps"));
+                    assert!(diagnostic.message.contains("after 2 rejected candidate steps"));
+                    assert!(diagnostic.message.contains("last tested step was 5.00e-1"));
                     assert!(diagnostic.message.contains("non-finite updates 0"));
-                    assert!(diagnostic.message.contains("non-finite residuals 1"));
+                    assert!(diagnostic.message.contains("non-finite residuals 2"));
                     assert!(
                         diagnostic
                             .message
@@ -2933,9 +2865,7 @@ mod tests {
             // so a one-trial budget must classify it as insufficient decrease.
             let x = Exp::var("x");
             let equation = Exp::sub(Exp::power(x, 3.0), Exp::val(1.0));
-            let solver = configure_options(solver_for_mode(vec![equation], mode), |options| {
-                options.line_search_max_trials = 1
-            });
+            let solver = solver_for_mode(vec![equation], mode).with_max_backtracks(0);
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
             let error = solver
@@ -3010,59 +2940,6 @@ mod tests {
             assert_eq!(diagnostic.error, 1.0);
             assert_eq!(diagnostic.gradient_norm, Some(0.0));
             assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
-        }
-    }
-
-    /// Verify that the configured initial trial cap applies to the first update.
-    #[test]
-    fn test_solver_honors_initial_step_size() {
-        for mode in test_modes() {
-            // The undamped Newton correction from x=0 is exactly one. With a
-            // single allowed update and a 0.5 cap, the final diagnostic must
-            // contain x=0.5.
-            let x = Exp::var("x");
-            let equation = Exp::sub(x, Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_initial_step_size(0.5)
-                .with_max_iterations(1);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
-
-            let error = solver
-                .solve_once(initial)
-                .expect_err("one half-step cannot yet reach the root");
-            match error {
-                SolverError::NoConvergence(diagnostic) => {
-                    assert!((diagnostic.values["x"] - 0.5).abs() < 1e-12);
-                    assert!((diagnostic.error - 0.5).abs() < 1e-12);
-                    assert_eq!(diagnostic.gradient_norm, Some(0.5));
-                    assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
-                }
-                other => panic!("expected NoConvergence, got {other:?}"),
-            }
-        }
-    }
-
-    /// Ensure that an intentionally small trial cap does not become a false
-    /// small-step failure before the residual tolerance is satisfied.
-    #[test]
-    fn test_small_initial_step_reaches_residual_tolerance() {
-        for mode in test_modes() {
-            // A 0.1 cap requires roughly 220 geometric updates to reduce the
-            // residual below 1e-10. The applied correction becomes small before
-            // then, but that is explicit policy rather than stagnation.
-            let x = Exp::var("x");
-            let equation = Exp::sub(x, Exp::val(1.0));
-            let solver = solver_for_mode(vec![equation], mode)
-                .with_initial_step_size(0.1)
-                .with_residual_tolerance(1e-10)
-                .with_max_iterations(300);
-            let initial = HashMap::from([("x".to_string(), 0.0)]);
-
-            let solution = solver
-                .solve_once(initial)
-                .expect("capped linear updates should eventually reach the root");
-
-            assert!(solution.error < 1e-10);
         }
     }
 
@@ -3241,7 +3118,6 @@ mod tests {
             let x_residual = Exp::sub(x, Exp::val(1.0));
             let y_residual = Exp::mul(Exp::val(1e9), y);
             let solver = solver_for_mode(vec![x_residual, y_residual.clone(), y_residual], mode)
-                .with_initial_step_size(1.0)
                 .with_stationarity_tolerance(1e-8)
                 .with_regularization(0.0);
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
@@ -3410,21 +3286,6 @@ mod tests {
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.last_linear_attempt, None);
 
-            // Starting at residual two with a half-sized Newton step lands
-            // exactly on the same boundary. The next accepted-state check must
-            // use the identical inclusive contract.
-            let solver = solver_for_mode(vec![x], mode)
-                .with_residual_tolerance(1.0)
-                .with_initial_step_size(0.5)
-                .with_max_iterations(1);
-            let initial = HashMap::from([("x".to_string(), 2.0)]);
-            let solution = solver
-                .solve_once(initial)
-                .expect("an accepted update on the tolerance boundary must succeed");
-
-            assert_eq!(solution.values["x"], 1.0);
-            assert_eq!(solution.error, 1.0);
-            assert_eq!(solution.iterations, 1);
         }
     }
 
@@ -3477,7 +3338,6 @@ mod tests {
 
             let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
                 .with_regularization(0.0)
-                .with_initial_step_size(1.0)
                 .with_max_iterations(10)
                 .with_residual_tolerance(1e-10);
 

@@ -338,11 +338,15 @@ the harness on the target machine when making performance decisions.
   to zero: zero solves the original Jacobian once, while a positive value solves
   one augmented system using exactly that ridge strength. Condition estimates
   are diagnostic and never silently replace the requested linear problem.
-- Line search applies a slope-based Armijo condition directly to the scaled
-  residual norm `||f_scaled||`. It evaluates the equivalent scale-safe
-  directional derivative without first forming a potentially overflowing raw
-  dot product, and reports failure without counting rejected candidates as
-  accepted solver updates.
+- Line search has one deterministic Armijo policy over `||f_scaled||`: test the
+  full Newton correction, then halve it after each rejection. The sufficient-
+  decrease coefficient is fixed at `1e-4`; `SolverOptions::max_backtracks`
+  (default 40) is the only search control and permits that many halvings in
+  addition to the full-step candidate. Diagnostics report the exact last tested
+  multiplier, and rejected candidates never count as accepted updates.
+- Levenberg–Marquardt or a trust-region method may be explored as a future
+  replacement globalization strategy for difficult least-squares models. It is
+  intentionally not mixed into the current backtracking policy as another mode.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.
