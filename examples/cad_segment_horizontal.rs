@@ -46,16 +46,27 @@ fn main() {
     let compiled = Compiler::compile(&[length_eq, horizontal_eq]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new_with_variables(compiled, &["bx", "by"])
         .expect("solver init failed");
+    let mut workspace = solver.workspace();
 
+    // Start away from both the horizontal line and the requested length so the
+    // example exercises actual nonlinear Newton updates instead of returning
+    // through the exact-initial-root fast path.
     let mut initial = HashMap::new();
     initial.insert("ax".to_string(), 1.0);
     initial.insert("ay".to_string(), 2.0);
-    initial.insert("bx".to_string(), 6.0);
-    initial.insert("by".to_string(), 2.0);
+    initial.insert("bx".to_string(), 5.0);
+    initial.insert("by".to_string(), 2.5);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let bx_sol = solution.values.get("bx").copied().unwrap();
     let by_sol = solution.values.get("by").copied().unwrap();
 
+    // Keep the runnable example self-checking: the positive-x branch selected
+    // by the initial guess must satisfy both constraints after at least one
+    // accepted update.
+    assert!(solution.error < 1e-10);
+    assert!(solution.iterations > 0);
+    assert!((bx_sol - 6.0).abs() < 1e-8);
+    assert!((by_sol - y_target).abs() < 1e-8);
     println!("B = ({:.6}, {:.6})", bx_sol, by_sol);
 }

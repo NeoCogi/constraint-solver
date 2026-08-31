@@ -22,13 +22,20 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Compilation of name-based symbolic expressions into compact, indexed
+//! equation systems suitable for repeated numerical evaluation.
+
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::exp::{Exp, MissingVarError};
+use crate::exp::Exp;
 
+/// Error returned when a symbolic expression cannot be compiled into the
+/// solver's compact variable-indexed representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
+    /// A variable used an empty name, which cannot be addressed unambiguously
+    /// by the name-based public solver API.
     EmptyVariableName,
 }
 
@@ -42,18 +49,30 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+/// Dense identifier assigned to a named variable during compilation.
+///
+/// Keeping this identifier crate-private prevents callers from depending on
+/// compilation order while allowing evaluation to use integer-indexed maps.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct VarId(usize);
 
 impl VarId {
+    /// Wrap an index from a specific compiled system as its internal variable
+    /// identifier.
     pub(crate) const fn new(id: usize) -> Self {
+        // `VarId` is deliberately a thin newtype: range validation belongs to
+        // the owning `VarTable`, which is the only source of public IDs.
         Self(id)
     }
 }
 
+/// Bidirectional variable registry owned by one compiled equation system.
 #[derive(Debug, Clone)]
 pub(crate) struct VarTable {
+    /// Names in stable compilation order; each position is the corresponding
+    /// `VarId` payload.
     names: Vec<String>,
+    /// Reverse lookup used when translating name-keyed initial guesses.
     name_to_id: HashMap<String, VarId>,
 }
 
@@ -95,32 +114,101 @@ impl VarTable {
     }
 }
 
+/// Internal evaluation failure for a compiled expression whose variable map
+/// does not contain one of the IDs embedded by the compiler.
+///
+/// Solver entry points validate complete initial guesses before evaluation, so
+/// this error indicates an internal state mismatch rather than a recoverable
+/// public "missing variable" condition. Keeping it crate-private removes the
+/// previously unreachable public error variant without making internal
+/// evaluators infallible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluationError {
+    /// Human-readable variable name retained in compiled variable nodes for a
+    /// useful invariant-violation message.
+    variable_name: String,
+}
+
+impl EvaluationError {
+    /// Construct an evaluation error for a compiled variable that could not be
+    /// found in the supplied internal value map.
+    fn missing_variable(variable_name: &str) -> Self {
+        // Clone only on the exceptional path; ordinary expression evaluation
+        // continues to borrow the name stored in the compiled node.
+        Self {
+            variable_name: variable_name.to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for EvaluationError {
+    /// Describe the violated compiled-system invariant without presenting it as
+    /// a user-correctable public lookup error.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "compiled evaluation map is missing variable '{}'",
+            self.variable_name
+        )
+    }
+}
+
+impl std::error::Error for EvaluationError {}
+
+/// Variable-indexed expression evaluated exactly in its written tree order.
+///
+/// This representation improves lookup cost; it does not algebraically
+/// reassociate operations or extend their `f64` exponent range. Keeping that
+/// distinction explicit prevents solver-level scaling guarantees from being
+/// mistaken for arbitrary expression-range guarantees.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CompiledExp {
+    /// Literal floating-point value.
     Val(f64),
+    /// Variable name retained for diagnostics and its compact lookup ID.
     Var(String, VarId),
+    /// Left-to-right binary addition node.
     Add(Box<CompiledExp>, Box<CompiledExp>),
+    /// Left-to-right binary subtraction node.
     Sub(Box<CompiledExp>, Box<CompiledExp>),
+    /// Direct floating-point multiplication node.
     Mul(Box<CompiledExp>, Box<CompiledExp>),
+    /// Direct floating-point division node.
     Div(Box<CompiledExp>, Box<CompiledExp>),
+    /// Floating-point power with a literal exponent.
     Power(Box<CompiledExp>, f64),
+    /// Arithmetic negation node.
     Neg(Box<CompiledExp>),
+    /// Sine function node.
     Sin(Box<CompiledExp>),
+    /// Cosine function node.
     Cos(Box<CompiledExp>),
+    /// Natural-logarithm function node.
     Ln(Box<CompiledExp>),
+    /// Natural-exponential function node.
     Exp(Box<CompiledExp>),
 }
 
 impl CompiledExp {
+    /// Evaluate this tree with direct IEEE-754 operations in tree order.
+    ///
+    /// Only a missing internal variable is represented by the returned error.
+    /// Arithmetic NaN and infinity remain values here so the owning solver can
+    /// reject them with its complete accepted-state diagnostic. No allocation,
+    /// symbolic reassociation, or hidden extended-range arithmetic occurs.
     pub(crate) fn evaluate_checked(
         &self,
         vars: &HashMap<VarId, f64>,
-    ) -> Result<f64, MissingVarError> {
+    ) -> Result<f64, EvaluationError> {
+        // Recursion follows the compiled syntax tree exactly. For example,
+        // `(MAX * x) / MAX` forms the multiplication before the division and
+        // can therefore overflow even when the algebraic result is finite.
         match self {
             CompiledExp::Val(v) => Ok(*v),
-            CompiledExp::Var(name, id) => vars.get(id).copied().ok_or_else(|| MissingVarError {
-                var_name: name.clone(),
-            }),
+            CompiledExp::Var(name, id) => vars
+                .get(id)
+                .copied()
+                .ok_or_else(|| EvaluationError::missing_variable(name)),
             CompiledExp::Add(l, r) => Ok(l.evaluate_checked(vars)? + r.evaluate_checked(vars)?),
             CompiledExp::Sub(l, r) => Ok(l.evaluate_checked(vars)? - r.evaluate_checked(vars)?),
             CompiledExp::Mul(l, r) => Ok(l.evaluate_checked(vars)? * r.evaluate_checked(vars)?),
@@ -271,19 +359,64 @@ impl CompiledExp {
     }
 }
 
+/// Immutable compiled representation consumed by `NewtonRaphsonSolver`.
+///
+/// Expression storage remains private so callers cannot invalidate the
+/// compiler's variable IDs, while the introspection methods expose the stable
+/// metadata needed to prepare solver inputs.
 #[derive(Debug, Clone)]
 pub struct CompiledSystem {
+    /// Equations in the same order as the source slice passed to `compile`.
     pub(crate) equations: Vec<CompiledExp>,
+    /// Variable names and IDs shared by all compiled equations.
     pub(crate) var_table: VarTable,
 }
 
 impl CompiledSystem {
+    /// Return the number of compiled scalar equations.
+    pub fn equation_count(&self) -> usize {
+        // Every entry represents one residual row in the eventual solver.
+        self.equations.len()
+    }
+
+    /// Return the number of distinct named variables referenced by the system.
+    pub fn variable_count(&self) -> usize {
+        // `VarTable` deduplicates repeated occurrences during compilation.
+        self.var_table.len()
+    }
+
+    /// Return variable names in the stable order used for Jacobian columns.
+    pub fn variable_names(&self) -> &[String] {
+        // Borrow the table's storage so introspection performs no allocation and
+        // cannot mutate compiler-owned identifiers.
+        self.var_table.names()
+    }
+
+    /// Report whether the compiled system contains a variable with `name`.
+    pub fn contains_variable(&self, name: &str) -> bool {
+        // Use the registry's reverse index instead of scanning the ordered name
+        // slice; this remains constant-time for large systems.
+        self.var_table.get_id(name).is_some()
+    }
+
+    /// Report whether the system contains no equations.
+    pub fn is_empty(&self) -> bool {
+        // Variables originate from equations, so an empty equation list also
+        // implies an empty variable table for compiler-created values.
+        self.equations.is_empty()
+    }
 }
 
+/// Stateless entry point that translates symbolic `Exp` trees into a validated
+/// `CompiledSystem` with shared dense variable identifiers.
 pub struct Compiler;
 
 impl Compiler {
+    /// Compile symbolic equations and assign stable dense IDs to their named
+    /// variables.
     pub fn compile(equations: &[Exp]) -> Result<CompiledSystem, CompileError> {
+        // One shared table ensures repeated names in different equations refer
+        // to the same solver variable and Jacobian column.
         let mut var_table = VarTable::new();
         let mut compiled = Vec::with_capacity(equations.len());
 
@@ -330,5 +463,54 @@ impl Compiler {
             Exp::Ln(e) => Ok(CompiledExp::Ln(Box::new(Self::compile_exp(e, var_table)?))),
             Exp::Exp(e) => Ok(CompiledExp::Exp(Box::new(Self::compile_exp(e, var_table)?))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure the public compiled-system API reports deduplicated variables in
+    /// the same first-seen order used by internal Jacobian construction.
+    #[test]
+    fn compiled_system_exposes_stable_metadata() {
+        let equations = vec![
+            Exp::sub(Exp::var("y"), Exp::var("x")),
+            Exp::add(Exp::var("x"), Exp::var("z")),
+        ];
+
+        let compiled = Compiler::compile(&equations).expect("valid system should compile");
+
+        assert_eq!(compiled.equation_count(), 2);
+        assert_eq!(compiled.variable_count(), 3);
+        assert_eq!(compiled.variable_names(), &["y", "x", "z"]);
+        assert!(compiled.contains_variable("x"));
+        assert!(!compiled.contains_variable("missing"));
+        assert!(!compiled.is_empty());
+    }
+
+    /// Verify that an empty source system has coherent public metadata rather
+    /// than exposing an otherwise opaque zero-sized compiled value.
+    #[test]
+    fn empty_compiled_system_reports_no_equations_or_variables() {
+        let compiled = Compiler::compile(&[]).expect("empty systems are valid to compile");
+
+        assert_eq!(compiled.equation_count(), 0);
+        assert_eq!(compiled.variable_count(), 0);
+        assert!(compiled.variable_names().is_empty());
+        assert!(compiled.is_empty());
+    }
+
+    /// Reject the one variable name that the public name-keyed solve API cannot
+    /// address unambiguously and preserve its structured compiler variant.
+    #[test]
+    fn empty_variable_name_returns_its_public_compile_error() {
+        let equation = Exp::var("");
+
+        let error = Compiler::compile(&[equation])
+            .expect_err("an empty variable name must not enter the registry");
+
+        assert_eq!(error, CompileError::EmptyVariableName);
+        assert_eq!(error.to_string(), "Variable name cannot be empty");
     }
 }

@@ -1,0 +1,226 @@
+# Validate every distributable and developer-facing target on pushes and pull
+# requests. Benchmark timing remains manual; CI executes the harness in test
+# mode so fixture construction and numerical assertions remain release gates.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The workflow only reads repository contents and does not publish artifacts or
+# mutate pull requests.
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: Audit RustSec advisories
+    runs-on: ubuntu-latest
+    permissions:
+      # The RustSec action reads the lockfile and publishes a dedicated check;
+      # it receives no issue, pull-request, package, or repository-write access.
+      contents: read
+      checks: write
+
+    steps:
+      # Audit the exact locked transitive graph belonging to this revision.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # RustSec's maintained action installs cargo-audit, refreshes the advisory
+      # database, and fails this job when the lockfile contains a vulnerability.
+      - name: Check dependency advisories
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  msrv:
+    name: Minimum supported Rust 1.86
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the same locked dependency graph consumed by the release
+      # validation job below.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Linux builds GLFW from its bundled source because the crate's
+      # `prebuilt-libs` feature only supplies binaries on Windows and macOS.
+      # Install every X11 development header required by GLFW's CMake checks so
+      # the following feature-enabled IK validation can compile the example.
+      - name: Install GLFW X11 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev
+
+      # Pin this job to the manifest's declared minimum so an accidental use of
+      # a newer language or standard-library feature fails independently of the
+      # moving stable toolchain. The action SHA belongs to durable master history;
+      # the explicit input avoids a generated toolchain branch that may be pruned.
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.86.0
+
+      # Cache entries are keyed by toolchain, so MSRV artifacts cannot mask or
+      # overwrite results produced by the stable validation job.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Compile and run every ordinary target against the locked dependency
+      # versions. The Criterion executable remains excluded by its required
+      # opt-in feature, matching the stable correctness suite.
+      - name: Test all targets at the MSRV
+        run: cargo test --locked --all-targets
+
+      # Exercise the native graphical example's headless model tests explicitly.
+      # Its feature is omitted from ordinary tests so library contributors do
+      # not need X11 headers.
+      - name: Test graphical example at the MSRV
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
+
+  portable-msrv:
+    name: Test all targets on ${{ matrix.os }} with Rust 1.86
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every supported host result even if one platform fails first.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      # Use the exact source revision and dependency lockfile validated on Linux.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Exercise the declared compiler floor on every supported host instead of
+      # assuming Linux-only MSRV coverage proves platform-specific development
+      # dependencies and examples remain compatible. Use the same durable action
+      # implementation and select the compiler through its explicit input.
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.86.0
+
+      # Toolchain and target metadata keep artifacts isolated across the two
+      # operating-system matrix entries.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Match the Linux MSRV command so the complete locked developer graph and
+      # every platform-specific example/test target compile at the claimed
+      # minimum. Windows and macOS use glfw's prebuilt native libraries.
+      - name: Test all targets at the MSRV
+        run: cargo test --locked --all-targets
+
+      # Windows and macOS consume glfw's prebuilt native libraries while still
+      # proving the optional example graph supports the declared compiler floor.
+      - name: Test graphical example at the MSRV
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
+
+  validate:
+    name: Format, lint, test, and package
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the exact revision whose source and manifest are being tested.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # All-feature Clippy and the explicit GLFW example tests compile the
+      # native example on Linux. The runner image does not include the X11
+      # development headers needed when glfw-sys builds its bundled source.
+      - name: Install GLFW X11 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev
+
+      # Install the stable compiler plus the two components used as hard gates.
+      # Pin the durable master implementation while leaving the requested moving
+      # toolchain visible as data rather than encoding it in an ephemeral branch.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      # Reuse registry and target artifacts without treating cache availability
+      # as part of build correctness.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Compile every feature and target, including examples and the opt-in
+      # Criterion harness, while promoting all warnings to failures.
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # The benchmark feature is intentionally absent so Criterion is not
+      # executed as part of the correctness suite.
+      - name: Run unit and example tests
+        run: cargo test --locked --all-targets
+
+      # `required-features` excludes the native example from the ordinary test
+      # command above. Enable it here to retain its five headless geometry and
+      # end-to-end solver regressions on the stable toolchain.
+      - name: Run graphical example tests
+        run: cargo test --locked --example ik_2d_glfw --features glfw-example
+
+      # Optimized arithmetic disables debug overflow traps. Re-run every ordinary
+      # unit, integration, and example test in the release profile so matrix,
+      # electronics, geometry, and executable-model safety cannot accidentally
+      # depend on debug-only behavior.
+      - name: Run optimized tests for all targets
+        run: cargo test --release --locked --all-targets
+
+      # The optional native example is excluded from all-targets by its required
+      # feature, so exercise its headless solver regressions in release mode too.
+      - name: Run optimized graphical example tests
+        run: cargo test --release --locked --example ik_2d_glfw --features glfw-example
+
+      # `cargo test --all-targets` builds example harnesses but does not execute
+      # their `main` functions. Run every headless example so solver failures and
+      # their self-checking numerical assertions participate in the release
+      # gate; the interactive GLFW program cannot run on a headless CI worker.
+      - name: Run headless examples
+        run: |
+          cargo run --release --locked --example cad_circle_intersection
+          cargo run --release --locked --example cad_segment_horizontal
+          cargo run --release --locked --example circuit_diode
+          cargo run --release --locked --example circuit_voltage_divider
+
+      - name: Run documentation tests
+        run: cargo test --locked --doc
+
+      # Doctests exercise examples but do not promote rustdoc's own warnings.
+      # Build the complete public API separately so broken links and other
+      # documentation regressions fail the release gate.
+      - name: Build warning-free public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+      # Criterion's test mode executes fixture setup and equivalence/rank
+      # assertions once without collecting timing samples. This catches stale or
+      # invalid benchmark workloads while leaving performance measurement manual.
+      - name: Execute benchmark fixture checks
+        run: cargo test --locked --bench linear_algebra --features benchmarks
+
+      # Package verification catches missing files and manifest metadata errors
+      # using the same locked dependency graph as the preceding checks.
+      - name: Verify crate package
+        run: cargo package --locked

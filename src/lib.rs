@@ -22,20 +22,73 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+//! Symbolic construction and numerical solution of small dense nonlinear
+//! constraint systems.
+//!
+//! Build residual expressions with [`Exp`], compile their variable names once
+//! with [`Compiler`], and solve square, underdetermined, or overdetermined
+//! systems with [`NewtonRaphsonSolver`]. Every linearized shape uses one
+//! Jacobi-SVD pseudoinverse policy and one scale-relative numerical-rank cutoff.
+//!
+//! The solver differentiates the supplied expression tree symbolically. It
+//! does not estimate or repair derivatives with finite differences. At a
+//! domain boundary, a finite residual can therefore have a non-finite symbolic
+//! derivative when the chosen expression contains an IEEE-754 indeterminate
+//! form such as `0 * infinity`. In that case solving returns
+//! [`SolverError::NonFiniteEvaluation`]; callers should start inside the
+//! expression's differentiable domain or rewrite the expression into a form
+//! whose derivative is finite at the intended starting point.
+//!
+//! Compiled expressions otherwise use direct `f64` arithmetic in syntax-tree
+//! order. Solver scaling protects its explicit residual, Jacobian, update, and
+//! SVD transformations; it does not reassociate arbitrary user expressions.
+//! Keep every written intermediate representable—for example, rewrite
+//! `(f64::MAX * x) / f64::MAX` as `x` or another physically scaled equivalent.
+//!
+//! # Quick start
+//!
+//! ```
+//! use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+//! use std::collections::HashMap;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Residual zero means x = 2. Arithmetic operators build expression nodes.
+//! let equation = Exp::var("x") - 2.0;
+//! let compiled = Compiler::compile(&[equation])?;
+//! let solver = NewtonRaphsonSolver::new(compiled);
+//! let initial = HashMap::from([("x".to_string(), 0.0)]);
+//!
+//! let mut workspace = solver.workspace();
+//! let solution = solver.solve(initial, &mut workspace)?;
+//! assert!(solution.error < 1e-10);
+//! assert!((solution.values["x"] - 2.0).abs() < 1e-10);
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
+
 pub mod compiler;
 pub mod exp;
 mod jacobian;
 pub mod matrix;
-pub mod mode;
+mod scaled;
 pub mod solver;
 
-#[cfg(test)]
-mod matrix_test;
-
 pub use compiler::{CompileError, CompiledSystem, Compiler};
-pub use exp::{Exp, MissingVarError};
-pub use matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
-pub use mode::Mode;
+pub use exp::Exp;
+pub use matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError, MatrixOperand};
 pub use solver::{
-    EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverRunDiagnostic,
+    EquationDiagnostic, EquationTrace, NewtonRaphsonSolver, Solution, SolverError, SolverOptions,
+    SolverRunDiagnostic, SolverWorkspace,
 };
+
+/// Documentation-only container that makes every Rust block in the repository
+/// README part of `cargo test --doc`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {
+    // The included Markdown supplies this module's doctests. Keeping the module
+    // empty avoids shipping duplicate documentation or executable code in
+    // ordinary library builds.
+}

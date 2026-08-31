@@ -22,40 +22,134 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use crate::compiler::{CompiledExp, CompiledSystem, VarId, VarTable};
-use crate::exp::MissingVarError;
-use crate::jacobian::Jacobian;
-use crate::matrix::{LeastSquaresQrInfo, Matrix, MatrixError};
-use crate::mode::{build_thread_pool, Mode};
-use rayon::ThreadPool;
-use std::collections::HashMap;
+//! Globalized Newton-Raphson iteration, SVD least-squares corrections,
+//! convergence results, and structured failure diagnostics.
 
-struct LeastSquaresWorkspace {
-    augmented_j: Matrix,
-    augmented_b: Matrix,
-    num_equations: usize,
-    num_variables: usize,
+use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
+use crate::jacobian::{Jacobian, JacobianWorkspace};
+use crate::matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError};
+use crate::scaled::{CompensatedSum, product_ratio};
+use std::collections::HashMap;
+use std::fmt;
+
+/// Fixed sufficient-decrease fraction for the solver's single Armijo policy.
+///
+/// This standard small value asks each accepted step to realize a modest part
+/// of the local predicted decrease without exposing a tuning parameter whose
+/// interaction with scaling and backtrack limits would create another mode.
+const ARMIJO_COEFFICIENT: f64 = 1e-4;
+
+/// Borrowed numerical state required to test line-search candidates for one
+/// Newton iteration.
+///
+/// Grouping these related values keeps the line-search call site explicit while
+/// avoiding an error-prone positional argument list.
+struct LineSearchContext<'a> {
+    /// Symbolic evaluator used to compute residuals at candidate points.
+    jacobian: &'a Jacobian,
+    /// Current accepted variables, including solve variables and fixed
+    /// parameters.
+    vars: &'a HashMap<VarId, f64>,
+    /// Reusable transaction buffer populated with each candidate state.
+    candidate_vars: &'a mut HashMap<VarId, f64>,
+    /// Newton correction direction whose scalar multiplier is being searched.
+    delta: &'a Matrix,
+    /// Equation-scale-normalized residual norm at the current accepted point.
+    current_residual_norm: f64,
+    /// Directional derivative of `||f_scaled||_2` along normalized `delta`.
+    ///
+    /// For non-zero residual vector `f`, Jacobian `J`, and candidate direction
+    /// `p`, this value is `(f_scaled / ||f_scaled||_2)^T J_scaled p`.
+    /// The SVD returns this value from its retained right-hand-side projection,
+    /// avoiding a second `J*p` reconstruction and an unnormalized dot product
+    /// that could overflow before division reduces its scale.
+    residual_norm_directional_derivative: f64,
+    /// Number of Newton updates accepted before this line search began.
+    ///
+    /// Keeping this as an accepted-update count, rather than a one-based attempt
+    /// number, preserves the public `SolverRunDiagnostic::iterations` contract
+    /// when every candidate is rejected and the current point is left unchanged.
+    accepted_updates: usize,
+    /// Residual vector at the current accepted point.
+    current_residuals: &'a Matrix,
+    /// Gradient measures already evaluated at the current accepted point.
+    gradient: ResidualGradientMeasure,
+    /// Reusable output storage for candidate residual evaluations.
+    candidate_residuals: &'a mut Matrix,
+    /// Reusable output storage for scaled candidate residuals used by Armijo.
+    candidate_scaled_residuals: &'a mut Matrix,
 }
 
-impl LeastSquaresWorkspace {
-    fn new(num_equations: usize, num_variables: usize, sqrt_reg: f64) -> Self {
-        let mut augmented_j = Matrix::new(num_equations + num_variables, num_variables);
-        for i in 0..num_variables {
-            augmented_j[(num_equations + i, i)] = sqrt_reg;
-        }
+/// Counts why candidates were rejected during one exhausted line search.
+///
+/// The categories stay private implementation detail because callers already
+/// receive the complete accepted state through `SolverRunDiagnostic`. Keeping
+/// the small summary here adds actionable failure context without expanding the
+/// public error hierarchy or retaining every rejected candidate.
+#[derive(Default)]
+struct LineSearchRejections {
+    /// Candidates whose scaled update made at least one variable non-finite.
+    non_finite_updates: usize,
+    /// Finite variable candidates whose scaled residual norm was NaN or infinite.
+    non_finite_residuals: usize,
+    /// Finite candidates that failed the Armijo sufficient-decrease inequality.
+    insufficient_decrease: usize,
+    /// Residual norm of the last finite candidate evaluated by the search.
+    last_finite_residual: Option<f64>,
+}
 
-        LeastSquaresWorkspace {
-            augmented_j,
-            augmented_b: Matrix::new(num_equations + num_variables, 1),
-            num_equations,
-            num_variables,
+/// Absolute and column-scaled measures of the nonlinear least-squares gradient
+/// at one accepted solver state.
+///
+/// Keeping the two values together ensures successful and failed results report
+/// the same gradient geometry without recomputing it through a different
+/// floating-point order.
+#[derive(Debug, Clone, Copy)]
+struct ResidualGradientMeasure {
+    /// Euclidean norm of `J_scaled^T f_scaled` in normalized variable units.
+    absolute_norm: f64,
+    /// Largest absolute cosine between `f` and a non-zero column of `J`.
+    ///
+    /// The value is absent only when `f` is zero. Zero Jacobian columns
+    /// contribute zero, so an entirely zero Jacobian at a non-root produces
+    /// `Some(0.0)`. This remains a descriptive gradient diagnostic; termination
+    /// is derived from the retained singular subspace that also produces the
+    /// Newton correction.
+    relative_norm: Option<f64>,
+}
+
+/// Complete numerical policy for one reusable nonlinear solver.
+///
+/// Fields are public so pre-alpha callers can start from [`SolverOptions::default`]
+/// or from [`NewtonRaphsonSolver::options`], change only the relevant values,
+/// and install the result with [`NewtonRaphsonSolver::with_options`]. Fields used
+/// by the selected solve path are validated when that solve begins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolverOptions {
+    /// Maximum number of accepted Newton updates before `NoConvergence`.
+    pub max_iterations: usize,
+    /// Inclusive maximum norm of equation-scale-normalized residuals for a
+    /// successful [`Solution`].
+    pub residual_tolerance: f64,
+    /// Maximum number of halvings after the full Newton step is rejected.
+    ///
+    /// Zero tests only `alpha = 1`; `n` permits exactly `n + 1` candidates:
+    /// `1, 1/2, ..., 1/2^n`, unless an earlier candidate is accepted or can no
+    /// longer change the floating-point variable state.
+    pub max_backtracks: usize,
+}
+
+impl Default for SolverOptions {
+    /// Return the crate's single globalized Newton policy.
+    fn default() -> Self {
+        // Keep every numerical constant visible in one value rather than
+        // scattering hidden policy through iteration and factorization bodies.
+        Self {
+            max_iterations: 100,
+            residual_tolerance: 1e-10,
+            max_backtracks: 40,
         }
     }
-}
-
-enum LeastSquaresSolveError {
-    InvalidInput(MatrixError),
-    Singular { qr_err: String, normal_eq_err: String },
 }
 
 /// Newton-Raphson solver for systems of nonlinear equations
@@ -65,109 +159,329 @@ enum LeastSquaresSolveError {
 /// - Under-constrained systems (equations < variables) - uses least squares
 /// - Over-constrained systems (equations > variables) - uses least squares
 ///
-/// The solver uses adaptive damping and regularization for numerical stability.
+/// Every correction is the retained Moore-Penrose minimum-norm result from the
+/// normalized Jacobian and is accepted transactionally by Armijo backtracking.
 pub struct NewtonRaphsonSolver {
-    /// The system of equations to solve (each equation should equal zero)
-    equations: Vec<CompiledExp>,
+    /// Residual expressions and their simplified symbolic partial derivatives.
+    ///
+    /// Keeping this cache on the reusable solver avoids repeating symbolic
+    /// differentiation every time [`NewtonRaphsonSolver::solve`] is called.
+    jacobian: Jacobian,
     /// Variable IDs that correspond to unknowns in the system
     variables: Vec<VarId>,
     /// Registry of all variables referenced by the compiled system
     var_table: VarTable,
-    /// Maximum number of iterations before giving up
-    max_iterations: usize,
-    /// Convergence tolerance (solution found when |f(x)| < tolerance)
-    tolerance: f64,
-    /// Initial damping factor (step size multiplier, 0 < damping <= 1)
-    /// Lower values make convergence more stable but slower
-    damping_factor: f64,
-    /// Minimum allowed damping before declaring convergence failure
-    min_damping: f64,
-    /// Base regularization parameter used when the system is ill-conditioned
-    regularization: f64,
+    /// Positive characteristic magnitude for each residual equation.
+    ///
+    /// Entry order matches compiled equations. The solver divides residual row
+    /// `i` and Jacobian row `i` by this value, so larger scales reduce an
+    /// equation's weight in convergence, retained-model classification, Armijo,
+    /// and least squares without changing raw diagnostic residuals.
+    equation_scales: Vec<f64>,
+    /// Positive characteristic magnitude for each solve variable.
+    ///
+    /// Entry order matches `variables`. Jacobian column `j` is multiplied by
+    /// this value, and accepted normalized corrections are converted back to
+    /// caller units with the same factor. In a wide or rank-deficient model,
+    /// these values also define the pseudoinverse's minimum-norm tie-break after
+    /// the linearized residual is minimized.
+    variable_scales: Vec<f64>,
+    /// Numerical policy validated for the selected path at each solve boundary.
+    options: SolverOptions,
     /// Optional metadata describing the source of each equation in the system
     equation_traces: Vec<Option<EquationTrace>>,
-    /// Execution mode for linear algebra (serial vs parallel)
-    mode: Mode,
-    /// Optional thread pool for parallel execution
-    pool: Option<ThreadPool>,
 }
 
-/// Solution result containing the solved variable values and convergence info
+/// Successful solver result with values and explicit convergence diagnostics.
+///
+/// Constructing this value certifies that the scaled Euclidean residual norm is
+/// at most the configured root tolerance. Stationary non-roots are returned through
+/// [`SolverError::StationaryNonRoot`] and can never produce `Solution`.
 #[derive(Debug, Clone)]
 pub struct Solution {
-    /// Final values of all variables (variable name -> value)
+    /// Finite final values of every compiled variable, including fixed
+    /// parameters.
     pub values: HashMap<String, f64>,
-    /// Number of iterations taken to converge
+    /// Number of accepted Newton updates. An already-solved initial guess
+    /// therefore reports zero iterations.
     pub iterations: usize,
-    /// Final residual error |f(x)|
+    /// Euclidean norm of `raw_residual_i / equation_scale_i`, evaluated at
+    /// exactly the values returned in `values`.
     pub error: f64,
-    /// Whether the solver successfully converged
-    pub converged: bool,
-    /// History of error values throughout the iteration process
-    pub convergence_history: Vec<f64>,
+    /// Norm of the normalized gradient `J_scaled^T f_scaled` at the returned
+    /// values, provided as a descriptive least-squares diagnostic.
+    ///
+    /// This diagnostic may be positive infinity when every underlying value and
+    /// relative gradient geometry is finite but the absolute physical gradient
+    /// magnitude exceeds `f64::MAX`. Such representational overflow is not a
+    /// non-finite solver state and does not invalidate a converged root.
+    pub gradient_norm: f64,
+    /// Largest absolute cosine between the residual and a Jacobian column.
+    ///
+    /// `None` means the residual was zero, so its direction was undefined. A
+    /// successful exact root therefore reports `None` here.
+    pub relative_gradient_norm: Option<f64>,
+    /// Successful linearized solve attempt that produced the most recent
+    /// accepted update represented by this solution.
+    ///
+    /// `None` means the initial point already satisfied the root tolerance and
+    /// therefore required no linearized solve. A failed factorization returns a
+    /// [`SolverError`] and cannot produce `Solution`.
+    pub last_linear_attempt: Option<LeastSquaresInfo>,
 }
 
-/// Provides traceability information back to the constraint that generated an equation
-#[derive(Debug, Clone)]
+/// Caller-owned numerical storage reusable across solves of one system shape.
+///
+/// Create a workspace with [`NewtonRaphsonSolver::workspace`] after configuring
+/// the solver, then pass it to every [`NewtonRaphsonSolver::solve`] call. The
+/// solver overwrites these private buffers but never resizes or replaces them.
+/// Use a separate workspace for each concurrently executing solve.
+pub struct SolverWorkspace {
+    /// Residual-equation count this workspace accepts.
+    equation_count: usize,
+    /// Solved-variable count this workspace accepts.
+    variable_count: usize,
+    /// Total compiled-variable count, including fixed parameter values.
+    ///
+    /// Unlike `variable_count`, this dimension determines the required capacity
+    /// of both name-translated value maps used during candidate evaluation.
+    compiled_variable_count: usize,
+    /// Accepted internal variable values keyed by compact compiled IDs.
+    vars: HashMap<VarId, f64>,
+    /// Transaction buffer for line-search candidate variable values.
+    candidate_vars: HashMap<VarId, f64>,
+    /// Reusable evaluated symbolic Jacobian storage.
+    jacobian: JacobianWorkspace,
+    /// Raw residuals at the current accepted point.
+    residuals: Matrix,
+    /// Equation-scaled residuals at the current accepted point.
+    scaled_residuals: Matrix,
+    /// Negated scaled residual right-hand side for the Newton correction.
+    correction_rhs: Matrix,
+    /// Equation- and variable-scaled Jacobian at the accepted point.
+    scaled_jacobian: Matrix,
+    /// Minimum-norm normalized correction produced by the linear solve.
+    correction: Matrix,
+    /// Raw residuals at the current line-search candidate.
+    candidate_residuals: Matrix,
+    /// Equation-scaled residuals at the current line-search candidate.
+    candidate_scaled_residuals: Matrix,
+    /// Reusable Jacobi-SVD factorization and projection storage.
+    least_squares: LeastSquaresWorkspace,
+}
+
+/// Metadata connecting one compiled residual equation to its source constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EquationTrace {
+    /// Caller-defined stable identifier for the source constraint.
     pub constraint_id: usize,
+    /// Human-readable description suitable for logs and failure reports.
     pub description: String,
 }
 
-/// Diagnostic data captured when the solver fails
-#[derive(Debug, Clone)]
-pub struct SolverRunDiagnostic {
-    pub message: String,
-    pub iterations: usize,
-    pub error: f64,
-    /// Variable values at the end of the run (variable name -> value)
-    pub values: HashMap<String, f64>,
-    pub residuals: Vec<f64>,
+/// Residual and optional source metadata for one equation at a failed solver
+/// state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EquationDiagnostic {
+    /// Zero-based equation index matching compilation order.
+    pub equation_index: usize,
+    /// Signed scalar residual evaluated at the diagnostic's `values`.
+    pub residual: f64,
+    /// Dimensionless residual `residual / equation_scale` used by convergence,
+    /// retained-model classification, Armijo acceptance, and the linearized
+    /// solve.
+    pub scaled_residual: f64,
+    /// Caller-provided source metadata, or `None` when no trace was attached for
+    /// this equation.
+    pub trace: Option<EquationTrace>,
 }
 
-/// Possible solver error conditions
+/// Complete numerical state captured when a solver run fails.
+#[derive(Debug, Clone)]
+pub struct SolverRunDiagnostic {
+    /// Human-readable summary of the terminating failure.
+    pub message: String,
+    /// Number of accepted Newton updates represented by the diagnostic state.
+    pub iterations: usize,
+    /// Euclidean norm of all `EquationDiagnostic::scaled_residual` entries.
+    pub error: f64,
+    /// Norm of `J_scaled^T f_scaled` when the terminating path evaluated the
+    /// current Jacobian. The contained value may be positive infinity when only
+    /// the reconstructed absolute diagnostic exceeds `f64` range.
+    ///
+    /// Other failures report `None` because computing a fresh Jacobian merely
+    /// for diagnostics could itself fail or obscure the original error.
+    pub gradient_norm: Option<f64>,
+    /// Largest absolute residual/Jacobian-column cosine when it was defined and
+    /// evaluated at the diagnostic state.
+    pub relative_gradient_norm: Option<f64>,
+    /// Most recent successful linearized solve attempt represented by this
+    /// failure state, whether or not line search accepted its correction.
+    ///
+    /// `None` means failure occurred before any correction was produced, such as
+    /// an invalid initial residual or Jacobian evaluation. A stationary non-root
+    /// has `Some` because its zero retained projection is established by a
+    /// completed factorization.
+    pub last_linear_attempt: Option<LeastSquaresInfo>,
+    /// Variable values at the end of the run, keyed by compiled variable name.
+    pub values: HashMap<String, f64>,
+    /// Per-equation residuals enriched with any attached source metadata.
+    pub equations: Vec<EquationDiagnostic>,
+}
+
+/// Failures returned by solver construction, validation, and iteration.
 #[derive(Debug, Clone)]
 pub enum SolverError {
-    /// Jacobian matrix became singular and couldn't be inverted
-    SingularMatrix(SolverRunDiagnostic),
-    /// Failed to converge within the maximum number of iterations
-    NoConvergence(SolverRunDiagnostic),
-    /// A required variable was missing during evaluation
-    MissingVariable(MissingVarError),
-    /// Invalid input parameters or system setup
+    /// The configured update budget or line search ended without convergence.
+    /// The diagnostic is boxed to keep the error enum compact.
+    NoConvergence(Box<SolverRunDiagnostic>),
+    /// The accepted solver state, its expression or Jacobian evaluation, a
+    /// correction, or a required descent quantity became NaN or infinity.
+    ///
+    /// Non-finite line-search candidates are rejected transactionally and may
+    /// instead end as [`SolverError::NoConvergence`] after all backtracks. An
+    /// infinite absolute gradient *diagnostic* is also permitted when its
+    /// finite relative column-alignment measure remains meaningful.
+    /// The diagnostic is boxed to keep the error enum compact.
+    NonFiniteEvaluation(Box<SolverRunDiagnostic>),
+    /// The residual remains above its root tolerance while the retained
+    /// Jacobian model has no reducible right-hand-side component.
+    ///
+    /// This applies uniformly to square, underdetermined, and overdetermined
+    /// systems. It describes the rank-truncated local linear model and does not
+    /// claim that the nonlinear state is a local minimum; maxima and saddles can
+    /// produce the same non-success result.
+    StationaryNonRoot(Box<SolverRunDiagnostic>),
+    /// A matrix operation failed while constructing or solving a nonlinear
+    /// correction.
+    Matrix {
+        /// Original typed matrix failure, including machine-readable shape,
+        /// operand, operation, or arithmetic metadata.
+        source: MatrixError,
+        /// Complete accepted nonlinear state at which the matrix failure
+        /// occurred.
+        diagnostic: Box<SolverRunDiagnostic>,
+    },
+    /// Invalid input parameters or system setup.
     InvalidInput(String),
 }
 
-impl From<MissingVarError> for SolverError {
-    fn from(value: MissingVarError) -> Self {
-        SolverError::MissingVariable(value)
+impl fmt::Display for SolverError {
+    /// Format the concise diagnostic summary while preserving structured state
+    /// for callers that pattern-match the error.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SolverError::NoConvergence(diagnostic) => {
+                write!(f, "Solver did not converge: {}", diagnostic.message)
+            }
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                write!(f, "Non-finite solver evaluation: {}", diagnostic.message)
+            }
+            SolverError::StationaryNonRoot(diagnostic) => {
+                write!(
+                    f,
+                    "Stationary point is not a constraint root: {}",
+                    diagnostic.message
+                )
+            }
+            SolverError::Matrix { source, diagnostic } => write!(
+                f,
+                "Correction matrix operation failed after {} accepted updates: {source}",
+                diagnostic.iterations
+            ),
+            SolverError::InvalidInput(message) => write!(f, "Invalid solver input: {message}"),
+        }
     }
 }
 
-impl From<MatrixError> for SolverError {
-    fn from(value: MatrixError) -> Self {
-        SolverError::InvalidInput(value.to_string())
+impl std::error::Error for SolverError {
+    /// Expose nested structured causes through the standard error chain.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Run diagnostics and input messages originate at this solver layer.
+        // Only a retained matrix failure has a lower-level source object.
+        match self {
+            SolverError::Matrix { source, .. } => Some(source),
+            SolverError::NoConvergence(_)
+            | SolverError::NonFiniteEvaluation(_)
+            | SolverError::StationaryNonRoot(_)
+            | SolverError::InvalidInput(_) => None,
+        }
+    }
+}
+
+impl From<EvaluationError> for SolverError {
+    /// Convert an impossible-after-validation evaluation mismatch into an
+    /// explicit invariant failure without exposing an unreachable public error
+    /// variant.
+    fn from(value: EvaluationError) -> Self {
+        SolverError::InvalidInput(format!(
+            "Internal compiled-system invariant failed: {value}"
+        ))
+    }
+}
+
+impl SolverWorkspace {
+    /// Allocate every mutable numerical buffer required by one configured solver.
+    ///
+    /// This constructor stays behind [`NewtonRaphsonSolver::workspace`] so the
+    /// workspace always reflects the solver's equation, selected-variable, and
+    /// complete compiled-variable counts.
+    #[track_caller]
+    fn new(solver: &NewtonRaphsonSolver) -> Self {
+        let equation_count = solver.jacobian.equation_count();
+        let variable_count = solver.variables.len();
+        let compiled_variable_count = solver.var_table.len();
+
+        // All matrices are constructed at their final direct-Jacobian shape, so
+        // the sole correction path neither resizes nor replaces storage while a
+        // solve is running.
+        Self {
+            equation_count,
+            variable_count,
+            compiled_variable_count,
+            vars: HashMap::with_capacity(compiled_variable_count),
+            candidate_vars: HashMap::with_capacity(compiled_variable_count),
+            jacobian: solver.jacobian.workspace(),
+            residuals: Matrix::new(equation_count, 1),
+            scaled_residuals: Matrix::new(equation_count, 1),
+            correction_rhs: Matrix::new(equation_count, 1),
+            scaled_jacobian: Matrix::new(equation_count, variable_count),
+            correction: Matrix::new(variable_count, 1),
+            candidate_residuals: Matrix::new(equation_count, 1),
+            candidate_scaled_residuals: Matrix::new(equation_count, 1),
+            least_squares: LeastSquaresWorkspace::new(equation_count, variable_count),
+        }
+    }
+
+    /// Return whether this workspace matches every allocation-bearing solver
+    /// dimension.
+    fn is_compatible_with(&self, solver: &NewtonRaphsonSolver) -> bool {
+        let equation_count = solver.jacobian.equation_count();
+        let variable_count = solver.variables.len();
+        let compiled_variable_count = solver.var_table.len();
+
+        // Matrix buffers derive from equation and selected-variable counts.
+        // Value maps additionally hold fixed parameters, so accepting a
+        // workspace with a different complete count could force growth during
+        // initial-guess translation or candidate cloning.
+        self.equation_count == equation_count
+            && self.variable_count == variable_count
+            && self.compiled_variable_count == compiled_variable_count
     }
 }
 
 impl NewtonRaphsonSolver {
-    /// Create a new Newton-Raphson solver with adaptive parameters
+    /// Create a Newton-Raphson solver with one shape-independent policy.
     ///
-    /// Parameters are automatically adjusted based on system type:
-    /// - Over-constrained systems get more iterations, relaxed tolerance, conservative damping
-    /// - Normal systems use standard parameters for fast convergence
+    /// Square, tall, and wide systems begin with identical iteration,
+    /// backtracking, and tolerance settings. Callers can replace those explicit
+    /// defaults through [`NewtonRaphsonSolver::with_options`].
     ///
     /// # Arguments
     /// * `compiled` - Compiled system of equations (each should evaluate to 0 at solution)
     pub fn new(compiled: CompiledSystem) -> Self {
         let variables = compiled.var_table.all_var_ids();
         Self::build(compiled, variables)
-    }
-
-    /// Create a new solver with an explicit execution mode.
-    pub fn new_with_mode(compiled: CompiledSystem, mode: Mode) -> Result<Self, SolverError> {
-        let variables = compiled.var_table.all_var_ids();
-        Self::build_with_mode(compiled, variables, mode)
     }
 
     /// Create a solver while specifying which variables to solve for.
@@ -192,515 +506,508 @@ impl NewtonRaphsonSolver {
         Ok(Self::build(compiled, ids))
     }
 
-    /// Create a solver with explicit variables and execution mode.
-    pub fn new_with_variables_and_mode(
-        compiled: CompiledSystem,
-        variables: &[&str],
-        mode: Mode,
-    ) -> Result<Self, SolverError> {
-        let mut ids = Vec::with_capacity(variables.len());
-        let mut seen = std::collections::HashSet::new();
-        for name in variables {
-            let id = compiled
-                .var_table
-                .get_id(name)
-                .ok_or_else(|| SolverError::InvalidInput(format!("Unknown variable '{name}'")))?;
-            if seen.insert(id) {
-                ids.push(id);
-            }
-        }
-
-        Self::build_with_mode(compiled, ids, mode)
-    }
-
     fn build(compiled: CompiledSystem, variables: Vec<VarId>) -> Self {
-        // Allow both under-constrained and over-constrained systems
-        // We'll use least squares to solve them
-        let is_over_constrained = compiled.equations.len() > variables.len();
+        // Symbolic differentiation depends only on the compiled equations and
+        // selected solve variables, both of which are immutable for the
+        // solver's lifetime. Construct and simplify every derivative here so
+        // repeated numerical solves share the result.
+        let jacobian = Jacobian::new(compiled.equations, variables.clone());
+        let equation_scales = vec![1.0; jacobian.equation_count()];
+        let variable_scales = vec![1.0; variables.len()];
 
         NewtonRaphsonSolver {
-            equations: compiled.equations,
+            jacobian,
             variables,
             var_table: compiled.var_table,
-            // Over-constrained systems are harder to converge, so give them more iterations
-            max_iterations: if is_over_constrained { 200 } else { 100 },
-            // Over-constrained systems use relaxed tolerance since exact solutions may not exist
-            tolerance: if is_over_constrained { 1e-8 } else { 1e-10 },
-            // Over-constrained systems use conservative damping for stability
-            damping_factor: if is_over_constrained { 0.7 } else { 1.0 },
-            min_damping: 0.001,
-            // Over-constrained systems need more regularization for numerical stability
-            regularization: if is_over_constrained { 1e-4 } else { 1e-8 },
+            // Unit scales preserve historical unscaled equations and variable
+            // coordinates until a caller explicitly supplies characteristic
+            // magnitudes.
+            equation_scales,
+            variable_scales,
+            // One numerical policy applies to square, tall, and wide systems.
+            // Shape-specific hidden defaults would make otherwise identical
+            // APIs change iteration or globalization behavior unexpectedly.
+            options: SolverOptions::default(),
             equation_traces: Vec::new(),
-            mode: Mode::Serial,
-            pool: None,
         }
     }
 
-    fn build_with_mode(
-        compiled: CompiledSystem,
-        variables: Vec<VarId>,
-        mode: Mode,
-    ) -> Result<Self, SolverError> {
-        let mut solver = Self::build(compiled, variables);
-        solver.set_mode(mode)?;
-        Ok(solver)
+    /// Borrow the complete numerical policy currently installed on the solver.
+    pub fn options(&self) -> &SolverOptions {
+        // Returning a shared reference makes inspection allocation-free while
+        // preventing validation from being bypassed during an active solve.
+        &self.options
     }
 
-    /// Update the execution mode for this solver.
-    pub fn with_mode(mut self, mode: Mode) -> Result<Self, SolverError> {
-        self.set_mode(mode)?;
+    /// Replace the complete numerical policy used by subsequent solves.
+    pub fn with_options(mut self, options: SolverOptions) -> Self {
+        // Preserve caller values verbatim. The solve boundary validates the
+        // fields that can affect its selected numerical path.
+        self.options = options;
+        self
+    }
+
+    /// Set one positive characteristic scale per compiled residual equation.
+    ///
+    /// Residual `f_i` is normalized as `f_i / scale_i`. Consequently the
+    /// configured residual tolerance is dimensionless, and choosing a larger
+    /// characteristic scale gives that equation less least-squares weight. The
+    /// vector must follow compilation order and contain exactly one entry per
+    /// equation.
+    pub fn with_equation_scales(mut self, scales: Vec<f64>) -> Result<Self, SolverError> {
+        if scales.len() != self.jacobian.equation_count() {
+            return Err(SolverError::InvalidInput(format!(
+                "Equation scale length ({}) does not match number of equations ({})",
+                scales.len(),
+                self.jacobian.equation_count()
+            )));
+        }
+        if let Some((index, _)) = scales
+            .iter()
+            .enumerate()
+            .find(|(_, scale)| !scale.is_finite() || **scale <= 0.0)
+        {
+            return Err(SolverError::InvalidInput(format!(
+                "Equation scale at index {index} must be finite and greater than zero"
+            )));
+        }
+        self.equation_scales = scales;
         Ok(self)
     }
 
-    /// Returns the current execution mode.
-    pub fn mode(&self) -> &Mode {
-        &self.mode
-    }
+    /// Override characteristic scales for named solve variables.
+    ///
+    /// Variable `x_j` is normalized as `x_j / scale_j`, so the linearized
+    /// Jacobian column is multiplied by `scale_j` and a normalized correction is
+    /// multiplied by the same value before updating caller-visible variables.
+    /// Among corrections that minimize the equation-scaled linearized residual,
+    /// the pseudoinverse selects one minimizing the normalized Euclidean norm,
+    /// equivalently `sqrt(sum((delta_x_j / scale_j)^2))` in caller coordinates.
+    /// Variable scales can therefore select a different correction among the
+    /// valid directions of a wide or rank-deficient model; they are not merely
+    /// an internal conditioning hint.
+    ///
+    /// Names omitted from the map retain their current scale, initially one.
+    /// Unknown names and fixed parameters are rejected rather than ignored.
+    pub fn with_variable_scales(
+        mut self,
+        scales: HashMap<String, f64>,
+    ) -> Result<Self, SolverError> {
+        // Sort the caller's unordered map so the first reported invalid entry is
+        // deterministic across processes and hash seeds.
+        let mut entries: Vec<_> = scales.into_iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    fn set_mode(&mut self, mode: Mode) -> Result<(), SolverError> {
-        let pool = build_thread_pool(&mode).map_err(SolverError::InvalidInput)?;
-        self.mode = mode;
-        self.pool = pool;
-        Ok(())
-    }
-
-    fn parallel_enabled(&self) -> bool {
-        self.pool.is_some()
-    }
-
-    fn run_in_mode<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R + Send,
-        R: Send,
-    {
-        if let Some(pool) = &self.pool {
-            pool.install(f)
-        } else {
-            f()
+        for (name, scale) in entries {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(SolverError::InvalidInput(format!(
+                    "Variable scale for '{name}' must be finite and greater than zero"
+                )));
+            }
+            let variable_id = self.var_table.get_id(&name).ok_or_else(|| {
+                SolverError::InvalidInput(format!("Unknown variable scale name '{name}'"))
+            })?;
+            let column = self
+                .variables
+                .iter()
+                .position(|candidate| *candidate == variable_id)
+                .ok_or_else(|| {
+                    SolverError::InvalidInput(format!(
+                        "Variable scale '{name}' refers to a fixed parameter, not a solve variable"
+                    ))
+                })?;
+            self.variable_scales[column] = scale;
         }
+        Ok(self)
     }
 
-    /// Attach metadata describing the origin of each equation in the system
-    pub fn try_with_equation_traces(
+    /// Borrow equation characteristic scales in compilation order.
+    pub fn equation_scales(&self) -> &[f64] {
+        &self.equation_scales
+    }
+
+    /// Return the characteristic scale of a named solve variable.
+    ///
+    /// `None` indicates that the name is unknown or belongs to a fixed
+    /// parameter rather than a Jacobian column.
+    pub fn variable_scale(&self, name: &str) -> Option<f64> {
+        let variable_id = self.var_table.get_id(name)?;
+        let column = self
+            .variables
+            .iter()
+            .position(|candidate| *candidate == variable_id)?;
+        Some(self.variable_scales[column])
+    }
+
+    /// Attach optional source metadata for every equation in compilation order.
+    ///
+    /// The trace vector must contain exactly one entry per equation, including
+    /// for an empty system. Use `None` for an equation whose source is unknown.
+    /// This fallible builder avoids the former API's input-dependent panic.
+    pub fn with_equation_traces(
         mut self,
         traces: Vec<Option<EquationTrace>>,
     ) -> Result<Self, SolverError> {
-        if !self.equations.is_empty() && traces.len() != self.equations.len() {
+        // Exact cardinality preserves the positional equation-to-trace mapping;
+        // accepting arbitrary entries for an empty system would create metadata
+        // that could never appear in a residual diagnostic.
+        if traces.len() != self.jacobian.equation_count() {
             return Err(SolverError::InvalidInput(format!(
                 "Equation trace length ({}) does not match number of equations ({})",
                 traces.len(),
-                self.equations.len()
+                self.jacobian.equation_count()
             )));
         }
         self.equation_traces = traces;
         Ok(self)
     }
 
-    /// Attach metadata describing the origin of each equation in the system
-    pub fn with_equation_traces(self, traces: Vec<Option<EquationTrace>>) -> Self {
-        self.try_with_equation_traces(traces)
-            .unwrap_or_else(|err| match err {
-                SolverError::InvalidInput(msg) => panic!("{}", msg),
-                other => panic!("{other:?}"),
-            })
-    }
-
-    /// Fetch trace metadata for a specific equation, if available
+    /// Fetch source metadata for a specific equation, if an entry was attached.
+    ///
+    /// Returns `None` both for an out-of-range index and for an explicitly
+    /// untraced equation.
     pub fn trace_for_equation(&self, equation_index: usize) -> Option<&EquationTrace> {
+        // Preserve borrowing so callers can inspect potentially long
+        // descriptions without cloning them.
         self.equation_traces
             .get(equation_index)
             .and_then(|entry| entry.as_ref())
     }
 
-    /// Override the maximum number of iterations
+    /// Override the maximum number of accepted Newton updates.
+    ///
+    /// Configuration is validated when a solve begins; zero is rejected as
+    /// `SolverError::InvalidInput`.
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.max_iterations = max_iterations;
+        // Preserve the caller's exact value so validation can report invalid
+        // input rather than silently substituting a different iteration limit.
+        self.options.max_iterations = max_iterations;
         self
     }
 
-    /// Override the convergence tolerance
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.tolerance = tolerance;
+    /// Override the positive, finite scaled residual norm required for success.
+    ///
+    /// The solver deliberately does not treat a small applied update as
+    /// convergence because backtracking can make a useful correction
+    /// arbitrarily small. Configuration is validated when a solve begins.
+    pub fn with_residual_tolerance(mut self, residual_tolerance: f64) -> Self {
+        // Store without clamping so NaN, infinity, zero, and negative values are
+        // observable to the common configuration validator.
+        self.options.residual_tolerance = residual_tolerance;
         self
     }
 
-    /// Override the damping factor (clamped to [0.1, 1.0] for stability)
-    pub fn with_damping(mut self, damping_factor: f64) -> Self {
-        self.damping_factor = damping_factor.clamp(0.1, 1.0);
+    /// Override the number of halvings permitted after a rejected full step.
+    ///
+    /// The complete candidate budget is `max_backtracks + 1`; zero therefore
+    /// retains one tested full step rather than disabling globalization.
+    pub fn with_max_backtracks(mut self, max_backtracks: usize) -> Self {
+        // Store the exact count. Floating-point no-change detection terminates
+        // even an intentionally enormous budget once further halving is useless.
+        self.options.max_backtracks = max_backtracks;
         self
     }
 
-    /// Override the base regularization parameter used when the system is ill-conditioned
-    pub fn with_regularization(mut self, regularization: f64) -> Self {
-        self.regularization = regularization.max(0.0);
-        self
+    /// Allocate reusable numerical storage for this configured solver.
+    ///
+    /// Construct one workspace after applying all solver builders and reuse it
+    /// across sequential solves. Concurrent solves require distinct workspaces
+    /// because each invocation mutates its accepted and candidate buffers.
+    #[track_caller]
+    pub fn workspace(&self) -> SolverWorkspace {
+        SolverWorkspace::new(self)
     }
 
-    /// Solve the system using standard Newton-Raphson method
-    pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
-        let vars = self.map_initial_guess(initial_guess)?;
-        self.run_in_mode(|| self.solve_modified_internal(vars, false))
+    /// Solve using caller-owned numerical storage and Armijo backtracking.
+    ///
+    /// The numerical iteration and factorization allocate nothing. The returned
+    /// owned [`Solution`] or a terminal [`SolverError`] may allocate its public
+    /// name-keyed values and diagnostic text after iteration terminates.
+    pub fn solve(
+        &self,
+        initial_guess: HashMap<String, f64>,
+        workspace: &mut SolverWorkspace,
+    ) -> Result<Solution, SolverError> {
+        // Reject invalid reusable settings before translating or validating the
+        // caller's variable map.
+        self.validate_configuration()?;
+        if !workspace.is_compatible_with(self) {
+            return Err(SolverError::InvalidInput(
+                "solver workspace does not match equation, selected-variable, or compiled-variable shape"
+                    .to_string(),
+            ));
+        }
+        self.map_initial_guess_into(initial_guess, &mut workspace.vars)?;
+        workspace.candidate_vars.clone_from(&workspace.vars);
+        self.solve_internal(workspace)
     }
 
-    /// Core Newton-Raphson solver implementation with optional line search
+    /// Allocate one temporary workspace for tests focused on numerical policy.
+    ///
+    /// Production examples and allocation regressions exercise the explicit
+    /// reusable API. This helper keeps unrelated unit fixtures concise without
+    /// adding an allocating convenience method to the public solver contract.
+    #[cfg(test)]
+    pub(crate) fn solve_once(
+        &self,
+        initial_guess: HashMap<String, f64>,
+    ) -> Result<Solution, SolverError> {
+        let mut workspace = self.workspace();
+        self.solve(initial_guess, &mut workspace)
+    }
+
+    /// Run the solver's single accepted-state Newton iteration.
     ///
     /// # Arguments
     /// * `initial_guess` - Starting values for all variables (by name)
-    /// * `use_line_search` - Whether to use backtracking line search for step size
-    ///
     /// # Algorithm
-    /// 1. Evaluate f(x) and check for convergence
-    /// 2. Compute Jacobian J = df/dx
-    /// 3. Solve linear system: J * delta = -f(x)
-    ///    - Square systems: Direct LU decomposition
-    ///    - Under/over-constrained: QR least squares (with adaptive regularization if needed)
-    /// 4. Update: x_new = x_old + damping * delta
-    /// 5. Adapt damping based on error change
-    fn solve_modified_internal(
-        &self,
-        initial_guess: HashMap<VarId, f64>,
-        use_line_search: bool,
-    ) -> Result<Solution, SolverError> {
-        self.validate_initial_guess(&initial_guess)?;
+    /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
+    /// 2. Check residual-based root termination
+    /// 3. Solve normalized `J * delta = -f(x)` by SVD
+    /// 4. Use that factorization's retained residual projection to classify
+    ///    model stationarity and derive the Armijo slope
+    /// 5. Backtrack transactionally until sufficient decrease holds
+    /// 6. Commit the already-evaluated candidate as the next accepted state
+    fn solve_internal(&self, workspace: &mut SolverWorkspace) -> Result<Solution, SolverError> {
+        // Borrow the construction-time symbolic cache and every caller-owned
+        // numerical buffer for the duration of this solve.
+        let jacobian = &self.jacobian;
+        // Retain the most recent successful linear solve attempt independently
+        // from line-search acceptance. This is attempt provenance, while `iter`
+        // continues to count only accepted state changes.
+        let mut last_linear_attempt: Option<LeastSquaresInfo> = None;
 
-        let mut vars = initial_guess.clone();
-        let jacobian = Jacobian::new(self.equations.clone(), self.variables.clone());
-        // Cache Jacobian storage to avoid per-iteration allocations.
-        let mut jacobian_workspace = jacobian.workspace();
-        let mut convergence_history = Vec::with_capacity(self.max_iterations);
-        // Start with configured damping factor, will be adapted during iterations
-        let mut damping = self.damping_factor;
-        let mut last_error = f64::INFINITY;
+        let num_equations = workspace.equation_count;
+        let SolverWorkspace {
+            vars,
+            candidate_vars,
+            jacobian: jacobian_workspace,
+            residuals: f_vals,
+            scaled_residuals: scaled_f_vals,
+            correction_rhs: f_neg,
+            scaled_jacobian,
+            correction: delta,
+            candidate_residuals: candidate_f_vals,
+            candidate_scaled_residuals: candidate_scaled_f_vals,
+            least_squares,
+            ..
+        } = workspace;
+        // Populate the complete initial accepted state once. Subsequent
+        // residuals arrive from successful line-search candidates, while each
+        // newly accepted point receives exactly one Jacobian evaluation.
+        jacobian.evaluate_functions_checked_into(vars, f_vals)?;
+        jacobian.evaluate_checked_in_workspace(vars, jacobian_workspace)?;
+        self.scale_residuals_into(f_vals, scaled_f_vals);
+        self.scale_jacobian_into(jacobian_workspace.jacobian(), scaled_jacobian);
 
-        let num_equations = self.equations.len();
-        let num_variables = self.variables.len();
+        if !f_vals.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Residual evaluation produced NaN or infinity",
+                0,
+                vars,
+                f_vals,
+                None,
+            ));
+        }
+        if !jacobian_workspace.jacobian().all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Jacobian evaluation produced NaN or infinity",
+                0,
+                vars,
+                f_vals,
+                None,
+            ));
+        }
+        if !scaled_f_vals.all_finite() || !scaled_jacobian.all_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Equation or variable scaling produced NaN or infinity",
+                0,
+                vars,
+                f_vals,
+                None,
+            ));
+        }
+        // The current state is always fully evaluated at loop entry. A mutable
+        // accepted-update count lets the budget-exhausted state receive the same
+        // root and retained-model checks without a special final evaluation path.
+        let mut iter = 0;
+        loop {
+            let error = scaled_f_vals.norm();
 
-        let mut f_vals = Matrix::new(num_equations, 1);
-        let mut f_neg = Matrix::new(num_equations, 1);
-        jacobian_workspace.replace_jacobian(jacobian.evaluate_checked(&vars)?);
-
-        let mut line_search_f_vals = Matrix::new(num_equations, 1);
-
-        let mut least_squares_workspace =
-            if self.regularization > 0.0 && num_equations != num_variables {
-                Some(LeastSquaresWorkspace::new(
-                    num_equations,
-                    num_variables,
-                    self.regularization.sqrt(),
-                ))
-            } else {
-                None
-            };
-        let parallel = self.parallel_enabled();
-
-        for iter in 0..self.max_iterations {
-            // Step 1: Evaluate function values f(x)
-            jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
-            let error = f_vals.norm();
-            convergence_history.push(error);
-
-            // Check for convergence: |f(x)| < tolerance
-            if error < self.tolerance {
-                return Ok(Solution {
-                    values: self.values_by_name(&vars),
-                    iterations: iter + 1,
-                    error,
-                    converged: true,
-                    convergence_history,
-                });
+            // A successful result requires the actual constraints to satisfy
+            // the residual threshold before any mutation is attempted. Every
+            // accepted iteration below is therefore one residual correction;
+            // no secondary point-selection policy can move or starve a root.
+            if error <= self.options.residual_tolerance {
+                // The Jacobian workspace already corresponds to `vars`, so the
+                // reported gradient norm is evaluated at the same point as the
+                // residual and returned values.
+                let gradient = Self::residual_gradient_measure(scaled_jacobian, scaled_f_vals);
+                return Ok(self.build_solution(vars, iter, error, gradient, last_linear_attempt));
             }
 
-            // Check for stagnation (error not decreasing significantly)
-            if iter > 0 && (error - last_error).abs() < self.tolerance * 0.1 {
-                damping *= 0.5; // Reduce step size
-                if damping < self.min_damping {
-                    let diag = self.build_diagnostic(
-                        format!(
-                            "Solver stagnated at iteration {} with error {:.2e}",
-                            iter + 1,
-                            error
-                        ),
-                        iter + 1,
-                        &vars,
-                        &f_vals,
-                    );
-                    return Err(SolverError::NoConvergence(diag));
-                }
-            }
-
-            // Adaptive damping based on error change
-            if error > last_error * 1.5 {
-                // Error increased significantly - reduce damping for stability
-                damping *= 0.5;
-            } else if error < last_error * 0.5 {
-                // Error decreased significantly - can increase damping for faster convergence
-                damping = (damping * 1.2).min(1.0);
-            }
-
-            last_error = error;
+            // Preserve the column-scaled gradient as a public diagnostic, but do
+            // not use it as an independent termination policy. Correlated columns
+            // can each have a tiny residual cosine even when a retained linear
+            // combination exactly reaches a root. Local reducibility is therefore
+            // classified below by the same SVD that produces the correction.
+            let gradient = Self::residual_gradient_measure(scaled_jacobian, scaled_f_vals);
 
             for i in 0..num_equations {
-                f_neg[(i, 0)] = -f_vals[(i, 0)];
+                f_neg[(i, 0)] = -scaled_f_vals[(i, 0)];
             }
 
-            // Step 2: Solve linear system J * delta = -f(x)
-            let delta = {
-                let j_matrix = jacobian_workspace.jacobian();
-                // Handle different system types with appropriate solving methods
-                if j_matrix.rows() == j_matrix.cols() {
-                    // Square system (equations == variables)
-                    // Use standard LU decomposition: J * delta = -f
-                    match j_matrix.solve_lu(&f_neg) {
-                        Ok(d) => d,
-                        Err(_) => {
-                            // Matrix is singular - try with increased regularization
-                            let diag_size = j_matrix.rows().min(j_matrix.cols());
-                            for i in 0..diag_size {
-                                j_matrix[(i, i)] += self.regularization * 100.0;
-                            }
-                            match j_matrix.solve_lu(&f_neg) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    let diag = self.build_diagnostic(
-                                        format!(
-                                            "Matrix is singular even with regularization: {e}"
-                                        ),
-                                        iter + 1,
-                                        &vars,
-                                        &f_vals,
-                                    );
-                                    return Err(SolverError::SingularMatrix(diag));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match self.solve_least_squares_delta(
-                        j_matrix,
-                        &f_neg,
-                        least_squares_workspace.as_mut(),
-                        parallel,
-                    ) {
-                        Ok(delta) => delta,
-                        Err(LeastSquaresSolveError::InvalidInput(err)) => {
-                            return Err(SolverError::InvalidInput(err.to_string()));
-                        }
-                        Err(LeastSquaresSolveError::Singular {
-                            qr_err,
-                            normal_eq_err,
-                        }) => {
-                            let diag = self.build_diagnostic(
-                                format!(
-                                    "Least squares system is singular (qr_err: {qr_err}; normal_eq_err: {normal_eq_err})"
-                                ),
-                                iter + 1,
-                                &vars,
-                                &f_vals,
-                            );
-                            return Err(SolverError::SingularMatrix(diag));
-                        }
-                    }
-                }
-            };
+            // Step 2: Solve J * delta = -f(x) through one shape-independent
+            // least-squares path. A wide Jacobian naturally yields the
+            // Moore-Penrose minimum-norm correction in normalized coordinates.
+            // Unit variable scales preserve the caller-coordinate null-space
+            // component; configured scales deliberately weight which correction
+            // is smallest when the model admits multiple choices.
+            let linear_info = scaled_jacobian
+                .solve_least_squares_into(f_neg, delta, least_squares)
+                .map_err(|source| {
+                    self.matrix_error(source, iter, vars, f_vals, gradient, last_linear_attempt)
+                })?;
+            last_linear_attempt = Some(linear_info);
 
-            // Step 4: Determine step size (damping or line search)
-            let step_size = if use_line_search {
-                // Use backtracking line search to find optimal step size
-                self.line_search(&jacobian, &vars, &delta, error, &mut line_search_f_vals)?
-            } else {
-                // Use current damping factor as step size
-                damping
-            };
-
-            // Step 5: Update variables: x_new = x_old + step_size * delta
-            for (i, &var_id) in self.variables.iter().enumerate() {
-                vars.insert(var_id, vars[&var_id] + step_size * delta[(i, 0)]);
+            // The dimensionless retained fraction is zero exactly when this SVD
+            // model has no representable component of `-f` in the retained
+            // Jacobian column space. It remains the stationarity decision even
+            // when the corresponding physical slope is too small for `f64`.
+            if linear_info.retained_rhs_projection_fraction == 0.0 {
+                return Err(self.stationary_non_root_error(
+                    iter,
+                    vars,
+                    f_vals,
+                    gradient,
+                    linear_info,
+                ));
             }
 
-            // Additional convergence check: small step size indicates convergence
-            if delta.norm() * step_size < self.tolerance {
-                return Ok(Solution {
-                    values: self.values_by_name(&vars),
-                    iterations: iter + 1,
-                    error,
-                    converged: true,
-                    convergence_history,
-                });
+            // Root and model-stationarity checks deliberately precede this
+            // boundary: the final permitted update may legitimately land on
+            // either. Only a state with a usable retained correction is
+            // classified as budget exhaustion.
+            if iter == self.options.max_iterations {
+                let diagnostic = self.build_diagnostic(
+                    format!(
+                        "Failed to converge after {} accepted updates. Final error: {:.2e}",
+                        self.options.max_iterations, error
+                    ),
+                    iter,
+                    vars,
+                    f_vals,
+                    Some(gradient),
+                    last_linear_attempt,
+                );
+                return Err(SolverError::NoConvergence(Box::new(diagnostic)));
             }
 
-            // Refresh Jacobian for next iteration
-            jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+            if !delta.all_finite() {
+                return Err(Self::attach_linear_attempt(
+                    self.non_finite_evaluation_error(
+                        "Linear solve produced a non-finite Newton correction",
+                        iter,
+                        vars,
+                        f_vals,
+                        Some(gradient),
+                    ),
+                    last_linear_attempt,
+                ));
+            }
+
+            // The same factorization returns the residual-norm derivative for
+            // its correction. Reusing it avoids reconstructing `J*p` through
+            // products that can overflow before cancellation and avoids
+            // squaring a tiny ratio before the residual's physical scale can
+            // restore a representable slope.
+            let residual_norm_directional_derivative = linear_info.residual_norm_slope;
+
+            // Armijo is the only update policy. It leaves the accepted state
+            // untouched while populating candidate buffers, so failure cannot
+            // require rollback or consume an update count.
+            self.line_search(LineSearchContext {
+                jacobian,
+                vars,
+                candidate_vars,
+                delta,
+                current_residual_norm: error,
+                residual_norm_directional_derivative,
+                accepted_updates: iter,
+                current_residuals: f_vals,
+                gradient,
+                candidate_residuals: candidate_f_vals,
+                candidate_scaled_residuals: candidate_scaled_f_vals,
+            })
+            .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt))?;
+
+            // The candidate residual has already passed finite and Armijo
+            // checks. Swap both buffers together so variables and residuals
+            // become one atomic accepted state without evaluating f(x) again.
+            std::mem::swap(vars, candidate_vars);
+            std::mem::swap(f_vals, candidate_f_vals);
+            std::mem::swap(scaled_f_vals, candidate_scaled_f_vals);
+
+            // Only the Jacobian was not needed by candidate acceptance. Evaluate
+            // it once for the newly committed state and retain it through the
+            // next iteration's convergence and correction calculations.
+            jacobian.evaluate_checked_in_workspace(vars, jacobian_workspace)?;
+            if !jacobian_workspace.jacobian().all_finite() {
+                return Err(Self::attach_linear_attempt(
+                    self.non_finite_evaluation_error(
+                        "Accepted Newton update produced a non-finite Jacobian",
+                        iter + 1,
+                        vars,
+                        f_vals,
+                        None,
+                    ),
+                    last_linear_attempt,
+                ));
+            }
+            self.scale_jacobian_into(jacobian_workspace.jacobian(), scaled_jacobian);
+            if !scaled_jacobian.all_finite() {
+                return Err(Self::attach_linear_attempt(
+                    self.non_finite_evaluation_error(
+                        "Variable or equation scaling produced a non-finite Jacobian",
+                        iter + 1,
+                        vars,
+                        f_vals,
+                        None,
+                    ),
+                    last_linear_attempt,
+                ));
+            }
+            iter += 1;
+
+            // Root and linear-model stationarity checks occur once at the next
+            // loop entry, using the residual and Jacobian for exactly this
+            // accepted state.
         }
-
-        // Failed to converge within max iterations
-        let residuals = jacobian.evaluate_functions_checked(&vars)?;
-        let diag = self.build_diagnostic(
-            format!(
-                "Failed to converge after {} iterations. Final error: {:.2e}",
-                self.max_iterations,
-                residuals.norm()
-            ),
-            self.max_iterations,
-            &vars,
-            &residuals,
-        );
-        Err(SolverError::NoConvergence(diag))
     }
 
-    fn solve_least_squares_delta(
-        &self,
-        j_matrix: &Matrix,
-        f_neg: &Matrix,
-        workspace: Option<&mut LeastSquaresWorkspace>,
-        parallel: bool,
-    ) -> Result<Matrix, LeastSquaresSolveError> {
-        let mut workspace = workspace;
-        // Prefer QR-based least squares to avoid forming normal equations (J^T J), which can
-        // severely amplify conditioning issues. If the QR solve is rank deficient or
-        // ill-conditioned, fall back to a regularized augmented system
-        // [J; sqrt(lambda) I] * delta ~= [-f; 0].
-        const COND_LIMIT: f64 = 1e12;
-
-        let full_rank = j_matrix.rows().min(j_matrix.cols());
-        let is_ill_conditioned = |info: &LeastSquaresQrInfo| -> bool {
-            info.rank < full_rank
-                || !info.cond_est.is_finite()
-                || info.cond_est > COND_LIMIT
-        };
-
-        let mut qr_err: Option<String> = None;
-        let mut unreg_delta: Option<Matrix> = None;
-        let mut unreg_info: Option<LeastSquaresQrInfo> = None;
-
-        match j_matrix.solve_least_squares_qr_with_info_with_parallel(f_neg, parallel) {
-            Ok((delta, info)) => {
-                if !is_ill_conditioned(&info) {
-                    return Ok(delta);
-                }
-                unreg_delta = Some(delta);
-                unreg_info = Some(info);
-            }
-            Err(err) => {
-                qr_err = Some(err);
-            }
-        }
-
-        if self.regularization <= 0.0 {
-            if let Some(delta) = unreg_delta {
-                return Ok(delta);
-            }
-            return Err(LeastSquaresSolveError::Singular {
-                qr_err: qr_err.unwrap_or_else(|| "QR least squares failed".to_string()),
-                normal_eq_err: "Regularization disabled".to_string(),
-            });
-        }
-
-        let reg_factors = [1.0, 10.0, 100.0];
-        let mut last_err: Option<String> = None;
-        let mut last_solution: Option<Matrix> = None;
-
-        for factor in reg_factors {
-            let lambda = self.regularization * factor;
-            if lambda <= 0.0 {
-                continue;
-            }
-            let sqrt_reg = lambda.sqrt();
-
-            let reg_result = match workspace.as_deref_mut() {
-                Some(workspace) => {
-                    if workspace.num_equations != j_matrix.rows()
-                        || workspace.num_variables != j_matrix.cols()
-                    {
-                        return Err(LeastSquaresSolveError::InvalidInput(
-                            MatrixError::DimensionMismatch {
-                                operation: "least_squares",
-                                left: (workspace.augmented_j.rows(), workspace.augmented_j.cols()),
-                                right: (j_matrix.rows(), j_matrix.cols()),
-                            },
-                        ));
-                    }
-
-                    for i in 0..workspace.num_equations {
-                        for j in 0..workspace.num_variables {
-                            workspace.augmented_j[(i, j)] = j_matrix[(i, j)];
-                        }
-                        workspace.augmented_b[(i, 0)] = f_neg[(i, 0)];
-                    }
-                    for i in 0..workspace.num_variables {
-                        for j in 0..workspace.num_variables {
-                            workspace.augmented_j[(workspace.num_equations + i, j)] = 0.0;
-                        }
-                        workspace.augmented_j[(workspace.num_equations + i, i)] = sqrt_reg;
-                        workspace.augmented_b[(workspace.num_equations + i, 0)] = 0.0;
-                    }
-
-                    workspace
-                        .augmented_j
-                        .solve_least_squares_qr_with_info_with_parallel(
-                            &workspace.augmented_b,
-                            parallel,
-                        )
-                }
-                None => {
-                    let mut augmented_j =
-                        Matrix::new(j_matrix.rows() + j_matrix.cols(), j_matrix.cols());
-                    let mut augmented_b = Matrix::new(j_matrix.rows() + j_matrix.cols(), 1);
-                    for i in 0..j_matrix.rows() {
-                        for j in 0..j_matrix.cols() {
-                            augmented_j[(i, j)] = j_matrix[(i, j)];
-                        }
-                        augmented_b[(i, 0)] = f_neg[(i, 0)];
-                    }
-                    for i in 0..j_matrix.cols() {
-                        augmented_j[(j_matrix.rows() + i, i)] = sqrt_reg;
-                        augmented_b[(j_matrix.rows() + i, 0)] = 0.0;
-                    }
-                    augmented_j.solve_least_squares_qr_with_info_with_parallel(
-                        &augmented_b,
-                        parallel,
-                    )
-                }
-            };
-
-            match reg_result {
-                Ok((delta, info)) => {
-                    last_solution = Some(delta);
-                    if !is_ill_conditioned(&info) {
-                        return Ok(last_solution.unwrap());
-                    }
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                }
-            }
-        }
-
-        if let Some(delta) = last_solution {
-            return Ok(delta);
-        }
-
-        Err(LeastSquaresSolveError::Singular {
-            qr_err: qr_err
-                .or_else(|| {
-                    unreg_info
-                        .map(|info| format!("QR ill-conditioned (rank {}, cond {:.2e})", info.rank, info.cond_est))
-                })
-                .unwrap_or_else(|| "QR least squares failed".to_string()),
-            normal_eq_err: last_err.unwrap_or_else(|| "Regularized QR failed".to_string()),
-        })
-    }
-
-    fn map_initial_guess(
+    /// Translate a public name-keyed initial guess into reusable compact storage.
+    ///
+    /// The destination map was preallocated by [`SolverWorkspace`]. Valid input
+    /// therefore clears and refills existing buckets without allocating; error
+    /// paths may allocate sorted name lists for caller-facing diagnostics.
+    fn map_initial_guess_into(
         &self,
         initial_guess: HashMap<String, f64>,
-    ) -> Result<HashMap<VarId, f64>, SolverError> {
+        vars: &mut HashMap<VarId, f64>,
+    ) -> Result<(), SolverError> {
         let mut unknown = Vec::new();
-        let mut vars = HashMap::new();
+        let mut non_finite = Vec::new();
+        vars.clear();
 
         for (name, value) in initial_guess {
             if let Some(id) = self.var_table.get_id(&name) {
-                vars.insert(id, value);
+                if value.is_finite() {
+                    // Only validated finite values are allowed into the compact
+                    // internal variable map used by expression evaluation.
+                    vars.insert(id, value);
+                } else {
+                    non_finite.push(name);
+                }
             } else {
                 unknown.push(name);
             }
@@ -713,8 +1020,42 @@ impl NewtonRaphsonSolver {
             )));
         }
 
-        self.validate_initial_guess(&vars)?;
-        Ok(vars)
+        if !non_finite.is_empty() {
+            // Sort names to make diagnostics deterministic despite HashMap's
+            // intentionally unspecified iteration order.
+            non_finite.sort();
+            return Err(SolverError::InvalidInput(format!(
+                "Initial guess includes non-finite values for variables: {non_finite:?}"
+            )));
+        }
+
+        self.validate_initial_guess(vars)?;
+        Ok(())
+    }
+
+    /// Convert one option predicate into the solver's consistent configuration
+    /// error representation.
+    fn require_valid_option(valid: bool, message: &'static str) -> Result<(), SolverError> {
+        // Allocate the caller-facing message only on the invalid path; successful
+        // validation remains a branch with no heap work.
+        valid
+            .then_some(())
+            .ok_or_else(|| SolverError::InvalidInput(message.to_string()))
+    }
+
+    /// Validate the solver's complete numerical policy before evaluation.
+    fn validate_configuration(&self) -> Result<(), SolverError> {
+        // One update path consumes every field, so validation no longer depends
+        // on which public entry point happened to be selected.
+        Self::require_valid_option(
+            self.options.max_iterations > 0,
+            "max_iterations must be greater than zero",
+        )?;
+        Self::require_valid_option(
+            self.options.residual_tolerance.is_finite() && self.options.residual_tolerance > 0.0,
+            "residual_tolerance must be finite and greater than zero",
+        )?;
+        Ok(())
     }
 
     fn validate_initial_guess(&self, vars: &HashMap<VarId, f64>) -> Result<(), SolverError> {
@@ -744,89 +1085,527 @@ impl NewtonRaphsonSolver {
         values
     }
 
+    /// Normalize raw residuals by their positive equation characteristic scales.
+    fn scale_residuals_into(&self, raw: &Matrix, scaled: &mut Matrix) {
+        if scaled.rows() != raw.rows() || scaled.cols() != 1 {
+            *scaled = Matrix::new(raw.rows(), 1);
+        }
+        for row in 0..raw.rows() {
+            scaled[(row, 0)] = raw[(row, 0)] / self.equation_scales[row];
+        }
+    }
+
+    /// Return the norm used by convergence and failure diagnostics without
+    /// allocating a temporary scaled residual vector.
+    fn scaled_residual_norm(&self, raw: &Matrix) -> f64 {
+        let mut norm = 0.0_f64;
+        for row in 0..raw.rows() {
+            norm = norm.hypot(raw[(row, 0)] / self.equation_scales[row]);
+        }
+        norm
+    }
+
+    /// Normalize a raw Jacobian for equation and variable characteristic scales.
+    ///
+    /// The normalized derivative is `J_ij * variable_scale_j /
+    /// equation_scale_i`. The shared exponent-scaled product policy prevents
+    /// either source-code association from manufacturing zero or infinity when
+    /// the final normalized derivative remains representable.
+    fn scale_jacobian_into(&self, raw: &Matrix, scaled: &mut Matrix) {
+        if scaled.rows() != raw.rows() || scaled.cols() != raw.cols() {
+            *scaled = Matrix::new(raw.rows(), raw.cols());
+        }
+        for row in 0..raw.rows() {
+            let equation_scale = self.equation_scales[row];
+            for column in 0..raw.cols() {
+                let variable_scale = self.variable_scales[column];
+                let derivative = raw[(row, column)];
+                if !derivative.is_finite() {
+                    // Preserve the original invalid derivative verbatim. The
+                    // caller's post-scaling finite check then reports the
+                    // established Jacobian evaluation error instead of asking
+                    // finite-only normalization arithmetic to classify it.
+                    scaled[(row, column)] = derivative;
+                    continue;
+                }
+                // Decomposing all three values into bounded significands and
+                // integer exponents makes the result independent of an
+                // arbitrary multiplication/division association.
+                scaled[(row, column)] =
+                    product_ratio([derivative, variable_scale], [equation_scale]);
+            }
+        }
+    }
+
+    /// Multiply a normalized correction by its step and variable scale without
+    /// order-dependent intermediate overflow or underflow.
+    fn scaled_update_component(delta: f64, step_size: f64, variable_scale: f64) -> f64 {
+        // One exponent accumulation now serves both this update path and
+        // Jacobian normalization instead of maintaining association heuristics
+        // that cover only selected scale orderings.
+        product_ratio([delta, step_size, variable_scale], [])
+    }
+
+    /// Apply one normalized correction atomically in caller variable units.
+    ///
+    /// The first pass validates the complete candidate without changing
+    /// `vars`. The second pass commits the same arithmetic only after success,
+    /// so a failure cannot leave a mixture of old and partially updated values.
+    /// Exponent-scaled products let backtracking and variable scaling recover
+    /// representable updates without depending on one multiplication order.
+    /// Fixed parameters are absent from `self.variables` and remain untouched.
+    fn apply_finite_step(
+        &self,
+        vars: &mut HashMap<VarId, f64>,
+        delta: &Matrix,
+        step_size: f64,
+    ) -> bool {
+        if self
+            .variables
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(index, var_id)| {
+                let update = Self::scaled_update_component(
+                    delta[(index, 0)],
+                    step_size,
+                    self.variable_scales[index],
+                );
+                let value = vars[&var_id] + update;
+                !value.is_finite()
+            })
+        {
+            return false;
+        }
+
+        for (index, &var_id) in self.variables.iter().enumerate() {
+            let update = Self::scaled_update_component(
+                delta[(index, 0)],
+                step_size,
+                self.variable_scales[index],
+            );
+            let value = vars[&var_id] + update;
+            vars.insert(var_id, value);
+        }
+        true
+    }
+
+    /// Construct a successful result from numerical quantities that have all
+    /// been evaluated at the same accepted variable state.
+    ///
+    /// Centralizing result construction prevents future convergence branches
+    /// from accidentally pairing updated variables with stale residual data.
+    fn build_solution(
+        &self,
+        vars: &HashMap<VarId, f64>,
+        iterations: usize,
+        error: f64,
+        gradient: ResidualGradientMeasure,
+        last_linear_attempt: Option<LeastSquaresInfo>,
+    ) -> Solution {
+        // Convert internal IDs only after all numerical convergence checks have
+        // succeeded, keeping the hot iteration path in its compact ID form.
+        Solution {
+            values: self.values_by_name(vars),
+            iterations,
+            error,
+            gradient_norm: gradient.absolute_norm,
+            relative_gradient_norm: gradient.relative_norm,
+            last_linear_attempt,
+        }
+    }
+
+    /// Construct the shape-independent error returned when a non-root has no
+    /// reducible component in the retained Jacobian model.
+    fn stationary_non_root_error(
+        &self,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+        gradient: ResidualGradientMeasure,
+        linear_attempt: LeastSquaresInfo,
+    ) -> SolverError {
+        // Pass both the descriptive gradient and the decisive linear attempt into
+        // the common constructor. The factorization's zero projection, rather
+        // than an independently tuned gradient threshold, establishes that no
+        // retained correction can reduce this residual locally.
+        let diagnostic = self.build_diagnostic(
+            format!(
+                "Residual norm {:.2e} exceeds tolerance {:.2e}, and the retained linear correction model cannot reduce it",
+                self.scaled_residual_norm(residuals),
+                self.options.residual_tolerance,
+            ),
+            iterations,
+            vars,
+            residuals,
+            Some(gradient),
+            Some(linear_attempt),
+        );
+        SolverError::StationaryNonRoot(Box::new(diagnostic))
+    }
+
+    /// Combine a typed matrix failure with the complete accepted nonlinear
+    /// state at which correction construction or related linear algebra failed.
+    fn matrix_error(
+        &self,
+        source: MatrixError,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+        gradient: ResidualGradientMeasure,
+        last_linear_attempt: Option<LeastSquaresInfo>,
+    ) -> SolverError {
+        // The current loop state has already evaluated both residual and
+        // gradient. Preserve them rather than forcing callers to choose between
+        // the nonlinear context and the machine-readable matrix cause.
+        let diagnostic = self.build_diagnostic(
+            format!("Correction matrix operation failed: {source}"),
+            iterations,
+            vars,
+            residuals,
+            Some(gradient),
+            last_linear_attempt,
+        );
+        SolverError::Matrix {
+            source,
+            diagnostic: Box::new(diagnostic),
+        }
+    }
+
+    /// Attach the last successful linear attempt to any run-state error
+    /// produced after that correction was available.
+    fn attach_linear_attempt(
+        mut error: SolverError,
+        last_linear_attempt: Option<LeastSquaresInfo>,
+    ) -> SolverError {
+        // Every numerical run-state variant owns the same boxed diagnostic
+        // shape. Invalid configuration errors occur before correction and
+        // therefore have no attachment point.
+        let diagnostic = match &mut error {
+            SolverError::NoConvergence(diagnostic)
+            | SolverError::NonFiniteEvaluation(diagnostic)
+            | SolverError::StationaryNonRoot(diagnostic) => Some(diagnostic),
+            SolverError::Matrix { diagnostic, .. } => Some(diagnostic),
+            SolverError::InvalidInput(_) => None,
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.last_linear_attempt = last_linear_attempt;
+        }
+        error
+    }
+
+    /// Compute the normalized least-squares gradient norm and column alignments.
+    ///
+    /// The relative diagnostic is
+    /// `max_j |J_j^T f| / (||J_j||_2 ||f||_2)`, the largest absolute cosine
+    /// between the residual and any non-zero Jacobian column. It is intentionally
+    /// descriptive: correlated columns can each have a small cosine while their
+    /// retained span still contains a useful correction. Entries are divided by
+    /// finite maxima before products are formed so both diagnostics remain
+    /// defined when raw norms exceed `f64`.
+    fn residual_gradient_measure(jacobian: &Matrix, residuals: &Matrix) -> ResidualGradientMeasure {
+        // A zero residual has no direction and is already handled as a root by
+        // every caller. All residual entries were checked for finiteness before
+        // this helper is reached.
+        let residual_scale = (0..residuals.rows())
+            .map(|row| residuals[(row, 0)].abs())
+            .fold(0.0_f64, f64::max);
+        if residual_scale == 0.0 {
+            return ResidualGradientMeasure {
+                absolute_norm: 0.0,
+                relative_norm: None,
+            };
+        }
+
+        // The norm of the max-scaled residual is finite and non-zero. `hypot`
+        // keeps the accumulation stable without allocating a normalized vector.
+        let mut scaled_residual_norm = 0.0_f64;
+        for row in 0..residuals.rows() {
+            scaled_residual_norm = scaled_residual_norm.hypot(residuals[(row, 0)] / residual_scale);
+        }
+
+        let mut absolute_norm = 0.0_f64;
+        let mut maximum_cosine = 0.0_f64;
+        for column in 0..jacobian.cols() {
+            let column_scale = (0..jacobian.rows())
+                .map(|row| jacobian[(row, column)].abs())
+                .fold(0.0_f64, f64::max);
+            if column_scale == 0.0 {
+                // A zero column contributes neither a gradient component nor a
+                // residual alignment. An entirely zero Jacobian consequently
+                // yields the descriptive relative value `Some(0.0)`.
+                continue;
+            }
+
+            let mut scaled_column_norm = 0.0_f64;
+            let mut dot = CompensatedSum::default();
+            for row in 0..jacobian.rows() {
+                let scaled_jacobian = jacobian[(row, column)] / column_scale;
+                let scaled_residual = residuals[(row, 0)] / residual_scale;
+                scaled_column_norm = scaled_column_norm.hypot(scaled_jacobian);
+                // Both normalized factors are bounded by one, so ordinary
+                // compensation improves rounding without needing a wider-range
+                // product or reduction contract.
+                dot.add(scaled_jacobian * scaled_residual);
+            }
+
+            let scaled_dot = dot.total();
+            let cosine = (scaled_dot.abs() / scaled_column_norm / scaled_residual_norm).min(1.0);
+            maximum_cosine = maximum_cosine.max(cosine);
+
+            // Reconstruct the normalized gradient component for diagnostics,
+            // combining all three factors through exponent arithmetic. An
+            // infinite norm remains valid when its completed mathematical
+            // magnitude exceeds `f64`; it does not affect the finite cosine.
+            let gradient_component = product_ratio([scaled_dot, column_scale, residual_scale], []);
+            absolute_norm = absolute_norm.hypot(gradient_component);
+        }
+
+        ResidualGradientMeasure {
+            absolute_norm,
+            relative_norm: Some(maximum_cosine),
+        }
+    }
+
+    /// Build the dedicated error variant for non-finite numerical states while
+    /// preserving every state-local measure already evaluated there.
+    ///
+    /// `gradient` is `Some` only after the current residual and Jacobian have
+    /// both passed their finite checks. Callers at an earlier boundary, or at a
+    /// newly accepted state whose Jacobian failed, pass `None` rather than
+    /// recomputing through the failing operation.
+    fn non_finite_evaluation_error(
+        &self,
+        message: impl Into<String>,
+        iterations: usize,
+        vars: &HashMap<VarId, f64>,
+        residuals: &Matrix,
+        gradient: Option<ResidualGradientMeasure>,
+    ) -> SolverError {
+        // Preserve a NaN or infinite residual norm as direct failure evidence.
+        // Supplying the optional gradient here, instead of mutating the boxed
+        // diagnostic afterward, makes already-computed state impossible to drop
+        // at a non-finite return boundary.
+        SolverError::NonFiniteEvaluation(Box::new(self.build_diagnostic(
+            message.into(),
+            iterations,
+            vars,
+            residuals,
+            gradient,
+            None,
+        )))
+    }
+
+    /// Capture a failure message together with the exact variable and
+    /// per-equation residual state at which it occurred.
+    ///
+    /// Optional measures and linear provenance must already describe this same
+    /// state. Accepting them here prevents terminal branches from constructing
+    /// a partial diagnostic and forgetting to attach data they computed.
     fn build_diagnostic(
         &self,
         message: String,
         iterations: usize,
         vars: &HashMap<VarId, f64>,
         residuals_matrix: &Matrix,
+        gradient: Option<ResidualGradientMeasure>,
+        last_linear_attempt: Option<LeastSquaresInfo>,
     ) -> SolverRunDiagnostic {
-        let mut residuals = Vec::with_capacity(residuals_matrix.rows());
-        for i in 0..residuals_matrix.rows() {
-            residuals.push(residuals_matrix[(i, 0)]);
+        // Residual row order matches compiled equation order. Clone optional
+        // trace metadata into the owned diagnostic so it remains useful after
+        // the solver itself has been dropped.
+        let mut equations = Vec::with_capacity(residuals_matrix.rows());
+        for equation_index in 0..residuals_matrix.rows() {
+            equations.push(EquationDiagnostic {
+                equation_index,
+                residual: residuals_matrix[(equation_index, 0)],
+                scaled_residual: residuals_matrix[(equation_index, 0)]
+                    / self.equation_scales[equation_index],
+                trace: self.trace_for_equation(equation_index).cloned(),
+            });
         }
 
         SolverRunDiagnostic {
             message,
             iterations,
-            error: residuals_matrix.norm(),
+            error: self.scaled_residual_norm(residuals_matrix),
+            gradient_norm: gradient.map(|measure| measure.absolute_norm),
+            relative_gradient_norm: gradient.and_then(|measure| measure.relative_norm),
+            last_linear_attempt,
             values: self.values_by_name(vars),
-            residuals,
+            equations,
         }
     }
 
-    /// Backtracking line search to find optimal step size
+    /// Backtrack until a trial step satisfies sufficient decrease in `||f||`.
     ///
-    /// Tries progressively smaller step sizes until one is found that reduces the error.
-    /// This helps prevent oscillation and improves convergence robustness.
+    /// The Armijo slope is supplied directly for the residual-norm merit
+    /// function. Testing `||f||` directly avoids overflow from squaring a large
+    /// but finite norm or forming the unnormalized product `f^T J delta`.
     ///
-    /// # Arguments
+    /// # Context fields
     /// * `jacobian` - Jacobian evaluator for computing function values
     /// * `vars` - Current variable values
+    /// * `candidate_vars` - Reusable transaction buffer for proposed values
     /// * `delta` - Newton step direction
-    /// * `current_error` - Current function error |f(x)|
+    /// * `current_residual_norm` - Current scaled error `||f_scaled(x)||`
+    /// * `residual_norm_directional_derivative` - Scale-safe value of
+    ///   `(f_scaled / ||f_scaled||)^T J_scaled delta`
+    /// * `accepted_updates` - Number of updates accepted before the search began
+    /// * `current_residuals` - Residual vector at the unmodified current point
+    /// * `gradient` - Gradient measures at that same current point
+    /// * `candidate_residuals` - Reusable storage for each trial point
+    /// * `candidate_scaled_residuals` - Reusable normalized candidate residuals
     ///
-    /// # Returns
-    /// Optimal step size alpha such that x_new = x + alpha * delta reduces error
-    fn line_search(
-        &self,
-        jacobian: &Jacobian,
-        vars: &HashMap<VarId, f64>,
-        delta: &Matrix,
-        current_error: f64,
-        f_vals: &mut Matrix,
-    ) -> Result<f64, SolverError> {
-        let mut alpha = 1.0; // Start with full Newton step
-        let mut new_vars = vars.clone();
+    /// On success, the accepted candidate variables and residuals remain in the
+    /// supplied transaction buffers. If no tested step is acceptable, the
+    /// method returns `NoConvergence`; it never substitutes an untested or
+    /// previously rejected fallback step.
+    fn line_search(&self, context: LineSearchContext<'_>) -> Result<(), SolverError> {
+        // Give the context fields concise numerical names for the candidate loop
+        // while preserving their documented grouping at the call boundary.
+        let LineSearchContext {
+            jacobian,
+            vars,
+            candidate_vars,
+            delta,
+            current_residual_norm,
+            residual_norm_directional_derivative,
+            accepted_updates,
+            current_residuals,
+            gradient,
+            candidate_residuals,
+            candidate_scaled_residuals,
+        } = context;
 
-        // Try up to 20 different step sizes
-        for _ in 0..20 {
-            new_vars.clone_from(vars);
-            // Compute new variable values: x_new = x + alpha * delta
-            for (i, &var_id) in self.variables.iter().enumerate() {
-                new_vars.insert(var_id, vars[&var_id] + alpha * delta[(i, 0)]);
+        // The factorization can legitimately report negative infinity when the
+        // completed physical slope exceeds `f64` range. Reject every non-finite
+        // slope before sign classification so it remains a numerical evaluation
+        // failure rather than a line-search policy result.
+        if !residual_norm_directional_derivative.is_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search residual-norm slope produced NaN or infinity",
+                accepted_updates,
+                vars,
+                current_residuals,
+                Some(gradient),
+            ));
+        }
+
+        // A positive derivative means the proposed correction is not a descent
+        // direction for the least-squares objective. Backtracking cannot repair
+        // such a direction, so preserve the current state and explain the cause
+        // without evaluating misleading trial points. Negative zero is allowed:
+        // the SVD has separately established a non-zero retained component, but
+        // its physical slope can lie below the subnormal range. In that case the
+        // representable Armijo requirement is simply nonincrease.
+        if residual_norm_directional_derivative > 0.0 {
+            let diagnostic = self.build_diagnostic(
+                format!(
+                    "Line search cannot proceed because the proposed correction is not a descent direction (d||f||/d alpha = {residual_norm_directional_derivative:.2e})"
+                ),
+                accepted_updates,
+                vars,
+                current_residuals,
+                Some(gradient),
+                None,
+            );
+            return Err(SolverError::NoConvergence(Box::new(diagnostic)));
+        }
+
+        // Always test the unmodified Newton correction first. Each rejection
+        // permits one deterministic halving, so there is no competing initial-
+        // step or minimum-step policy to reconcile with the backtrack budget.
+        let mut alpha = 1.0;
+        let mut last_tested_alpha = alpha;
+        let mut attempted_trials = 0;
+        // Retain only aggregate rejection evidence. Candidate vectors and
+        // residuals continue to use the existing reusable transaction buffers.
+        let mut rejections = LineSearchRejections::default();
+
+        for backtrack_index in 0..=self.options.max_backtracks {
+            attempted_trials += 1;
+            last_tested_alpha = alpha;
+            candidate_vars.clone_from(vars);
+
+            // Build the candidate transactionally. Variable overflow is rejected
+            // before expression evaluation, while a finite smaller step remains
+            // eligible on the next backtracking trial.
+            if self.apply_finite_step(candidate_vars, delta, alpha) {
+                // If even the largest remaining multiplier cannot change any
+                // variable at floating-point precision, every smaller candidate
+                // will be identical. Stop immediately instead of counting a
+                // no-op as an accepted update or repeating it to the budget.
+                if candidate_vars == vars {
+                    let diagnostic = self.build_diagnostic(
+                        format!(
+                            "Newton correction cannot change the variable state at the tested step size {alpha:.2e}"
+                        ),
+                        accepted_updates,
+                        vars,
+                        current_residuals,
+                        Some(gradient),
+                        None,
+                    );
+                    return Err(SolverError::NoConvergence(Box::new(diagnostic)));
+                }
+
+                // Non-finite residuals are likewise rejected by the finite Armijo
+                // comparison. This permits a large exponential step to recover at
+                // a smaller alpha without accepting an invalid candidate.
+                jacobian.evaluate_functions_checked_into(candidate_vars, candidate_residuals)?;
+                self.scale_residuals_into(candidate_residuals, candidate_scaled_residuals);
+                let new_error = candidate_scaled_residuals.norm();
+                let required_error = current_residual_norm
+                    + ARMIJO_COEFFICIENT * alpha * residual_norm_directional_derivative;
+                if !new_error.is_finite() {
+                    // A smaller candidate may return to the expression domain,
+                    // so record the cause and continue backtracking.
+                    rejections.non_finite_residuals += 1;
+                } else if new_error <= required_error {
+                    return Ok(());
+                } else {
+                    // Preserve the final finite norm to show how close the last
+                    // admissible trial came to improving the accepted state.
+                    rejections.insufficient_decrease += 1;
+                    rejections.last_finite_residual = Some(new_error);
+                }
+            } else {
+                // Candidate construction failed before residual evaluation
+                // because at least one physical variable update overflowed.
+                rejections.non_finite_updates += 1;
             }
 
-            // Check if this step size reduces the error sufficiently
-            jacobian.evaluate_functions_checked_into(&new_vars, f_vals)?;
-            let new_error = f_vals.norm();
-            // Armijo condition: require sufficient decrease
-            if new_error < current_error * (1.0 - 0.5 * alpha) {
-                return Ok(alpha);
-            }
-            // Reduce step size and try again
-            alpha *= 0.5;
-
-            // Give up if step size becomes too small
-            if alpha < 1e-10 {
-                break;
+            // Halve only when the caller's explicit backtrack budget permits a
+            // subsequent candidate. The diagnostic therefore never observes an
+            // alpha value that the solver did not evaluate.
+            if backtrack_index < self.options.max_backtracks {
+                alpha *= 0.5;
             }
         }
 
-        // Return at least the minimum damping to avoid complete stagnation
-        Ok(alpha.max(self.min_damping))
-    }
-
-    /// Solve the system using Newton-Raphson with line search
-    ///
-    /// Line search helps improve convergence robustness by automatically
-    /// finding good step sizes, especially useful for difficult systems.
-    pub fn solve_with_line_search(
-        &self,
-        initial_guess: HashMap<String, f64>,
-    ) -> Result<Solution, SolverError> {
-        let vars = self.map_initial_guess(initial_guess)?;
-        self.run_in_mode(|| self.solve_modified_internal(vars, true))
+        // Applying any rejected fallback could increase the residual or leave
+        // the expression domain. Preserve the current point and provide a
+        // diagnostic that identifies line-search exhaustion instead.
+        // Format the optional scalar only on failure. Successful searches add no
+        // allocation and return immediately from the candidate loop above.
+        let last_finite_residual = rejections
+            .last_finite_residual
+            .map_or_else(|| "none".to_string(), |value| format!("{value:.2e}"));
+        let diagnostic = self.build_diagnostic(
+            format!(
+                "Line search failed after {attempted_trials} rejected candidate steps; last tested step was {last_tested_alpha:.2e}; rejections: non-finite updates {}, non-finite residuals {}, insufficient Armijo decrease {}; last finite candidate residual {last_finite_residual}",
+                rejections.non_finite_updates,
+                rejections.non_finite_residuals,
+                rejections.insufficient_decrease,
+            ),
+            accepted_updates,
+            vars,
+            current_residuals,
+            Some(gradient),
+            None,
+        );
+        Err(SolverError::NoConvergence(Box::new(diagnostic)))
     }
 }
 
@@ -835,32 +1614,43 @@ mod tests {
     use super::*;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
-    use crate::Mode;
 
+    /// Small deterministic generator used by numerical property regressions.
+    ///
+    /// Keeping the generator local and dependency-free makes every randomized
+    /// fixture repeatable across platforms and build profiles.
     struct TestRng {
+        /// Current linear-congruential state.
         state: u64,
     }
 
     impl TestRng {
+        /// Start one reproducible sequence from an explicit non-secret seed.
         fn new(seed: u64) -> Self {
             Self { state: seed }
         }
 
+        /// Advance the fixed linear-congruential recurrence and return its high
+        /// 32 bits, whose distribution is better than the low-order bits.
         fn next_u32(&mut self) -> u32 {
-            self.state = self
-                .state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            // Wrapping arithmetic defines the recurrence modulo 2^64 and is
+            // therefore intentional in debug as well as optimized builds.
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (self.state >> 32) as u32
         }
 
+        /// Map the next integer sample deterministically into `[-1, 1]`.
         fn next_f64(&mut self) -> f64 {
             let v = self.next_u32() as f64 / u32::MAX as f64;
             2.0 * v - 1.0
         }
     }
 
+    /// Build one dense linear residual `coeffs^T vars - rhs` for randomized
+    /// square and rectangular solver cases.
     fn linear_equation(coeffs: &[f64], vars: &[Exp], rhs: f64) -> Exp {
+        // Accumulate in stable slice order so seeded fixtures construct the
+        // identical expression tree on every run.
         let mut sum = Exp::val(0.0);
         for (coeff, var) in coeffs.iter().zip(vars.iter()) {
             let term = Exp::mul(Exp::val(*coeff), var.clone());
@@ -869,611 +1659,1865 @@ mod tests {
         Exp::sub(sum, Exp::val(rhs))
     }
 
-    fn test_modes() -> Vec<Mode> {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(4)
-            .max(1);
-        vec![Mode::Serial, Mode::Parallel { thread_count: threads }]
-    }
-
-    fn assert_solution_close(serial: &Solution, parallel: &Solution, tol: f64) {
-        assert_eq!(serial.values.len(), parallel.values.len());
-        for (name, value) in &serial.values {
-            let other = parallel.values.get(name).expect("missing variable");
-            let diff = (value - other).abs();
-            assert!(diff <= tol, "var {name} mismatch: {value} vs {other}");
+    /// Extract the structured state from the strict non-root stationarity error
+    /// while producing a focused test failure for any other variant.
+    fn expect_stationary_non_root(error: SolverError) -> SolverRunDiagnostic {
+        // Centralizing this match keeps stationarity regression tests focused on
+        // their numerical state rather than repeating variant boilerplate.
+        match error {
+            SolverError::StationaryNonRoot(diagnostic) => *diagnostic,
+            other => panic!("expected StationaryNonRoot, got {other:?}"),
         }
     }
 
-    fn assert_error_matches(serial: &SolverError, parallel: &SolverError) {
-        assert_eq!(
-            std::mem::discriminant(serial),
-            std::mem::discriminant(parallel)
-        );
-        match (serial, parallel) {
-            (SolverError::InvalidInput(a), SolverError::InvalidInput(b)) => assert_eq!(a, b),
-            (SolverError::MissingVariable(a), SolverError::MissingVariable(b)) => {
-                assert_eq!(a, b)
+    /// Assert the factorization invariant shared by every stationary-non-root
+    /// diagnostic produced after the SVD-centered convergence refactor.
+    fn assert_zero_retained_projection(diagnostic: &SolverRunDiagnostic) {
+        // Stationarity is no longer inferred from a separately tuned gradient
+        // threshold. The terminating state must therefore retain the successful
+        // linear attempt whose projection result made the decision.
+        let attempt = diagnostic
+            .last_linear_attempt
+            .as_ref()
+            .expect("stationarity requires a completed SVD factorization");
+        assert_eq!(attempt.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.residual_norm_slope, 0.0);
+    }
+
+    /// Compile equations and construct the sole serial solver policy used by
+    /// focused numerical tests.
+    fn build_solver(equations: Vec<Exp>) -> NewtonRaphsonSolver {
+        let compiled = Compiler::compile(&equations).expect("compile failed");
+        NewtonRaphsonSolver::new(compiled)
+    }
+
+    /// Compile equations while selecting only the named variables as unknowns;
+    /// all other compiled variables remain fixed parameters.
+    fn solver_for_with_vars(equations: Vec<Exp>, variables: &[&str]) -> NewtonRaphsonSolver {
+        let compiled = Compiler::compile(&equations).expect("compile failed");
+        NewtonRaphsonSolver::new_with_variables(compiled, variables)
+            .expect("failed to select solve variables")
+    }
+
+    /// Preserve every machine-readable matrix field and the complete nonlinear
+    /// run state when an actual correction solve fails.
+    #[test]
+    fn test_linear_solve_error_retains_matrix_cause_and_run_diagnostic() {
+        // The derivative is the smallest positive subnormal. Its mathematical
+        // correction is larger than `f64::MAX`, forcing a real public solve to
+        // return a typed matrix result error after residuals and gradient have
+        // already been evaluated at the accepted initial state.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(f64::from_bits(1)), x), Exp::val(1.0));
+        let solver = build_solver(vec![equation])
+            .with_equation_traces(vec![Some(EquationTrace {
+                constraint_id: 41,
+                description: "unrepresentable correction fixture".to_string(),
+            })])
+            .expect("one trace is supplied for one equation");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let solver_error = solver
+            .solve_once(initial)
+            .expect_err("the required correction lies outside the f64 range");
+        let expected_source = MatrixError::NonFiniteResult {
+            operation: "solve_least_squares",
+        };
+
+        match &solver_error {
+            SolverError::Matrix { source, diagnostic } => {
+                assert_eq!(source, &expected_source);
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 0.0);
+                assert_eq!(diagnostic.error, 1.0);
+                assert_eq!(diagnostic.last_linear_attempt, None);
+                assert_eq!(diagnostic.equations.len(), 1);
+                assert_eq!(diagnostic.equations[0].residual, -1.0);
+                assert_eq!(diagnostic.equations[0].scaled_residual, -1.0);
+                assert_eq!(
+                    diagnostic.equations[0]
+                        .trace
+                        .as_ref()
+                        .map(|trace| trace.constraint_id),
+                    Some(41)
+                );
             }
-            _ => {}
+            other => panic!("expected contextual Matrix error, got {other:?}"),
         }
+
+        // Generic error-reporting integrations must observe the identical typed
+        // value as the lower-level source without parsing display text.
+        let source = std::error::Error::source(&solver_error)
+            .expect("a structured matrix failure must remain in the error chain");
+        assert_eq!(source.downcast_ref::<MatrixError>(), Some(&expected_source));
     }
 
-    fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
-        let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new_with_mode(compiled, mode).expect("failed to set solver mode")
-    }
+    /// Exercise the public nonlinear solver at an extreme finite scale so the
+    /// canonical factorization cannot reject a representable pseudoinverse
+    /// correction because of an overflowing intermediate value.
+    #[test]
+    fn test_solver_solves_extreme_rank_deficient_linearization() {
+        // Every coefficient and residual is finite at the initial point,
+        // and the duplicated 1e308-scale Jacobian columns have the finite
+        // minimum-norm root x=y=-5e-309. The coefficient normalization in
+        // the SVD must keep that ordinary answer representable even though
+        // the unscaled largest singular value exceeds `f64::MAX`.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let huge_linear_form =
+            Exp::add(Exp::mul(Exp::val(-1e308), x), Exp::mul(Exp::val(-1e308), y));
+        let equations = vec![
+            Exp::sub(huge_linear_form.clone(), Exp::val(1.0)),
+            Exp::sub(huge_linear_form, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
-    fn solver_for_with_vars_mode(
-        equations: Vec<Exp>,
-        variables: &[&str],
-        mode: Mode,
-    ) -> NewtonRaphsonSolver {
-        let compiled = Compiler::compile(&equations).expect("compile failed");
-        NewtonRaphsonSolver::new_with_variables_and_mode(compiled, variables, mode)
-            .expect("failed to select solve variables or set mode")
+        let solution = solver
+            .solve_once(initial)
+            .expect("the finite extreme-scale pseudoinverse root must solve");
+        for variable in ["x", "y"] {
+            let relative_error = (solution.values[variable] / -5e-309 - 1.0).abs();
+            assert!(relative_error < 1e-12, "relative error: {relative_error}");
+        }
+        assert_eq!(solution.iterations, 1);
+        assert!(solution.error < 1e-12);
     }
 
     #[test]
     fn test_simple_system() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Test system: x^2 + y^2 = 1, xy = 0.25
-            // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+        // Test system: x^2 + y^2 = 1, xy = 0.25
+        // Solution should be approximately x ~= 0.5, y ~= 0.866 (or vice versa)
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            let eq1 = Exp::sub(
-                Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
-                Exp::val(1.0),
-            );
-            let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
+        let eq1 = Exp::sub(
+            Exp::add(Exp::power(x.clone(), 2.0), Exp::power(y.clone(), 2.0)),
+            Exp::val(1.0),
+        );
+        let eq2 = Exp::sub(Exp::mul(x.clone(), y.clone()), Exp::val(0.25));
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode);
+        let solver = build_solver(vec![eq1, eq2]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.5);
-            initial.insert("y".to_string(), 0.866);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.866);
 
-            let solution = match solver.solve(initial.clone()) {
-                Ok(sol) => sol,
-                Err(_) => match solver.solve_with_line_search(initial) {
-                    Ok(sol) => sol,
-                    Err(e) => panic!("Failed to solve: {:?}", e),
-                },
-            };
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
+        let solution = solver.solve_once(initial).expect("Failed to solve system");
+        assert!(solution.error < 1e-10);
+
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
+        assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
+        assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
+    }
+
+    /// Reuse every caller-owned numerical buffer across distinct solve calls.
+    #[test]
+    fn test_reused_solver_handles_distinct_initial_guesses() {
+        // The two initial guesses converge to opposite roots of the same
+        // nonlinear equation. Reusing the solver proves that caching the
+        // derivative does not retain values from the first numeric run.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+        let solver = build_solver(vec![equation])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(20);
+
+        let mut workspace = solver.workspace();
+        let mut matrix_addresses = [
+            workspace.residuals.storage_address() as usize,
+            workspace.scaled_residuals.storage_address() as usize,
+            workspace.correction_rhs.storage_address() as usize,
+            workspace.scaled_jacobian.storage_address() as usize,
+            workspace.correction.storage_address() as usize,
+            workspace.candidate_residuals.storage_address() as usize,
+            workspace.candidate_scaled_residuals.storage_address() as usize,
+            workspace.jacobian.jacobian().storage_address() as usize,
+        ];
+        matrix_addresses.sort_unstable();
+        let map_capacities = (
+            workspace.vars.capacity(),
+            workspace.candidate_vars.capacity(),
+        );
+
+        // Both calls overwrite the same construction-time workspace. Owned
+        // result maps are created only after each numerical run terminates.
+        let positive_solution = solver
+            .solve(HashMap::from([("x".to_string(), 3.0)]), &mut workspace)
+            .expect("positive initial guess should converge");
+        let negative_solution = solver
+            .solve(HashMap::from([("x".to_string(), -3.0)]), &mut workspace)
+            .expect("negative initial guess should converge");
+
+        assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
+        assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
+        let mut reused_addresses = [
+            workspace.residuals.storage_address() as usize,
+            workspace.scaled_residuals.storage_address() as usize,
+            workspace.correction_rhs.storage_address() as usize,
+            workspace.scaled_jacobian.storage_address() as usize,
+            workspace.correction.storage_address() as usize,
+            workspace.candidate_residuals.storage_address() as usize,
+            workspace.candidate_scaled_residuals.storage_address() as usize,
+            workspace.jacobian.jacobian().storage_address() as usize,
+        ];
+        reused_addresses.sort_unstable();
+        assert_eq!(matrix_addresses, reused_addresses);
+        assert_eq!(
+            map_capacities,
+            (
+                workspace.vars.capacity(),
+                workspace.candidate_vars.capacity()
+            )
+        );
+    }
+
+    /// Reject a workspace whose equation shape does not match the solver before
+    /// either object mutates numerical state.
+    #[test]
+    fn test_solver_rejects_workspace_from_incompatible_shape() {
+        let compiled = Compiler::compile(&[Exp::var("x")]).unwrap();
+        let one_equation_solver = NewtonRaphsonSolver::new(compiled);
+        let mut one_equation_workspace = one_equation_solver.workspace();
+
+        // The second solver has the same named variable but two residual rows,
+        // so reusing the first solver's matrix storage would violate every
+        // exact-shape evaluation and factorization contract.
+        let x = Exp::var("x");
+        let compiled = Compiler::compile(&[x.clone(), x]).unwrap();
+        let two_equation_solver = NewtonRaphsonSolver::new(compiled);
+        let error = two_equation_solver
+            .solve(
+                HashMap::from([("x".to_string(), 0.0)]),
+                &mut one_equation_workspace,
+            )
+            .expect_err("two equations require a two-row workspace");
+
+        match error {
+            SolverError::InvalidInput(message) => {
+                assert!(message.contains("workspace does not match"));
             }
-            assert!(solution.converged);
-            assert!(solution.error < 1e-10);
-
-            let x_sol = solution.values.get("x").copied().unwrap();
-            let y_sol = solution.values.get("y").copied().unwrap();
-            assert!((x_sol * x_sol + y_sol * y_sol - 1.0).abs() < 1e-10);
-            assert!((x_sol * y_sol - 0.25).abs() < 1e-10);
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// Treat fixed parameters as part of reusable workspace layout even though
+    /// they do not create Jacobian columns.
+    #[test]
+    fn test_solver_rejects_workspace_with_incompatible_compiled_variable_count() {
+        // This source workspace has one equation, one selected variable, and no
+        // fixed parameters. Its numerical matrix shape therefore matches the
+        // target solver below while its value-map layout does not.
+        let x = Exp::var("x");
+        let source_solver = build_solver(vec![Exp::sub(x, Exp::val(1.0))]);
+        let mut source_workspace = source_solver.workspace();
+        let original_capacities = (
+            source_workspace.vars.capacity(),
+            source_workspace.candidate_vars.capacity(),
+        );
+
+        // Geometry and circuit systems commonly solve one coordinate while
+        // retaining several dimensions or component values as fixed inputs.
+        // All five compiled values must fit both maps despite only x appearing
+        // as a correction coordinate.
+        let x = Exp::var("x");
+        let fixed_sum = Exp::add(
+            Exp::add(Exp::var("a"), Exp::var("b")),
+            Exp::add(Exp::var("c"), Exp::var("d")),
+        );
+        let target_solver = solver_for_with_vars(vec![Exp::sub(x, fixed_sum)], &["x"]);
+        let initial = HashMap::from([
+            ("x".to_string(), 0.0),
+            ("a".to_string(), 0.0),
+            ("b".to_string(), 0.0),
+            ("c".to_string(), 0.0),
+            ("d".to_string(), 0.0),
+        ]);
+
+        let error = target_solver
+            .solve(initial, &mut source_workspace)
+            .expect_err("fixed parameters require a matching value-map layout");
+        assert!(matches!(
+            error,
+            SolverError::InvalidInput(message)
+                if message.contains("compiled-variable shape")
+        ));
+
+        // Compatibility is checked before initial-guess translation, so a
+        // rejected cross-layout solve cannot mutate or grow either map.
+        assert!(source_workspace.vars.is_empty());
+        assert!(source_workspace.candidate_vars.is_empty());
+        assert_eq!(
+            original_capacities,
+            (
+                source_workspace.vars.capacity(),
+                source_workspace.candidate_vars.capacity(),
+            )
+        );
+    }
+
+    /// Exercise simultaneous immutable borrows of one reusable solver so its
+    /// construction-time caches cannot hide shared mutable numerical storage.
+    #[test]
+    fn test_reused_solver_supports_concurrent_solve_calls() {
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 2.0), Exp::val(4.0));
+        let solver = build_solver(vec![equation])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(20);
+        let initial_values = [3.0, -3.0, 5.0, -5.0];
+
+        // Scoped threads borrow the same immutable symbolic solver while
+        // each thread owns a distinct mutable numerical workspace.
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = initial_values
+                .into_iter()
+                .map(|initial_value| {
+                    let solver = &solver;
+                    scope.spawn(move || {
+                        let mut workspace = solver.workspace();
+                        solver.solve(
+                            HashMap::from([("x".to_string(), initial_value)]),
+                            &mut workspace,
+                        )
+                    })
+                })
+                .collect();
+
+            for (handle, initial_value) in handles.into_iter().zip(initial_values) {
+                let solution = handle
+                    .join()
+                    .expect("concurrent solver thread must not panic")
+                    .expect("each concurrent initial guess should converge");
+                let expected = if initial_value.is_sign_positive() {
+                    2.0
+                } else {
+                    -2.0
+                };
+                assert!((solution.values["x"] - expected).abs() < 1e-10);
+            }
+        });
     }
 
     #[test]
     fn test_transcendental_system() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Test transcendental system: sin(x) = 2y, cos(y) = x
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+        // Test transcendental system: sin(x) = 2y, cos(y) = x
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
-            let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
+        let eq1 = Exp::sub(Exp::sin(x.clone()), Exp::mul(y.clone(), Exp::val(2.0)));
+        let eq2 = Exp::sub(Exp::cos(y.clone()), x.clone());
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_tolerance(1e-8)
-                .with_max_iterations(50)
-                .with_regularization(1e-8);
+        let solver = build_solver(vec![eq1, eq2])
+            .with_residual_tolerance(1e-8)
+            .with_max_iterations(50);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.5);
-            initial.insert("y".to_string(), 0.25);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.5);
+        initial.insert("y".to_string(), 0.25);
 
-            let solution = solver
-                .solve_with_line_search(initial)
-                .expect("Failed to solve transcendental system");
+        let solution = solver
+            .solve_once(initial)
+            .expect("Failed to solve transcendental system");
 
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
-            }
-            assert!(solution.converged);
-            let x_sol = solution.values.get("x").copied().unwrap();
-            let y_sol = solution.values.get("y").copied().unwrap();
-            assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
-            assert!((y_sol.cos() - x_sol).abs() < 1e-8);
-        }
+        let x_sol = solution.values.get("x").copied().unwrap();
+        let y_sol = solution.values.get("y").copied().unwrap();
+        assert!((x_sol.sin() - 2.0 * y_sol).abs() < 1e-8);
+        assert!((y_sol.cos() - x_sol).abs() < 1e-8);
     }
 
     #[test]
-    fn test_solver_errors_on_missing_variable() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // System: x - a = 0, solving for x with a treated as a fixed parameter.
-            // Missing `a` should be an error (not implicitly treated as 0).
-            let x = Exp::var("x");
-            let a = Exp::var("a");
-            let eq = Exp::sub(x.clone(), a.clone());
+    fn test_solver_rejects_missing_fixed_parameter() {
+        // System: x - a = 0, solving for x with a treated as a fixed parameter.
+        // Missing `a` should be an error (not implicitly treated as 0).
+        let x = Exp::var("x");
+        let a = Exp::var("a");
+        let eq = Exp::sub(x.clone(), a.clone());
 
-            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 1.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 1.0);
 
-            let err = solver.solve(initial).expect_err("expected missing variable error");
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+        let err = solver
+            .solve_once(initial)
+            .expect_err("expected missing variable error");
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("a"), "unexpected message: {msg}");
             }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("a"), "unexpected message: {msg}");
-                }
-                other => panic!("expected InvalidInput, got {:?}", other),
-            }
+            other => panic!("expected InvalidInput, got {:?}", other),
         }
     }
 
     #[test]
     fn test_solver_invalid_input_on_missing_initial_guess_variable() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
 
-            let solver = solver_for_mode(vec![eq], mode);
+        let solver = build_solver(vec![eq]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
 
-            let err = solver
-                .solve(initial)
-                .expect_err("expected invalid input due to missing y");
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
+        let err = solver
+            .solve_once(initial)
+            .expect_err("expected invalid input due to missing y");
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("y"), "unexpected message: {msg}");
             }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("y"), "unexpected message: {msg}");
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    /// Verify that every externally configurable numerical parameter enforces
+    /// its documented finite range before iteration begins.
+    #[test]
+    fn test_solver_rejects_invalid_configuration() {
+        /// Boxed builder mutation used to exercise one invalid configuration
+        /// while constructing a fresh solver for each table entry.
+        type SolverConfigurator = Box<dyn Fn(NewtonRaphsonSolver) -> NewtonRaphsonSolver>;
+
+        // Each case constructs a fresh solver because builder methods consume
+        // and return the solver by value.
+        let invalid_cases: Vec<(&str, SolverConfigurator)> = vec![
+            (
+                "max_iterations",
+                Box::new(|solver| solver.with_max_iterations(0)),
+            ),
+            (
+                "residual_tolerance",
+                Box::new(|solver| solver.with_residual_tolerance(0.0)),
+            ),
+            (
+                "residual_tolerance",
+                Box::new(|solver| solver.with_residual_tolerance(f64::NAN)),
+            ),
+        ];
+
+        for (expected_parameter, configure) in invalid_cases {
+            let x = Exp::var("x");
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let compiled = Compiler::compile(&[equation]).expect("compile failed");
+            let solver = configure(NewtonRaphsonSolver::new(compiled));
+            let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+            let error = solver
+                .solve_once(initial)
+                .expect_err("invalid active configuration must be rejected");
+            match error {
+                SolverError::InvalidInput(message) => {
+                    assert!(message.contains(expected_parameter), "{message}");
                 }
-                other => panic!("expected InvalidInput, got {:?}", other),
+                other => panic!("expected InvalidInput, got {other:?}"),
             }
         }
     }
 
+    /// Reject malformed physical scaling at the builder boundary where names
+    /// and equation cardinality are still available for precise diagnostics.
     #[test]
-    fn test_try_with_equation_traces_invalid_length() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
+    fn test_solver_rejects_invalid_scales() {
+        let x = Exp::var("x");
+        let equation = Exp::sub(x.clone(), Exp::val(1.0));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_equation_scales(Vec::new())
+            .err()
+            .expect("one equation requires one scale");
+        assert!(matches!(error, SolverError::InvalidInput(message) if message.contains("length")));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_equation_scales(vec![0.0])
+            .err()
+            .expect("zero cannot be a characteristic scale");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("greater than zero"))
+        );
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(std::slice::from_ref(&equation)).expect("equation should compile"),
+        );
+        let error = solver
+            .with_variable_scales(HashMap::from([("unknown".to_string(), 1.0)]))
+            .err()
+            .expect("unknown variable scale names must be rejected");
+        assert!(matches!(error, SolverError::InvalidInput(message) if message.contains("Unknown")));
+
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(&[equation]).expect("equation should compile"),
+        );
+        let error = solver
+            .with_variable_scales(HashMap::from([("x".to_string(), f64::NAN)]))
+            .err()
+            .expect("non-finite variable scales must be rejected");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("greater than zero"))
+        );
+
+        // A compiled variable can be a fixed parameter rather than a Jacobian
+        // column. Scaling it would have no mathematical effect and is therefore
+        // rejected instead of silently stored.
+        let parameter = Exp::var("a");
+        let parameterized = Exp::sub(x, parameter);
+        let solver = NewtonRaphsonSolver::new_with_variables(
+            Compiler::compile(&[parameterized]).expect("equation should compile"),
+            &["x"],
+        )
+        .expect("x is a solve variable");
+        let error = solver
+            .with_variable_scales(HashMap::from([("a".to_string(), 1.0)]))
+            .err()
+            .expect("fixed parameter scales must be rejected");
+        assert!(
+            matches!(error, SolverError::InvalidInput(message) if message.contains("fixed parameter"))
+        );
+    }
+
+    /// Reject NaN and infinity in the caller's initial map before expression
+    /// evaluation can obscure their origin.
+    #[test]
+    fn test_solver_rejects_non_finite_initial_values() {
+        for invalid_value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let x = Exp::var("x");
-            let eq = Exp::sub(x.clone(), Exp::val(1.0));
+            let equation = Exp::sub(x, Exp::val(1.0));
+            let compiled = Compiler::compile(&[equation]).expect("compile failed");
+            let solver = NewtonRaphsonSolver::new(compiled);
+            let initial = HashMap::from([("x".to_string(), invalid_value)]);
 
-            let solver = solver_for_mode(vec![eq], mode);
-
-            let traces = vec![
-                Some(EquationTrace {
-                    constraint_id: 0,
-                    description: "eq0".to_string(),
-                }),
-                None,
-            ];
-            let err = match solver.try_with_equation_traces(traces) {
-                Ok(_) => panic!("expected invalid input for trace length mismatch"),
-                Err(err) => err,
-            };
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
-            }
-            match err {
-                SolverError::InvalidInput(msg) => {
-                    assert!(msg.contains("Equation trace length (2)"), "{}", msg);
-                    assert!(msg.contains("number of equations (1)"), "{}", msg);
+            let error = solver
+                .solve_once(initial)
+                .expect_err("non-finite initial values must be rejected");
+            match error {
+                SolverError::InvalidInput(message) => {
+                    assert!(message.contains("non-finite"), "{message}");
+                    assert!(message.contains("x"), "{message}");
                 }
-                other => panic!("expected InvalidInput, got {:?}", other),
+                other => panic!("expected InvalidInput, got {other:?}"),
             }
         }
+    }
+
+    /// Prevent a finite residual from hiding overflow in the variable state
+    /// produced by either solver update path.
+    #[test]
+    fn test_solver_never_commits_non_finite_variable_updates() {
+        // At x=1e308 the reciprocal expression and its derivative are both
+        // finite, but the undamped Newton correction is another 1e308. The
+        // resulting x would overflow to infinity while the reciprocal of
+        // that invalid value evaluates to the deceptively finite value zero.
+        let x = Exp::var("x");
+        let scaled_x = Exp::mul(Exp::val(1e-308), x);
+        let equation = Exp::div(Exp::val(1.0), scaled_x);
+        let initial = HashMap::from([("x".to_string(), 1e308)]);
+
+        // Candidate construction rejects the overflowing full step before
+        // expression evaluation. Limiting the search to that one trial
+        // makes preservation of the initial accepted state deterministic.
+        let solver = build_solver(vec![equation]).with_max_backtracks(0);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("an overflowing line-search candidate must be rejected");
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert!(diagnostic.message.contains("Line search failed"));
+                assert!(diagnostic.message.contains("non-finite updates 1"));
+                assert!(diagnostic.message.contains("non-finite residuals 0"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 0")
+                );
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 1e308);
+                assert!(diagnostic.values.values().all(|value| value.is_finite()));
+            }
+            other => panic!("expected NoConvergence, got {other:?}"),
+        }
+    }
+
+    /// Distinguish an invalid expression domain from singularity or ordinary
+    /// iteration exhaustion.
+    #[test]
+    fn test_solver_reports_non_finite_residual_evaluation() {
+        let x = Exp::var("x");
+        let equation = Exp::ln(x);
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), -1.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("ln of a negative value is outside the real domain");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Residual evaluation"));
+                assert_eq!(diagnostic.iterations, 0);
+                assert!(diagnostic.error.is_nan());
+            }
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        }
+    }
+
+    /// Detect a finite residual paired with a non-finite symbolic derivative.
+    #[test]
+    fn test_solver_reports_non_finite_jacobian_evaluation() {
+        // sqrt(x)-1 is finite at x=0, but its derivative is positive
+        // infinity there.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 0.5), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("non-finite derivative must be reported explicitly");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Jacobian evaluation"));
+                assert_eq!(diagnostic.error, 1.0);
+            }
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        }
+    }
+
+    /// Preserve exact symbolic-derivative behavior at a removable boundary
+    /// singularity and demonstrate the caller-controlled algebraic rewrite.
+    #[test]
+    fn test_solver_requires_boundary_safe_expression_form() {
+        let x = Exp::var("x");
+
+        // Differentiating x*sqrt(x) with the product rule retains
+        // x*(0.5*x^-0.5). At x=0 that term evaluates as 0*infinity, so the
+        // exact symbolic Jacobian is NaN even though the residual is -1.
+        let boundary_singular = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::power(x.clone(), 0.5)), x.clone()),
+            Exp::val(1.0),
+        );
+        let solver = build_solver(vec![boundary_singular]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial.clone())
+            .expect_err("the written product has a non-finite derivative at zero");
+        match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => {
+                assert!(diagnostic.message.contains("Jacobian evaluation"));
+                assert_eq!(diagnostic.error, 1.0);
+            }
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        }
+
+        // x^(3/2) is algebraically identical for x>=0, but its symbolic
+        // derivative is finite at zero. This explicit model rewrite lets
+        // Newton iteration leave the domain boundary and certify the root.
+        let boundary_safe = Exp::sub(Exp::add(Exp::power(x.clone(), 1.5), x), Exp::val(1.0));
+        let solution = build_solver(vec![boundary_safe])
+            .solve_once(initial)
+            .expect("the rewritten expression has a finite boundary derivative");
+        assert!(solution.error < 1e-10);
+    }
+
+    #[test]
+    fn test_with_equation_traces_rejects_invalid_length() {
+        let x = Exp::var("x");
+        let eq = Exp::sub(x.clone(), Exp::val(1.0));
+
+        let solver = build_solver(vec![eq]);
+
+        let traces = vec![
+            Some(EquationTrace {
+                constraint_id: 0,
+                description: "eq0".to_string(),
+            }),
+            None,
+        ];
+        let err = match solver.with_equation_traces(traces) {
+            Ok(_) => panic!("expected invalid input for trace length mismatch"),
+            Err(err) => err,
+        };
+        match err {
+            SolverError::InvalidInput(msg) => {
+                assert!(msg.contains("Equation trace length (2)"), "{}", msg);
+                assert!(msg.contains("number of equations (1)"), "{}", msg);
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+
+        // Empty systems must reject unreachable trace entries as strictly as
+        // non-empty systems reject too many or too few entries.
+        let empty = NewtonRaphsonSolver::new(
+            Compiler::compile(&[]).expect("empty equation system should compile"),
+        );
+        let error = match empty.with_equation_traces(vec![None]) {
+            Ok(_) => panic!("empty system must reject an unreachable trace"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SolverError::InvalidInput(_)));
+    }
+
+    /// Ensure failure diagnostics pair each residual with its positional source
+    /// metadata and retain explicit `None` entries for untraced equations.
+    #[test]
+    fn test_diagnostics_include_equation_traces() {
+        let equations = vec![
+            Exp::sub(Exp::var("x"), Exp::val(1.0)),
+            Exp::sub(Exp::var("x"), Exp::val(2.0)),
+        ];
+        let trace = EquationTrace {
+            constraint_id: 41,
+            description: "horizontal alignment".to_string(),
+        };
+        let solver = NewtonRaphsonSolver::new(
+            Compiler::compile(&equations).expect("equations should compile"),
+        )
+        .with_equation_traces(vec![Some(trace.clone()), None])
+        .expect("trace cardinality matches equation cardinality");
+        let mut workspace = solver.workspace();
+        solver
+            .map_initial_guess_into(HashMap::from([("x".to_string(), 0.0)]), &mut workspace.vars)
+            .expect("initial guess should map to the compiled variable");
+        let residuals = Matrix::from_vec(vec![-1.0, -2.0], 2, 1)
+            .expect("residual vector shape should be valid");
+
+        let diagnostic = solver.build_diagnostic(
+            "test failure".to_string(),
+            0,
+            &workspace.vars,
+            &residuals,
+            None,
+            None,
+        );
+
+        assert_eq!(diagnostic.equations.len(), 2);
+        assert_eq!(
+            diagnostic.equations[0],
+            EquationDiagnostic {
+                equation_index: 0,
+                residual: -1.0,
+                scaled_residual: -1.0,
+                trace: Some(trace),
+            }
+        );
+        assert_eq!(diagnostic.equations[1].equation_index, 1);
+        assert_eq!(diagnostic.equations[1].residual, -2.0);
+        assert_eq!(diagnostic.equations[1].scaled_residual, -2.0);
+        assert_eq!(diagnostic.equations[1].trace, None);
     }
 
     #[test]
     fn test_line_search_preserves_fixed_variables() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Regression test: line search must preserve "fixed parameter" variables that are
-            // not part of `self.variables` but are referenced by equations.
-            //
-            // If line search drops them, evaluation errors and the solver fails.
-            let x = Exp::var("x");
-            let a = Exp::var("a");
-            let eq = Exp::sub(x.clone(), a.clone());
+        // Regression test: line search must preserve "fixed parameter" variables that are
+        // not part of `self.variables` but are referenced by equations.
+        //
+        // If line search drops them, evaluation errors and the solver fails.
+        let x = Exp::var("x");
+        let a = Exp::var("a");
+        let eq = Exp::sub(x.clone(), a.clone());
 
-            let solver = solver_for_with_vars_mode(vec![eq], &["x"], mode);
+        let solver = solver_for_with_vars(vec![eq], &["x"]);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("a".to_string(), 2.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("a".to_string(), 2.0);
 
-            let solution = solver
-                .solve_with_line_search(initial)
-                .expect("solver should converge when fixed variables are provided");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
+        let solution = solver
+            .solve_once(initial)
+            .expect("solver should converge when fixed variables are provided");
+        assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
+    }
+
+    /// Exercise a recoverable exponential Newton step that needs more than the
+    /// former twenty backtracking trials.
+    #[test]
+    fn test_line_search_can_backtrack_beyond_twenty_trials() {
+        // At x=-20, exp(x)-1 has a Newton step of roughly 4.85e8. Steps as
+        // large as 2^-19 overflow or increase the residual, while a step of
+        // roughly 2^-25 enters a useful region and must be accepted.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+        let solver = build_solver(vec![equation])
+            .with_max_iterations(100)
+            .with_residual_tolerance(1e-10);
+        let initial = HashMap::from([("x".to_string(), -20.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("deep backtracking should recover a finite step");
+
+        assert!(solution.error < 1e-10);
+        assert!(solution.values["x"].abs() < 1e-8);
+    }
+
+    /// Verify that the public line-search trial budget controls candidate
+    /// exhaustion rather than serving as documentation-only metadata.
+    #[test]
+    fn test_line_search_honors_configured_trial_budget() {
+        // The same exponential problem used by the deep-backtracking test
+        // cannot accept its first two Newton candidates. One permitted
+        // backtrack must test exactly alpha=1 and alpha=1/2 before failing.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::exp(x), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_backtracks(1);
+        let initial = HashMap::from([("x".to_string(), -20.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("two rejected candidates must exhaust the configured search");
+
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert_eq!(diagnostic.iterations, 0);
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("after 2 rejected candidate steps")
+                );
+                assert!(diagnostic.message.contains("last tested step was 5.00e-1"));
+                assert!(diagnostic.message.contains("non-finite updates 0"));
+                assert!(diagnostic.message.contains("non-finite residuals 2"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 0")
+                );
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.values["x"], -20.0);
+                assert!(diagnostic.gradient_norm.is_some());
+                assert_eq!(diagnostic.relative_gradient_norm, Some(1.0));
+                let attempt = diagnostic
+                    .last_linear_attempt
+                    .as_ref()
+                    .expect("the rejected candidate still followed a successful SVD attempt");
+                assert_eq!(attempt.rank, 1);
             }
-            assert!(solution.converged);
-            assert!((solution.values.get("x").copied().unwrap() - 2.0).abs() < 1e-10);
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
+    /// Distinguish a finite but unhelpful trial from overflow and expression
+    /// domain failures in line-search exhaustion diagnostics.
     #[test]
-    fn test_least_squares_qr_handles_ill_conditioned_overdetermined_system_without_regularization()
-    {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
-            // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
-            // lose the tiny distinguishing term and become singular in floating point. QR-based
-            // least squares should still solve it.
-            let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
+    fn test_line_search_reports_insufficient_finite_decrease() {
+        // At x=0.1, Newton's full correction for x^3-1 is about 33.3. The
+        // candidate remains finite but increases the residual substantially,
+        // so a one-trial budget must classify it as insufficient decrease.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::power(x, 3.0), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_backtracks(0);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
 
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-
-            // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
-            // b corresponds to solution (x,y) = (1,1)
-            let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
-            let eq2 = Exp::sub(
-                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
-                Exp::val(2.0 + eps),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
-                Exp::val(2.0 - eps),
-            );
-
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_regularization(0.0)
-                .with_damping(1.0)
-                .with_max_iterations(10)
-                .with_tolerance(1e-10);
-
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
-
-            let solution = solver
-                .solve(initial)
-                .expect("expected solver to converge with QR least squares");
-
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-8);
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the finite full step must fail Armijo decrease");
+        match error {
+            SolverError::NoConvergence(diagnostic) => {
+                assert!(diagnostic.message.contains("non-finite updates 0"));
+                assert!(diagnostic.message.contains("non-finite residuals 0"));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains("insufficient Armijo decrease 1")
+                );
+                assert!(
+                    !diagnostic
+                        .message
+                        .contains("last finite candidate residual none")
+                );
+                assert_eq!(diagnostic.iterations, 0);
+                assert_eq!(diagnostic.values["x"], 0.1);
             }
-            assert!(solution.converged, "{:?}", solution);
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-8);
-            assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-8);
+            other => panic!("expected NoConvergence, got {other:?}"),
         }
     }
 
+    /// Ensure Armijo line search normalizes the residual before forming its
+    /// directional derivative.
     #[test]
-    fn test_underconstrained_system_returns_min_norm_solution() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Underdetermined system: x + y = 1 has infinitely many solutions.
-            // The solver should return the minimum-norm solution: x = 0.5, y = 0.5.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
+    fn test_line_search_avoids_raw_directional_derivative_overflow() {
+        // The raw objective derivative at x=0 is -1e400, but the derivative
+        // of the residual norm is the representable value -1e200. The full
+        // Newton step reaches the exact root and must not fail merely because
+        // the unused squared-residual objective has an unrepresentable slope.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(1e200), x), Exp::val(1e200));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let eq = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(1.0));
-            let solver = solver_for_mode(vec![eq], mode)
-                .with_tolerance(1e-12)
-                .with_max_iterations(10);
+        let solution = solver
+            .solve_once(initial)
+            .expect("scale-safe residual-norm slope should permit the Newton step");
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+        assert_eq!(solution.values["x"], 1.0);
+        assert_eq!(solution.error, 0.0);
+    }
 
-            let solution = solver.solve(initial).expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!(solution.converged, "{:?}", solution);
-            assert!((solution.values.get("x").copied().unwrap() - 0.5).abs() < 1e-10);
-            assert!((solution.values.get("y").copied().unwrap() - 0.5).abs() < 1e-10);
+    /// Retain gradient evidence when a completed SVD slope exceeds `f64` range.
+    #[test]
+    fn test_non_finite_slope_retains_computed_gradient_diagnostics() {
+        // Two identical large residuals have a finite minimum-norm correction,
+        // but their residual norm and its full-step derivative exceed the
+        // representable range. The line-search boundary is reached only after
+        // both gradient measures and the successful SVD attempt are available.
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.5e308));
+        let solver = build_solver(vec![equation.clone(), equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the physical residual-norm slope is negative infinity");
+        let diagnostic = match error {
+            SolverError::NonFiniteEvaluation(diagnostic) => *diagnostic,
+            other => panic!("expected NonFiniteEvaluation, got {other:?}"),
+        };
+
+        // The accepted state is unchanged, and diagnostics computed before the
+        // slope check must not be discarded while building the typed failure.
+        assert_eq!(diagnostic.iterations, 0);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.error, f64::INFINITY);
+        assert_eq!(diagnostic.gradient_norm, Some(f64::INFINITY));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|value| (value - 1.0).abs() < 1e-12)
+        );
+        let attempt = diagnostic
+            .last_linear_attempt
+            .expect("the completed correction attempt must remain attached");
+        assert_eq!(attempt.rank, 1);
+        assert!((attempt.retained_rhs_projection_fraction - 1.0).abs() < 1e-12);
+        assert_eq!(attempt.residual_norm_slope, f64::NEG_INFINITY);
+    }
+
+    /// Verify that exhaustion preserves the current state and reports failure
+    /// instead of applying an untested minimum-step fallback.
+    #[test]
+    fn test_line_search_reports_constant_residual_as_stationary_non_root() {
+        // Multiplying x by zero registers it as a solve variable while the
+        // residual remains exactly one for every possible candidate.
+        let x = Exp::var("x");
+        let equation = Exp::add(Exp::mul(x, Exp::val(0.0)), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_iterations(2);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("a constant residual is stationary but not a root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        // Stationarity is visible before line search attempts an unusable
+        // zero correction, so the unchanged initial state has zero updates.
+        assert_eq!(diagnostic.iterations, 0);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.error, 1.0);
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert_zero_retained_projection(&diagnostic);
+    }
+
+    /// Confirm that a tiny Newton update reports diagnostics from the returned
+    /// point rather than retaining the residual from before the update.
+    #[test]
+    fn test_tiny_update_recomputes_returned_residual() {
+        // The exact update is only 1e-20, below the default tolerance, but
+        // it moves x from residual one to the exact root.
+        let x = Exp::var("x");
+        let equation = Exp::add(Exp::mul(Exp::val(1e20), x), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("scaled linear root should solve");
+
+        let returned_residual = 1e20 * solution.values["x"] + 1.0;
+        assert_eq!(solution.iterations, 1);
+        assert_eq!(solution.error, returned_residual.abs());
+        assert_eq!(solution.error, 0.0);
+    }
+
+    /// Distinguish a stationary non-root error from a successful constraint root
+    /// in an inconsistent overdetermined system.
+    #[test]
+    fn test_inconsistent_overdetermined_system_reports_stationarity() {
+        // No x satisfies both equations. Their least-squares objective is
+        // stationary at x=0 with residual norm sqrt(2).
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("stationary least-squares state is not a constraint root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert_eq!(diagnostic.iterations, 0);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+        assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-10));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|norm| norm < 1e-10)
+        );
+        assert_zero_retained_projection(&diagnostic);
+    }
+
+    /// Verify strict stationary-non-root semantics do not depend on the number
+    /// of equations relative to solve variables.
+    #[test]
+    fn test_stationary_non_root_error_is_shape_independent() {
+        // Square case: two incompatible equations constrain x while y is a
+        // registered but unused solve variable. Their gradient cancels at
+        // the initial point even though neither residual is zero.
+        let square_x = Exp::var("square_x");
+        let square_y = Exp::var("square_y");
+        let square_zero_y = Exp::mul(square_y, Exp::val(0.0));
+        let square_equations = vec![
+            Exp::add(Exp::sub(square_x.clone(), Exp::val(1.0)), square_zero_y),
+            Exp::add(square_x, Exp::val(1.0)),
+        ];
+        let square_initial =
+            HashMap::from([("square_x".to_string(), 0.0), ("square_y".to_string(), 0.0)]);
+
+        // Underdetermined case: the positive residual x^2 + 1 has a zero
+        // derivative at x=0, and multiplication by zero registers a second
+        // solve variable without changing the equation.
+        let wide_x = Exp::var("wide_x");
+        let wide_y = Exp::var("wide_y");
+        let wide_equations = vec![Exp::add(
+            Exp::add(Exp::power(wide_x, 2.0), Exp::val(1.0)),
+            Exp::mul(wide_y, Exp::val(0.0)),
+        )];
+        let wide_initial =
+            HashMap::from([("wide_x".to_string(), 0.0), ("wide_y".to_string(), 0.0)]);
+
+        for (shape, equations, initial) in [
+            ("square", square_equations, square_initial),
+            ("underdetermined", wide_equations, wide_initial),
+        ] {
+            let error = build_solver(equations)
+                .solve_once(initial)
+                .expect_err("a stationary non-root must never be successful");
+            let diagnostic = expect_stationary_non_root(error);
+
+            assert_eq!(diagnostic.iterations, 0, "unexpected {shape} update");
+            assert!(diagnostic.error > 0.0, "missing {shape} residual");
+            assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            assert_zero_retained_projection(&diagnostic);
         }
     }
 
+    /// Preserve finite gradient geometry and retained-model stationarity when
+    /// raw norms and residual-gradient products exceed the `f64` range.
     #[test]
-    fn test_rank_deficient_overconstrained_recovers_with_regularization() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+    fn test_scaled_stationary_system_avoids_raw_gradient_overflow() {
+        // At x=0 the residual and Jacobian norms are both infinite in f64,
+        // while their residual-gradient contributions are -1e616 and
+        // +1e616. Max-scaling the entries first exposes their exact finite
+        // cancellation instead of falling back from an undefined norm.
+        let x = Exp::var("x");
+        let scaled_x = Exp::mul(Exp::val(1.3e308), x);
+        let equations = vec![
+            Exp::sub(scaled_x.clone(), Exp::val(1.3e308)),
+            Exp::add(scaled_x, Exp::val(1.3e308)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-            let eq2 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
-                Exp::val(2.0),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
-                Exp::val(3.0),
-            );
+        let error = solver
+            .solve_once(initial)
+            .expect_err("normalized stationary non-root should survive raw overflow");
+        let diagnostic = expect_stationary_non_root(error);
 
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_tolerance(1e-12)
-                .with_max_iterations(10);
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert!(diagnostic.error.is_infinite());
+        assert_zero_retained_projection(&diagnostic);
+    }
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+    /// Preserve a representable public gradient norm when reconstructing it
+    /// requires three factors whose naive association underflows.
+    #[test]
+    fn test_gradient_diagnostic_uses_scale_safe_factor_reconstruction() {
+        // J^T*f is exactly 1e-308: only the first residual depends on the
+        // variable. Multiplying the normalized dot by the tiny column scale
+        // before the large residual scale would underflow this diagnostic to
+        // zero. Exercise the diagnostic directly because the SVD-centered solver
+        // now removes that reducible first residual before it reports the final
+        // stationary state.
+        let jacobian =
+            Matrix::from_vec(vec![1e-308, 0.0], 2, 1).expect("the Jacobian fixture has two rows");
+        let residuals =
+            Matrix::from_vec(vec![1.0, 1e308], 2, 1).expect("the residual fixture has two rows");
+        let gradient = NewtonRaphsonSolver::residual_gradient_measure(&jacobian, &residuals);
+        let gradient_norm = gradient.absolute_norm;
+        let relative_error = (gradient_norm / 1e-308 - 1.0).abs();
 
-            let solution = solver.solve(initial).expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!(solution.converged, "{:?}", solution);
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
-            assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
-        }
+        assert!(gradient_norm > 0.0);
+        assert!(relative_error < 1e-12, "relative error: {relative_error:e}");
+    }
+
+    /// Ensure one high-scale variable cannot hide a descent direction belonging
+    /// to another variable before an exactly solvable system's first update.
+    #[test]
+    fn test_scaled_consistent_overdetermined_system_does_not_false_converge() {
+        // At the origin the x column is exactly anti-parallel to the
+        // residual, but two unrelated y equations dominate the Jacobian's
+        // global Frobenius norm by nine orders of magnitude. A global gradient
+        // threshold could therefore hide the x direction even though the x=1
+        // root is one ordinary Newton correction away.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let x_residual = Exp::sub(x, Exp::val(1.0));
+        let y_residual = Exp::mul(Exp::val(1e9), y);
+        let solver = build_solver(vec![x_residual, y_residual.clone(), y_residual]);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("a scaled consistent linear system should reach its root");
+
+        assert_eq!(solution.iterations, 1);
+        assert!((solution.values["x"] - 1.0).abs() < 1e-12);
+        assert_eq!(solution.values["y"], 0.0);
+        assert!(solution.error < 1e-12);
+    }
+
+    /// Use the retained singular subspace, rather than individual column
+    /// cosines, to decide whether a correlated system has a usable correction.
+    #[test]
+    fn test_correlated_columns_do_not_hide_reachable_root() {
+        // At this initial point the residual is [0, -1e-6]. Its cosine with each
+        // individual Jacobian column is at most 1e-12, but the difference of the
+        // nearly parallel columns spans the residual exactly. Both singular
+        // directions remain above the precision-derived rank cutoff, so the
+        // pseudoinverse correction [-1e6, 1e6] must be attempted rather than
+        // classifying the accepted state as stationary.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![Exp::add(x.clone(), y.clone()), Exp::mul(Exp::val(1e-12), y)];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 1e6), ("y".to_string(), -1e6)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("the retained correlated direction reaches the exact root");
+
+        assert_eq!(solution.iterations, 1);
+        assert!(solution.values["x"].abs() < 1e-8);
+        assert!(solution.values["y"].abs() < 1e-8);
+        assert!(solution.error <= solver.options().residual_tolerance);
+        assert_eq!(
+            solution
+                .last_linear_attempt
+                .as_ref()
+                .expect("one correction requires one factorization")
+                .rank,
+            2
+        );
+    }
+
+    /// Attempt a retained correction even when its physical Armijo slope
+    /// underflows to negative zero.
+    #[test]
+    fn test_underflowed_slope_does_not_imply_model_stationarity() {
+        // The variable can remove the tiny first residual exactly, while the
+        // independent constant residual remains unsatisfied. Relative to the
+        // unit residual, the retained projection is 1e-300 and its norm slope
+        // is -1e-600, which rounds to negative zero. The solver must still take
+        // the correction under the representable nonincrease condition before
+        // reporting the remaining constant equation as stationary.
+        let x = Exp::var("x");
+        let solver = build_solver(vec![Exp::add(x, Exp::val(1e-300)), Exp::val(1.0)]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the constant residual prevents a constraint root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert_eq!(diagnostic.iterations, 1);
+        assert_eq!(diagnostic.values["x"], -1e-300);
+        assert_eq!(diagnostic.equations[0].residual, 0.0);
+        let attempt = diagnostic
+            .last_linear_attempt
+            .expect("stationarity is established by the final SVD attempt");
+        assert_eq!(attempt.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.residual_norm_slope, 0.0);
+    }
+
+    /// Classify a non-root zero-Jacobian point as stationary without claiming it
+    /// is a successful least-squares minimum.
+    #[test]
+    fn test_zero_jacobian_nonminimum_is_stationary_non_root() {
+        // Both equations have exact roots at +/-1. At x=0 their residual is
+        // non-zero and the squared-residual objective has a local maximum,
+        // even though the raw first derivative is zero.
+        let x = Exp::var("x");
+        let residual = Exp::sub(Exp::power(x, 2.0), Exp::val(1.0));
+        let solver = build_solver(vec![residual.clone(), residual]).with_max_iterations(1);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("a zero-Jacobian local maximum must not be successful");
+
+        let diagnostic = expect_stationary_non_root(error);
+        assert_eq!(diagnostic.iterations, 0);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-12);
+        assert_eq!(diagnostic.values["x"], 0.0);
+        assert_eq!(diagnostic.gradient_norm, Some(0.0));
+        assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert_zero_retained_projection(&diagnostic);
+    }
+
+    /// Ensure Armijo reaches a non-zero residual floor without confusing small
+    /// objective changes with failure.
+    #[test]
+    fn test_inconsistent_overdetermined_system_reaches_stationarity_from_away() {
+        // The least-squares objective for these incompatible equations has
+        // its unique stationary point at x=0 and residual norm sqrt(2). The
+        // A former absolute residual-change rule stopped before `J^T f`
+        // met tolerance even though valid descent remained.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("Armijo should identify a stationary non-root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert!(diagnostic.values["x"].abs() < 1e-8);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
+        assert!(diagnostic.gradient_norm.is_some_and(|norm| norm < 1e-8));
+        assert!(
+            diagnostic
+                .relative_gradient_norm
+                .is_some_and(|norm| norm < 1e-8)
+        );
+        assert!(
+            diagnostic.last_linear_attempt.is_some(),
+            "stationarity must retain its final SVD correction"
+        );
+    }
+
+    /// Confirm that line search uses the local least-squares slope rather than
+    /// demanding an impossible fixed reduction near a non-zero residual floor.
+    #[test]
+    fn test_line_search_reaches_inconsistent_least_squares_stationarity() {
+        // Moving from x=0.1 to x=0 only improves the residual norm by about
+        // half a percent because sqrt(2) is unavoidable. A valid Armijo test
+        // accepts that slope-consistent improvement, whereas the former 50%
+        // requirement rejected every possible positive step.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::add(x, Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.1)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("Armijo line search should reach a stationary non-root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert!(diagnostic.values["x"].abs() < 1e-8);
+        assert!((diagnostic.error - 2.0_f64.sqrt()).abs() < 1e-10);
+    }
+
+    /// Verify that the iteration count measures accepted updates rather than
+    /// residual evaluations.
+    #[test]
+    fn test_exact_initial_root_reports_zero_iterations() {
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
+
+        let solution = solver.solve_once(initial).expect("initial point is a root");
+
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.last_linear_attempt, None);
+    }
+
+    /// Enforce the documented inclusive residual threshold both before and
+    /// after a Newton correction.
+    #[test]
+    fn test_residual_tolerance_boundary_is_successful() {
+        // The initial residual norm is exactly one. Equality with the
+        // configured tolerance must certify this point without a linear
+        // solve or an accepted update.
+        let x = Exp::var("x");
+        let solver = build_solver(vec![x.clone()]).with_residual_tolerance(1.0);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("a residual equal to tolerance must be successful");
+
+        assert_eq!(solution.error, 1.0);
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.last_linear_attempt, None);
+    }
+
+    /// Ensure an intentionally unbounded-looking iteration budget does not
+    /// affect fixed-shape workspace construction before convergence is checked.
+    #[test]
+    fn test_large_iteration_budget_does_not_change_workspace_allocation() {
+        // The initial point is an exact root, so only one history entry is
+        // required regardless of the permitted maximum number of updates.
+        let x = Exp::var("x");
+        let equation = Exp::sub(x, Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_max_iterations(usize::MAX);
+        let initial = HashMap::from([("x".to_string(), 1.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("an exact root must not reserve the full update budget");
+
+        assert_eq!(solution.iterations, 0);
     }
 
     #[test]
-    fn test_rank_deficient_overconstrained_fails_without_regularization() {
-        let mut serial_error: Option<SolverError> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let x = Exp::var("x");
-            let y = Exp::var("y");
-            let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+    fn test_least_squares_svd_handles_ill_conditioned_overdetermined_system() {
+        // This system is overdetermined (3 equations, 2 unknowns) with an ill-conditioned
+        // Jacobian whose columns are nearly linearly dependent. Normal equations (J^T J) can
+        // lose the tiny distinguishing term and become singular in floating point. The
+        // canonical SVD should still retain and solve both singular directions.
+        let eps = 2f64.powi(-27); // exactly representable; eps^2 is below 1 ulp at ~3.0
 
-            let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
-            let eq2 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
-                Exp::val(2.0),
-            );
-            let eq3 = Exp::sub(
-                Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
-                Exp::val(3.0),
-            );
+        let x = Exp::var("x");
+        let y = Exp::var("y");
 
-            let solver = solver_for_mode(vec![eq1, eq2, eq3], mode)
-                .with_regularization(0.0)
-                .with_tolerance(1e-12)
-                .with_max_iterations(10);
+        // A = [[1, 1], [1, 1+eps], [1, 1-eps]]
+        // b corresponds to solution (x,y) = (1,1)
+        let eq1 = Exp::sub(Exp::add(x.clone(), y.clone()), Exp::val(2.0));
+        let eq2 = Exp::sub(
+            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 + eps))),
+            Exp::val(2.0 + eps),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(x.clone(), Exp::mul(y.clone(), Exp::val(1.0 - eps))),
+            Exp::val(2.0 - eps),
+        );
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
-            initial.insert("y".to_string(), 0.0);
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_max_iterations(10)
+            .with_residual_tolerance(1e-10);
 
-            let err = solver.solve(initial).expect_err("expected singular matrix error");
-            if is_serial {
-                serial_error = Some(err.clone());
-            } else {
-                let serial = serial_error.as_ref().expect("serial error missing");
-                assert_error_matches(serial, &err);
-            }
-            assert!(matches!(err, SolverError::SingularMatrix(_)), "{:?}", err);
-        }
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge with SVD least squares");
+
+        // The matrix condition is roughly 2/eps, so a few ulps in the
+        // factorization can move the individual coordinates by more than
+        // the residual tolerance. Require accurate variables at the scale
+        // justified by that conditioning and retain the stricter root test
+        // through the solver's residual assertion.
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-7);
+        assert!((solution.values.get("y").copied().unwrap() - 1.0).abs() < 1e-7);
+        assert!(solution.error < 1e-10);
+    }
+
+    /// Retain an independent direction whose coefficient is small because of
+    /// caller units rather than floating-point rank loss.
+    #[test]
+    fn test_solver_does_not_truncate_solvable_small_coefficient_direction() {
+        // The exact root is x=1, y=1e13. The former fixed 1e-12 relative
+        // cutoff dropped the y direction, accepted 100 zero corrections,
+        // and reported NoConvergence with y still at zero.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![
+            Exp::sub(x, Exp::val(1.0)),
+            Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("a direction above factorization roundoff must be retained");
+
+        assert_eq!(solution.iterations, 1);
+        assert_eq!(solution.values["x"], 1.0);
+        assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+        assert!(solution.error <= solver.options().residual_tolerance);
+        assert_eq!(
+            solution
+                .last_linear_attempt
+                .as_ref()
+                .expect("one correction must retain factorization diagnostics")
+                .rank,
+            2
+        );
+    }
+
+    /// Normalize variable coordinates so correction geometry and condition
+    /// diagnostics do not depend on the caller's chosen units.
+    #[test]
+    fn test_variable_scales_normalize_jacobian_columns() {
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![
+            Exp::sub(x, Exp::val(1.0)),
+            Exp::sub(Exp::mul(Exp::val(1e-13), y), Exp::val(1.0)),
+        ];
+        let solver = build_solver(equations)
+            .with_variable_scales(HashMap::from([("y".to_string(), 1e13)]))
+            .expect("y has a positive finite characteristic scale");
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("normalized variable coordinates should solve");
+        let linear = solution
+            .last_linear_attempt
+            .expect("one correction must report its scaled factorization");
+
+        assert_eq!(solution.values["x"], 1.0);
+        assert!((solution.values["y"] - 1e13).abs() < 1e-3);
+        assert_eq!(linear.rank, 2);
+        assert!((linear.cond_est - 1.0).abs() < 1e-12);
+        assert_eq!(solver.variable_scale("x"), Some(1.0));
+        assert_eq!(solver.variable_scale("y"), Some(1e13));
+    }
+
+    /// Make the variable-scale weighting of underdetermined minimum-norm
+    /// corrections an explicit solver contract.
+    #[test]
+    fn test_variable_scales_define_minimum_norm_correction_metric() {
+        // From the origin, x+y=1 has infinitely many exact full-step
+        // corrections. Unit scales minimize x^2+y^2 and select [0.5, 0.5].
+        // Giving x scale two minimizes (x/2)^2+y^2 instead and selects [0.8,
+        // 0.2], with both results returned in the caller's original units.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+
+        let unit_solution = build_solver(vec![equation.clone()])
+            .solve_once(initial.clone())
+            .expect("unit scales should reach the affine root");
+        let weighted_solution = build_solver(vec![equation])
+            .with_variable_scales(HashMap::from([("x".to_string(), 2.0)]))
+            .expect("x has a positive finite characteristic scale")
+            .solve_once(initial)
+            .expect("weighted normalized coordinates should reach the same root set");
+
+        assert!((unit_solution.values["x"] - 0.5).abs() < 1e-12);
+        assert!((unit_solution.values["y"] - 0.5).abs() < 1e-12);
+        assert!((weighted_solution.values["x"] - 0.8).abs() < 1e-12);
+        assert!((weighted_solution.values["y"] - 0.2).abs() < 1e-12);
+        assert!(weighted_solution.error < 1e-12);
+    }
+
+    /// Preserve finite caller-unit corrections across extreme scaling and
+    /// backtracking factors.
+    #[test]
+    fn test_scaled_update_preserves_representable_products() {
+        // Applying the step size first underflows 1e-320 * 1e-12, while
+        // applying the large variable scale first preserves a result near 1e-24.
+        let recovered_from_underflow =
+            NewtonRaphsonSolver::scaled_update_component(1e-320, 1e-12, 1e308);
+        assert!(recovered_from_underflow.is_finite());
+        assert!(recovered_from_underflow > 0.0);
+        assert!((recovered_from_underflow.log10() + 24.0).abs() < 0.01);
+
+        // Scaling first overflows 1e308 * 10, while applying the step size
+        // first preserves the finite result 1e307.
+        let recovered_from_overflow =
+            NewtonRaphsonSolver::scaled_update_component(1e308, 1e-2, 10.0);
+        assert!(recovered_from_overflow.is_finite());
+        assert!((recovered_from_overflow / 1e307 - 1.0).abs() < 1e-12);
+    }
+
+    /// Preserve a non-zero normalized derivative when coefficient and unit
+    /// scales span the complete finite exponent range.
+    #[test]
+    fn test_jacobian_scaling_does_not_underflow_representable_derivative() {
+        // The normalized derivative is
+        // 1e308 * 1e-308 / 1e308 = 1e-308. Forming the scale ratio first
+        // underflows it to zero and falsely classifies x=0 as stationary;
+        // the normalized Newton correction is 1e308 and restores the
+        // ordinary caller-unit update x=1.
+        let x = Exp::var("x");
+        let equation = Exp::sub(Exp::mul(Exp::val(1e308), x), Exp::val(1e308));
+        let solver = build_solver(vec![equation])
+            .with_equation_scales(vec![1e308])
+            .expect("the equation has one positive characteristic scale")
+            .with_variable_scales(HashMap::from([("x".to_string(), 1e-308)]))
+            .expect("the solve variable has one positive characteristic scale");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("the representable normalized derivative must reach the root");
+
+        assert_eq!(solution.iterations, 1);
+        assert!((solution.values["x"] - 1.0).abs() < 1e-12);
+        assert!(solution.error < 1e-12);
+    }
+
+    /// Use equation characteristic scales consistently for least-squares
+    /// weighting, convergence, stationarity, Armijo, and diagnostics.
+    #[test]
+    fn test_equation_scales_define_dimensionless_residual_objective() {
+        // Raw least squares would let the second equation's factor 1000
+        // dominate and place x near two. Dividing it by its characteristic
+        // scale gives both physical constraints equal dimensionless weight,
+        // whose stationary point is x=1.5.
+        let x = Exp::var("x");
+        let equations = vec![
+            Exp::sub(x.clone(), Exp::val(1.0)),
+            Exp::mul(Exp::val(1000.0), Exp::sub(x, Exp::val(2.0))),
+        ];
+        let solver = build_solver(equations)
+            .with_equation_scales(vec![1.0, 1000.0])
+            .expect("one positive scale is supplied per equation");
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the equally weighted equations are inconsistent");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert!((diagnostic.values["x"] - 1.5).abs() < 1e-12);
+        assert!((diagnostic.error - 0.5_f64.sqrt()).abs() < 1e-12);
+        assert!((diagnostic.equations[0].residual - 0.5).abs() < 1e-12);
+        assert!((diagnostic.equations[0].scaled_residual - 0.5).abs() < 1e-12);
+        assert!((diagnostic.equations[1].residual + 500.0).abs() < 1e-9);
+        assert!((diagnostic.equations[1].scaled_residual + 0.5).abs() < 1e-12);
+        assert_eq!(solver.equation_scales(), &[1.0, 1000.0]);
+    }
+
+    /// Ensure a nonlinear wide system certifies roots before mutation and still
+    /// makes genuine minimum-norm residual corrections away from a root.
+    #[test]
+    fn test_nonlinear_underdetermined_solver_never_starves_corrections() {
+        // The Jacobian row [y, x] rotates as either coordinate changes. The
+        // removed point-projection phase chased that row space and could
+        // starve residual corrections indefinitely.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::mul(x, y), Exp::val(1.0));
+        let solver = build_solver(vec![equation]).with_residual_tolerance(1e-12);
+
+        let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
+        let solution = solver
+            .solve_once(exact_root)
+            .expect("an exact nonlinear root must remain unchanged");
+        assert_eq!(solution.iterations, 0);
+        assert_eq!(solution.values["x"], 2.0);
+        assert_eq!(solution.values["y"], 0.5);
+
+        // Reuse the same compiled solver away from the root. Every accepted
+        // iteration must be a residual-reducing Newton correction.
+        let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("a nonlinear wide system must execute Newton corrections");
+        assert!(solution.iterations > 0);
+        assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
+    }
+
+    /// Confirm that a wide solve preserves the initial Jacobian-null-space
+    /// component by applying the unique minimum-norm Newton correction.
+    #[test]
+    fn test_underconstrained_solver_preserves_null_space_component() {
+        // The initial point has x+y=0 and a large component in the [1,-1]
+        // null-space direction. The minimum correction is [0.5,0.5].
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let solver = build_solver(vec![equation]);
+        let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("linear constraint should solve");
+
+        assert!((solution.values["x"] - 10.5).abs() < 1e-10);
+        assert!((solution.values["y"] + 9.5).abs() < 1e-10);
+    }
+
+    /// Confirm that default settings accept a well-conditioned retained SVD
+    /// subspace without changing policy merely because a variable is unused.
+    #[test]
+    fn test_rank_deficient_overconstrained_converges_with_default_settings() {
+        // Equations depend only on x; y is unconstrained. The Jacobian is rank deficient.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+            Exp::val(2.0),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+            Exp::val(3.0),
+        );
+
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
+
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge");
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
+        assert!((solution.values.get("y").copied().unwrap() - 0.0).abs() < 1e-10);
+    }
+
+    /// Confirm that a rank-deficient Jacobian uses its Moore-Penrose correction
+    /// directly.
+    #[test]
+    fn test_rank_deficient_overconstrained_uses_pseudoinverse() {
+        // Every equation constrains x while multiplication by zero keeps y
+        // present in the compiled variable table but absent from J's image.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let y_zero = Exp::mul(y.clone(), Exp::val(0.0));
+
+        let eq1 = Exp::sub(Exp::add(x.clone(), y_zero.clone()), Exp::val(1.0));
+        let eq2 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(2.0)), y_zero.clone()),
+            Exp::val(2.0),
+        );
+        let eq3 = Exp::sub(
+            Exp::add(Exp::mul(x.clone(), Exp::val(3.0)), y_zero.clone()),
+            Exp::val(3.0),
+        );
+
+        let solver = build_solver(vec![eq1, eq2, eq3])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
+
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
+        initial.insert("y".to_string(), 0.0);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("the SVD pseudoinverse should solve the dependent system");
+        assert!((solution.values["x"] - 1.0).abs() < 1e-10);
+        assert!(solution.values["y"].abs() < 1e-10);
+    }
+
+    /// Confirm that a dependent square system uses the canonical SVD directly.
+    #[test]
+    fn test_rank_deficient_square_system_uses_pseudoinverse() {
+        // Both equations describe the same line. Their 2-by-2 Jacobian is
+        // exactly rank one, so the Moore-Penrose correction selects
+        // x = y = 1/2 from the zero initial point.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let first_equation = Exp::sub(Exp::add(x, y), Exp::val(1.0));
+        let second_equation = Exp::mul(Exp::val(2.0), first_equation.clone());
+        let solver = build_solver(vec![first_equation, second_equation])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
+
+        // A symmetric initial point makes the pseudoinverse's minimum-norm
+        // choice deterministic and easy to distinguish from an arbitrary
+        // diagonal perturbation of the singular Jacobian.
+        let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
+        let solution = solver
+            .solve_once(initial)
+            .expect("the canonical SVD should solve dependent equations");
+
+        // The canonical serial traversal must select the pseudoinverse
+        // solution and terminate by satisfying the residual equations.
+        assert!(solution.error < 1e-12);
+        assert!((solution.values["x"] - 0.5).abs() < 1e-10);
+        assert!((solution.values["y"] - 0.5).abs() < 1e-10);
+        let linear = solution
+            .last_linear_attempt
+            .expect("the accepted correction must retain SVD diagnostics");
+        assert_eq!(linear.rank, 1);
     }
 
     #[test]
     fn test_overconstrained_consistent_system_solves() {
-        let mut serial_solution: Option<Solution> = None;
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            // Overdetermined but consistent system: x = 1 and 2x = 2.
-            let x = Exp::var("x");
-            let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
-            let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
+        // Overdetermined but consistent system: x = 1 and 2x = 2.
+        let x = Exp::var("x");
+        let eq1 = Exp::sub(x.clone(), Exp::val(1.0));
+        let eq2 = Exp::sub(Exp::mul(x.clone(), Exp::val(2.0)), Exp::val(2.0));
 
-            let solver = solver_for_mode(vec![eq1, eq2], mode)
-                .with_tolerance(1e-12)
-                .with_max_iterations(10);
+        let solver = build_solver(vec![eq1, eq2])
+            .with_residual_tolerance(1e-12)
+            .with_max_iterations(10);
 
-            let mut initial = HashMap::new();
-            initial.insert("x".to_string(), 0.0);
+        let mut initial = HashMap::new();
+        initial.insert("x".to_string(), 0.0);
 
-            let solution = solver.solve(initial).expect("expected solver to converge");
-            if is_serial {
-                serial_solution = Some(solution.clone());
-            } else {
-                let serial = serial_solution.as_ref().expect("serial solution missing");
-                assert_solution_close(serial, &solution, 1e-10);
-            }
-            assert!(solution.converged, "{:?}", solution);
-            assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
-        }
+        let solution = solver
+            .solve_once(initial)
+            .expect("expected solver to converge");
+        assert!((solution.values.get("x").copied().unwrap() - 1.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_random_square_linear_systems() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
-            for case_index in 0..5 {
-                let n = 3;
-                let mut a = vec![vec![0.0; n]; n];
-                for i in 0..n {
-                    for j in 0..n {
-                        a[i][j] = rng.next_f64();
-                    }
-                    a[i][i] += 2.0;
+        let mut rng = TestRng::new(0x51ab_1e55_cafe_f00d);
+        for _ in 0..5 {
+            let n = 3;
+            let mut a = vec![vec![0.0; n]; n];
+            for (diagonal_index, row) in a.iter_mut().enumerate() {
+                for coefficient in row.iter_mut() {
+                    *coefficient = rng.next_f64();
                 }
+                row[diagonal_index] += 2.0;
+            }
 
-                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
-                let mut b = vec![0.0; n];
-                for i in 0..n {
-                    for j in 0..n {
-                        b[i] += a[i][j] * x_true[j];
-                    }
-                }
+            let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let mut b = vec![0.0; n];
+            for (rhs, row) in b.iter_mut().zip(&a) {
+                *rhs = row
+                    .iter()
+                    .zip(x_true.iter())
+                    .map(|(coefficient, value)| coefficient * value)
+                    .sum();
+            }
 
-                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-                let equations: Vec<Exp> = (0..n)
-                    .map(|i| linear_equation(&a[i], &vars, b[i]))
-                    .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+            let equations: Vec<Exp> = (0..n)
+                .map(|i| linear_equation(&a[i], &vars, b[i]))
+                .collect();
 
-                let solver = solver_for_mode(equations, mode.clone())
-                    .with_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(equations)
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
+            }
 
-                let solution = solver.solve(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
-                }
-                for i in 0..n {
-                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - x_true[i]).abs() < 1e-8);
-                }
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            for (i, expected_value) in x_true.iter().enumerate() {
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - expected_value).abs() < 1e-8);
             }
         }
     }
 
     #[test]
     fn test_random_overconstrained_linear_systems() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0xa11c_e551_dead_beef);
-            let m = 5;
-            let n = 3;
+        let mut rng = TestRng::new(0xa11c_e551_dead_beef);
+        let m = 5;
+        let n = 3;
 
-            for case_index in 0..5 {
-                let mut a = vec![vec![0.0; n]; m];
-                for i in 0..m {
-                    for j in 0..n {
-                        a[i][j] = rng.next_f64();
-                    }
+        for _ in 0..5 {
+            let mut a = vec![vec![0.0; n]; m];
+            for row in &mut a {
+                for coefficient in row {
+                    *coefficient = rng.next_f64();
                 }
-                for i in 0..n {
-                    a[i][i] += 2.0;
-                }
+            }
+            for (diagonal_index, row) in a.iter_mut().take(n).enumerate() {
+                row[diagonal_index] += 2.0;
+            }
 
-                let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
-                let mut b = vec![0.0; m];
-                for i in 0..m {
-                    for j in 0..n {
-                        b[i] += a[i][j] * x_true[j];
-                    }
-                }
+            let x_true = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+            let mut b = vec![0.0; m];
+            for (rhs, row) in b.iter_mut().zip(&a) {
+                *rhs = row
+                    .iter()
+                    .zip(x_true.iter())
+                    .map(|(coefficient, value)| coefficient * value)
+                    .sum();
+            }
 
-                let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
-                let equations: Vec<Exp> = (0..m)
-                    .map(|i| linear_equation(&a[i], &vars, b[i]))
-                    .collect();
+            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+            let equations: Vec<Exp> = (0..m)
+                .map(|i| linear_equation(&a[i], &vars, b[i]))
+                .collect();
 
-                let solver = solver_for_mode(equations, mode.clone())
-                    .with_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(equations)
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
+            }
 
-                let solution = solver.solve(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-8);
-                }
-                for i in 0..n {
-                    let value = solution.values.get(&format!("x{i}")).copied().unwrap();
-                    assert!((value - x_true[i]).abs() < 1e-8);
-                }
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            for (i, expected_value) in x_true.iter().enumerate() {
+                let value = solution.values.get(&format!("x{i}")).copied().unwrap();
+                assert!((value - expected_value).abs() < 1e-8);
             }
         }
     }
 
     #[test]
     fn test_random_underdetermined_min_norm_structure() {
-        let mut serial_solutions: Vec<Solution> = Vec::new();
-        for mode in test_modes() {
-            let is_serial = matches!(mode, Mode::Serial);
-            let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
-            let _m = 2;
-            let n = 4;
-            let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
+        let mut rng = TestRng::new(0x0ddc_affe_fade_bead);
+        let _m = 2;
+        let n = 4;
+        let vars: Vec<Exp> = (0..n).map(|i| Exp::var(format!("x{i}"))).collect();
 
-            for case_index in 0..5 {
-                let b0 = rng.next_f64();
-                let b1 = rng.next_f64();
-                let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
-                let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
-                let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
-                let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
+        for _ in 0..5 {
+            let b0 = rng.next_f64();
+            let b1 = rng.next_f64();
+            let x2_zero = Exp::mul(vars[2].clone(), Exp::val(0.0));
+            let x3_zero = Exp::mul(vars[3].clone(), Exp::val(0.0));
+            let eq1 = Exp::sub(Exp::add(vars[0].clone(), x2_zero.clone()), Exp::val(b0));
+            let eq2 = Exp::sub(Exp::add(vars[1].clone(), x3_zero.clone()), Exp::val(b1));
 
-                let solver = solver_for_mode(vec![eq1, eq2], mode.clone())
-                    .with_tolerance(1e-12)
-                    .with_max_iterations(20);
+            let solver = build_solver(vec![eq1, eq2])
+                .with_residual_tolerance(1e-12)
+                .with_max_iterations(20);
 
-                let mut initial = HashMap::new();
-                for i in 0..n {
-                    initial.insert(format!("x{i}"), 0.0);
-                }
-
-                let solution = solver.solve(initial).expect("expected to solve");
-                if is_serial {
-                    serial_solutions.push(solution.clone());
-                } else {
-                    assert_solution_close(&serial_solutions[case_index], &solution, 1e-10);
-                }
-                assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
-                assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
-                assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
-                assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
+            let mut initial = HashMap::new();
+            for i in 0..n {
+                initial.insert(format!("x{i}"), 0.0);
             }
+
+            let solution = solver.solve_once(initial).expect("expected to solve");
+            assert!((solution.values.get("x0").copied().unwrap() - b0).abs() < 1e-10);
+            assert!((solution.values.get("x1").copied().unwrap() - b1).abs() < 1e-10);
+            assert!(solution.values.get("x2").copied().unwrap().abs() < 1e-10);
+            assert!(solution.values.get("x3").copied().unwrap().abs() < 1e-10);
         }
     }
 }

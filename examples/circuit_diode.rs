@@ -37,26 +37,35 @@ fn main() {
     let vt = 0.02585;
 
     // KVL: Vs - I*R - Vd = 0
-    let kvl = Exp::sub(Exp::sub(Exp::val(vs), Exp::mul(i.clone(), Exp::val(r))), vd.clone());
+    let kvl = Exp::sub(
+        Exp::sub(Exp::val(vs), Exp::mul(i.clone(), Exp::val(r))),
+        vd.clone(),
+    );
 
     // I - Is * (exp(Vd / (n*Vt)) - 1) = 0
     let exp_arg = Exp::div(vd.clone(), Exp::val(n * vt));
-    let diode_i = Exp::mul(
-        Exp::val(isat),
-        Exp::sub(Exp::exp(exp_arg), Exp::val(1.0)),
-    );
+    let diode_i = Exp::mul(Exp::val(isat), Exp::sub(Exp::exp(exp_arg), Exp::val(1.0)));
     let diode_eq = Exp::sub(i.clone(), diode_i);
 
     let compiled = Compiler::compile(&[kvl, diode_eq]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new(compiled);
+    let mut workspace = solver.workspace();
 
     let mut initial = HashMap::new();
     initial.insert("i".to_string(), 0.005);
     initial.insert("vd".to_string(), 0.7);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let i_sol = solution.values.get("i").copied().unwrap();
     let vd_sol = solution.values.get("vd").copied().unwrap();
 
+    // Verify the selected forward-biased operating point as well as the
+    // solver's aggregate residual. These bounds are intentionally tighter
+    // than the printed precision while allowing harmless floating-point drift.
+    assert!(solution.error < 1e-10);
+    assert!(solution.iterations > 0);
+    assert!((i_sol - 0.004_425_85).abs() < 1e-8);
+    assert!((vd_sol - 0.574_147).abs() < 1e-6);
+    assert!((vs - i_sol * r - vd_sol).abs() < 1e-10);
     println!("diode: i={:.6} A, vd={:.6} V", i_sol, vd_sol);
 }

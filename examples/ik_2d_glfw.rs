@@ -22,13 +22,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverWorkspace};
 use glfw::{Action, Context, Key, WindowEvent};
 use glow::HasContext;
 use rs_math3d::Vec2d;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::f64::consts::PI;
+use std::ffi::c_void;
 
 // Link lengths and draw sizes (world units == screen pixels).
 const LINK_1: f64 = 140.0;
@@ -38,12 +38,15 @@ const LINK_4: f64 = 80.0;
 const JOINT_RADIUS: f64 = 6.0;
 const TARGET_RADIUS: f64 = 8.0;
 
-// Current IK solution in local (base-centered) coordinates.
-#[derive(Clone)]
+/// Current IK solution in local, base-centered coordinates.
 struct IkState {
+    /// Endpoint of the first fixed-length link.
     joint1: Vec2d,
+    /// Endpoint of the second fixed-length link.
     joint2: Vec2d,
+    /// Endpoint of the third fixed-length link.
     joint3: Vec2d,
+    /// Endpoint of the fourth link and constrained target effector.
     effector: Vec2d,
 }
 
@@ -141,7 +144,9 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     "#;
 
     let program = gl.create_program().expect("create program");
-    let vertex = gl.create_shader(glow::VERTEX_SHADER).expect("create vertex shader");
+    let vertex = gl
+        .create_shader(glow::VERTEX_SHADER)
+        .expect("create vertex shader");
     gl.shader_source(vertex, vertex_src);
     gl.compile_shader(vertex);
     if !gl.get_shader_compile_status(vertex) {
@@ -154,7 +159,10 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     gl.shader_source(fragment, fragment_src);
     gl.compile_shader(fragment);
     if !gl.get_shader_compile_status(fragment) {
-        panic!("fragment shader error: {}", gl.get_shader_info_log(fragment));
+        panic!(
+            "fragment shader error: {}",
+            gl.get_shader_info_log(fragment)
+        );
     }
 
     gl.attach_shader(program, vertex);
@@ -184,6 +192,30 @@ unsafe fn build_gl_state(gl: &glow::Context) -> GlState {
     }
 }
 
+/// Delete every OpenGL object owned by [`GlState`] while its context is still
+/// current on this thread.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn destroy_gl_state(gl: &glow::Context, state: GlState) {
+    // Clear bindings before deletion so no subsequent context teardown step can
+    // observe handles that the example no longer owns.
+    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    gl.use_program(None);
+    gl.delete_buffer(state.vbo);
+    gl.delete_program(state.program);
+}
+
+/// Print a solver failure only when it differs from the most recently reported
+/// failure, then retain it for change detection on the next frame.
+fn report_changed_solver_error(last_error: &mut Option<String>, message: String) {
+    // A continuously unreachable cursor target can fail for many consecutive
+    // frames. Suppressing identical messages keeps stderr useful without hiding
+    // transitions to a different failure mode.
+    if last_error.as_deref() != Some(message.as_str()) {
+        eprintln!("IK solver error: {message}");
+    }
+    *last_error = Some(message);
+}
+
 fn draw_vertices(
     gl: &glow::Context,
     state: &GlState,
@@ -197,7 +229,9 @@ fn draw_vertices(
         gl.line_width(line_width);
 
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(state.vbo));
-        let byte_len = vertices.len() * std::mem::size_of::<f32>();
+        // Compute the complete slice size directly so element-count arithmetic
+        // cannot drift from the vertex element type.
+        let byte_len = std::mem::size_of_val(vertices);
         let bytes = std::slice::from_raw_parts(vertices.as_ptr() as *const u8, byte_len);
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
 
@@ -236,7 +270,6 @@ impl PointExpr {
 // Constraint interface used by joints and the target.
 trait IKConstraint {
     fn equations(&self) -> Vec<Exp>;
-    fn variables(&self) -> &Vec<String>;
 }
 
 // Names + expressions for a 2D point in the solver.
@@ -261,10 +294,6 @@ impl JointVars {
             y_name,
             var_names,
         }
-    }
-
-    fn variables(&self) -> &Vec<String> {
-        &self.var_names
     }
 
     // Insert a Vec2d into the solver input map.
@@ -309,10 +338,6 @@ impl IKConstraint for Joint {
             self.length,
         )]
     }
-
-    fn variables(&self) -> &Vec<String> {
-        self.vars.variables()
-    }
 }
 
 // Target constraint: effector should match a target point.
@@ -338,9 +363,242 @@ impl IKConstraint for Target {
             Exp::sub(self.effector.y.clone(), self.vars.y.clone()),
         ]
     }
+}
 
-    fn variables(&self) -> &Vec<String> {
-        self.vars.variables()
+/// Complete reusable constraint model for the four-link graphical IK example.
+///
+/// Owning model construction and pose translation here keeps the interactive
+/// loop and the headless regression on exactly the same compile/solve path.
+struct IkModel {
+    /// Ordered link constraints from the base-adjacent joint to the effector.
+    joints: [Joint; 4],
+    /// Fixed-parameter point that the end effector must match.
+    target: Target,
+    /// Compiled nonlinear solver reused across graphical frames.
+    solver: NewtonRaphsonSolver,
+    /// Numerical buffers reused across graphical frames and headless tests.
+    workspace: SolverWorkspace,
+}
+
+impl IkModel {
+    /// Build and compile the same four-link constraint graph used by every
+    /// graphical frame and headless end-to-end test.
+    fn new() -> Self {
+        // Point expressions own cloned symbolic trees rather than references,
+        // so the complete chain can be assembled before its joints are moved
+        // into the returned model.
+        let origin = PointExpr::constant(0.0, 0.0);
+        let joint1 = Joint::new("j1", origin, LINK_1);
+        let joint2 = Joint::new("j2", PointExpr::from_vars(&joint1.vars), LINK_2);
+        let joint3 = Joint::new("j3", PointExpr::from_vars(&joint2.vars), LINK_3);
+        let joint4 = Joint::new("j4", PointExpr::from_vars(&joint3.vars), LINK_4);
+        let target = Target::new("t", PointExpr::from_vars(&joint4.vars));
+
+        // Compile every constraint once. The target variables remain fixed
+        // parameters because only joint names are supplied as solve variables.
+        let constraints: [&dyn IKConstraint; 5] = [&joint1, &joint2, &joint3, &joint4, &target];
+        let mut equations = Vec::new();
+        for constraint in constraints {
+            equations.extend(constraint.equations());
+        }
+        let compiled = Compiler::compile(&equations).expect("IK constraints must compile");
+
+        let joint_variables = [&joint1.vars, &joint2.vars, &joint3.vars, &joint4.vars];
+        let mut solve_variable_names = Vec::with_capacity(joint_variables.len() * 2);
+        for variables in joint_variables {
+            solve_variable_names.extend(variables.var_names.iter().cloned());
+        }
+        let solve_variable_refs: Vec<&str> =
+            solve_variable_names.iter().map(String::as_str).collect();
+
+        // Minimum-norm Newton corrections preserve the previous frame's local
+        // null-space component, keeping underdetermined chain motion continuous.
+        let solver = NewtonRaphsonSolver::new_with_variables(compiled, &solve_variable_refs)
+            .expect("all selected IK variables belong to the compiled system");
+
+        let workspace = solver.workspace();
+        Self {
+            joints: [joint1, joint2, joint3, joint4],
+            target,
+            solver,
+            workspace,
+        }
+    }
+
+    /// Solve one target update from the previous valid pose.
+    ///
+    /// A successful result contains every joint coordinate. Solver failures and
+    /// an impossible missing-coordinate invariant are both converted to the
+    /// graphical example's existing displayable error channel.
+    fn solve_pose(
+        &mut self,
+        current: &IkState,
+        target_position: &Vec2d,
+    ) -> Result<IkState, String> {
+        // Seed joint variables from the previous frame for continuity and add
+        // the requested target as the two fixed parameters referenced by the
+        // final constraints.
+        let mut initial = HashMap::with_capacity(10);
+        let current_positions = [
+            &current.joint1,
+            &current.joint2,
+            &current.joint3,
+            &current.effector,
+        ];
+        for (joint, value) in self.joints.iter().zip(current_positions) {
+            joint.vars.insert_values(&mut initial, value);
+        }
+        self.target
+            .vars
+            .insert_values(&mut initial, target_position);
+
+        let solution = self
+            .solver
+            .solve(initial, &mut self.workspace)
+            .map_err(|error| error.to_string())?;
+        let missing_coordinate =
+            || "successful IK solve omitted one or more compiled joint coordinates".to_string();
+        let read_joint = |index: usize| {
+            self.joints[index]
+                .vars
+                .read_values(&solution.values)
+                .ok_or_else(missing_coordinate)
+        };
+
+        // Translate the public name-keyed result back into the compact state
+        // consumed by rendering and by the independent geometric assertions.
+        Ok(IkState {
+            joint1: read_joint(0)?,
+            joint2: read_joint(1)?,
+            joint3: read_joint(2)?,
+            effector: read_joint(3)?,
+        })
+    }
+}
+
+/// Headless checks for the graphical example's pure geometry helpers.
+///
+/// Window creation and OpenGL context lifetime remain compile-tested on CI,
+/// while these tests execute the numerical decisions that can be isolated from
+/// a display server.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert two double-precision points agree within the tolerance needed by
+    /// the example's screen-space geometry.
+    fn assert_point_close(actual: &Vec2d, expected: &Vec2d) {
+        // Check coordinates separately so a failure identifies which screen
+        // axis produced the unexpected result.
+        assert!((actual.x - expected.x).abs() < 1e-12);
+        assert!((actual.y - expected.y).abs() < 1e-12);
+    }
+
+    /// Verify that targets beyond maximum extension retain their direction and
+    /// land exactly on the reachable outer radius.
+    #[test]
+    fn target_beyond_outer_radius_is_clamped_radially() {
+        // A 3-4-5 target clamped to a chain of total length three must scale to
+        // the analytically known point (1.8, 2.4).
+        let (clamped, changed) = clamp_target(&vec2(3.0, 4.0), &[2.0, 1.0]);
+
+        assert!(changed);
+        assert_point_close(&clamped, &vec2(1.8, 2.4));
+    }
+
+    /// Verify that a chain dominated by one link pushes an origin target to a
+    /// deterministic point on the inner reachable radius.
+    #[test]
+    fn origin_inside_inner_radius_uses_positive_x_fallback() {
+        // Lengths five and one can reach radii only in [4, 6]. At the origin no
+        // incoming direction exists, so the helper deliberately chooses +X.
+        let (clamped, changed) = clamp_target(&vec2(0.0, 0.0), &[5.0, 1.0]);
+
+        assert!(changed);
+        assert_point_close(&clamped, &vec2(4.0, 0.0));
+    }
+
+    /// Verify that an already reachable target is copied without reporting a
+    /// clamp operation.
+    #[test]
+    fn reachable_target_is_preserved() {
+        // Radius sqrt(2) lies between the inner radius one and outer radius five
+        // for a three-plus-two link chain.
+        let target = vec2(1.0, -1.0);
+        let (clamped, changed) = clamp_target(&target, &[3.0, 2.0]);
+
+        assert!(!changed);
+        assert_point_close(&clamped, &target);
+    }
+
+    /// Verify circle tessellation emits one interleaved x/y pair per requested
+    /// segment and places the four cardinal samples correctly.
+    #[test]
+    fn circle_vertices_generate_cardinal_points() {
+        // Four segments sample angles 0, pi/2, pi, and 3pi/2 around a translated
+        // circle. Casting through f32 requires an appropriately relaxed check.
+        let vertices = circle_vertices(2.0, -1.0, 3.0, 4);
+        let expected = [5.0_f32, -1.0, 2.0, 2.0, -1.0, -1.0, 2.0, -4.0];
+
+        assert_eq!(vertices.len(), expected.len());
+        for (actual, expected) in vertices.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1e-6);
+        }
+    }
+
+    /// Execute a 100-frame target path without a display and independently check
+    /// every returned target and link-length geometry.
+    #[test]
+    fn ik_model_tracks_reachable_targets_from_graphical_startup_pose() {
+        let mut model = IkModel::new();
+
+        // Use the exact fully extended pose shown on graphical startup. Its
+        // Jacobian is rank deficient, so this headless path must exercise the
+        // numerical-null-space handling required by the first interactive frame
+        // instead of sidestepping it with an already bent fixture.
+        let origin = vec2(0.0, 0.0);
+        let joint1 = vec2(LINK_1, 0.0);
+        let joint2 = vec2(LINK_1 + LINK_2, 0.0);
+        let joint3 = vec2(LINK_1 + LINK_2 + LINK_3, 0.0);
+        let effector = vec2(LINK_1 + LINK_2 + LINK_3 + LINK_4, 0.0);
+        let mut state = IkState {
+            joint1,
+            joint2,
+            joint3,
+            effector,
+        };
+
+        let initial_radius = 130_000.0_f64.sqrt();
+        let initial_angle = (2.0_f64 / 3.0).atan();
+        for frame in 0..100 {
+            // Follow a smooth closed path whose varying radius keeps every point
+            // comfortably inside the chain's reachable disk. The phase offset
+            // makes the first correction leave the singular horizontal pose in
+            // both x and y, matching an ordinary cursor-driven startup frame.
+            let phase = 2.0 * PI * frame as f64 / 100.0;
+            let radius = initial_radius + 20.0 * (2.0 * phase).sin();
+            let angle = initial_angle + phase;
+            let target = vec2(radius * angle.cos(), radius * angle.sin());
+            let solved = model
+                .solve_pose(&state, &target)
+                .unwrap_or_else(|error| panic!("interactive frame {frame} failed: {error}"));
+
+            // Target coordinates are direct residuals, while link checks are an
+            // independent geometric oracle over the returned joint positions.
+            assert!((solved.effector.x - target.x).abs() < 1e-8);
+            assert!((solved.effector.y - target.y).abs() < 1e-8);
+            let links = [
+                (&origin, &solved.joint1, LINK_1),
+                (&solved.joint1, &solved.joint2, LINK_2),
+                (&solved.joint2, &solved.joint3, LINK_3),
+                (&solved.joint3, &solved.effector, LINK_4),
+            ];
+            for (parent, child, expected_length) in links {
+                let offset = vec2(child.x - parent.x, child.y - parent.y);
+                assert!((vec2_len(&offset) - expected_length).abs() < 1e-8);
+            }
+            state = solved;
+        }
     }
 }
 
@@ -349,10 +607,18 @@ fn main() {
     glfw.window_hint(glfw::WindowHint::ContextVersion(2, 1));
 
     let (mut window, events) = glfw
-        .create_window(900, 700, "2D IK (constraint-solver)", glfw::WindowMode::Windowed)
+        .create_window(
+            900,
+            700,
+            "2D IK (constraint-solver)",
+            glfw::WindowMode::Windowed,
+        )
         .expect("failed to create window");
 
     window.make_current();
+    // Synchronize buffer swaps to the display so the continuously solving demo
+    // does not consume an entire CPU core rendering imperceptible extra frames.
+    glfw.set_swap_interval(glfw::SwapInterval::Sync(1));
     window.set_key_polling(true);
     window.set_cursor_pos_polling(true);
     window.set_framebuffer_size_polling(true);
@@ -370,31 +636,9 @@ fn main() {
         gl.clear_color(0.06, 0.07, 0.09, 1.0);
     }
 
-    // Build the IK chain as constraint objects.
-    let origin = PointExpr::constant(0.0, 0.0);
-    let joint1 = Joint::new("j1", origin.clone(), LINK_1);
-    let joint2 = Joint::new("j2", PointExpr::from_vars(&joint1.vars), LINK_2);
-    let joint3 = Joint::new("j3", PointExpr::from_vars(&joint2.vars), LINK_3);
-    let joint4 = Joint::new("j4", PointExpr::from_vars(&joint3.vars), LINK_4);
-    let target = Target::new("t", PointExpr::from_vars(&joint4.vars));
-
-    // Collect equations and compile them into the solver.
-    let constraints: [&dyn IKConstraint; 5] = [&joint1, &joint2, &joint3, &joint4, &target];
-    let mut equations = Vec::new();
-    for constraint in constraints {
-        equations.extend(constraint.equations());
-    }
-
-    let compiled = Compiler::compile(&equations).expect("compile");
-    // Only the joints are solved for; the target is provided as a parameter.
-    let joints: [&dyn IKConstraint; 4] = [&joint1, &joint2, &joint3, &joint4];
-    let mut solve_var_names = Vec::with_capacity(joints.len() * 2);
-    for joint in joints {
-        solve_var_names.extend(joint.variables().iter().cloned());
-    }
-    let solve_var_refs: Vec<&str> = solve_var_names.iter().map(|s| s.as_str()).collect();
-    let solver =
-        NewtonRaphsonSolver::new_with_variables(compiled, &solve_var_refs).expect("solver");
+    // Compile the reusable constraint graph independently of window state so
+    // every frame and the headless regression share one model implementation.
+    let mut ik_model = IkModel::new();
 
     // Initial pose: straight chain along +X axis.
     let mut state = IkState {
@@ -403,6 +647,9 @@ fn main() {
         joint3: vec2(LINK_1 + LINK_2 + LINK_3, 0.0),
         effector: vec2(LINK_1 + LINK_2 + LINK_3 + LINK_4, 0.0),
     };
+    // Retain the last user-visible failure so a repeated per-frame error is
+    // reported once rather than flooding the terminal.
+    let mut last_solver_error: Option<String> = None;
 
     while !window.should_close() {
         glfw.poll_events();
@@ -435,33 +682,21 @@ fn main() {
         let lengths = [LINK_1, LINK_2, LINK_3, LINK_4];
         let (clamped_target, was_clamped) = clamp_target(&raw_target, &lengths);
 
-        // Provide current state + target as the solver initial guess.
-        let mut initial = HashMap::with_capacity(10);
-        let joint_values = [
-            (&joint1, &state.joint1),
-            (&joint2, &state.joint2),
-            (&joint3, &state.joint3),
-            (&joint4, &state.effector),
-        ];
-        for (joint, value) in joint_values {
-            joint.vars.insert_values(&mut initial, value);
-        }
-        target.vars.insert_values(&mut initial, &clamped_target);
+        // Solve for joint positions and retain the last valid pose whenever a
+        // frame cannot be solved. Failures remain visible without making the
+        // graphical example terminate on a transient numerical condition.
+        match ik_model.solve_pose(&state, &clamped_target) {
+            Ok(solved_state) => {
+                state = solved_state;
 
-        // Solve for the joint positions.
-        if let Ok(solution) = solver.solve(initial) {
-            if solution.converged {
-                if let (Some(j1), Some(j2), Some(j3), Some(j4)) = (
-                    joint1.vars.read_values(&solution.values),
-                    joint2.vars.read_values(&solution.values),
-                    joint3.vars.read_values(&solution.values),
-                    joint4.vars.read_values(&solution.values),
-                ) {
-                    state.joint1 = j1;
-                    state.joint2 = j2;
-                    state.joint3 = j3;
-                    state.effector = j4;
+                // Report recovery once when a valid complete pose follows a
+                // previously surfaced error.
+                if last_solver_error.take().is_some() {
+                    eprintln!("IK solver recovered");
                 }
+            }
+            Err(message) => {
+                report_changed_solver_error(&mut last_solver_error, message);
             }
         }
 
@@ -479,20 +714,10 @@ fn main() {
             gl.viewport(0, 0, fb_w as i32, fb_h as i32);
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(gl_state.program));
-            gl.uniform_2_f32(
-                gl_state.u_view_loc.as_ref(),
-                fb_w as f32,
-                fb_h as f32,
-            );
+            gl.uniform_2_f32(gl_state.u_view_loc.as_ref(), fb_w as f32, fb_h as f32);
 
             let mut line_vertices = Vec::with_capacity(16);
-            let points = [
-                base,
-                joint1_world,
-                joint2_world,
-                joint3_world,
-                eff_world,
-            ];
+            let points = [base, joint1_world, joint2_world, joint3_world, eff_world];
             for i in 0..points.len() - 1 {
                 let a = &points[i];
                 let b = &points[i + 1];
@@ -549,5 +774,11 @@ fn main() {
         }
 
         window.swap_buffers();
+    }
+
+    // Release GPU resources explicitly before `window` destroys the current
+    // context; deleting them afterward would be invalid OpenGL usage.
+    unsafe {
+        destroy_gl_state(&gl, gl_state);
     }
 }
