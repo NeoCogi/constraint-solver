@@ -130,12 +130,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   residual, gradient, equation-trace, iteration, and prior-attempt state.
   Already-computed gradient measures are also retained in every
   `NoConvergence` diagnostic.
-- Prevented avoidable intermediate range failures in norms, column-scaled
-  stationarity, line-search slopes, Jacobian normalization, physical updates,
-  matrix products, and SVD projection and reconstruction when their completed
-  `f64` results are representable. Products, quotients, and critical reductions
-  now share one exponent-scaled compensated policy; ordinary `f64` rounding is
-  retained rather than claiming arbitrary-precision cancellation.
+- Prevented avoidable factor-order range failures in Jacobian normalization,
+  physical updates, residual-norm slopes, and individual SVD reconstruction
+  contributions through binary-exponent product and quotient formation. Dot
+  products and cross-component reconstruction remain ordinary compensated
+  `f64`: a non-finite term or partial total is rejected even if later
+  cancellation could produce a finite mathematical result.
 - Bounded the dimensionless stationarity tolerance to `(0, 1]` and retained
   algebraically independent small-coefficient directions above factorization
   roundoff, preventing repeated zero corrections on solvable systems.

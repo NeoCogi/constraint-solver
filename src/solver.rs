@@ -1314,9 +1314,9 @@ impl NewtonRaphsonSolver {
                 let scaled_jacobian = jacobian[(row, column)] / column_scale;
                 let scaled_residual = residuals[(row, 0)] / residual_scale;
                 scaled_column_norm = scaled_column_norm.hypot(scaled_jacobian);
-                // Both normalized factors are bounded by one. Ordinary
-                // compensation is sufficient here; exponent extension is
-                // reserved for SVD reconstruction where it is indispensable.
+                // Both normalized factors are bounded by one, so ordinary
+                // compensation improves rounding without needing a wider-range
+                // product or reduction contract.
                 dot.add(scaled_jacobian * scaled_residual);
             }
 

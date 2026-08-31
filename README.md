@@ -323,9 +323,11 @@ the harness on the target machine when making performance decisions.
   matrix shape and rank. This avoids normal equations and makes numerical rank
   independent of variable ordering. Rank uses the scale-relative threshold
   `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
-  level cutoff. Binary-exponent accumulation is confined to reconstruction of
-  singular components, where large contributions can cancel to a finite
-  solution; it is not a general-purpose extended-precision number system.
+  level cutoff. Each singular solution contribution forms its products and
+  quotients through binary-exponent scaling, then rounds to `f64` before an
+  ordinary compensated component-order sum. A non-finite contribution or
+  partial total is a structured error even if a later component could cancel
+  it; no hidden wider-range accumulator is used.
 - Matrix arithmetic uses `add_into`, `sub_into`, `mul_into`, and `scale_into`
   with exact-shape caller-owned output buffers. Construct buffers once and
   reuse them; these operations never resize or allocate. Arithmetic rejects NaN

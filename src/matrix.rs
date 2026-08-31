@@ -34,7 +34,7 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
-use crate::scaled::{CompensatedSum, ScaledSum, product_ratio};
+use crate::scaled::{CompensatedSum, product_ratio};
 
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked arithmetic or linear-solve operation began.
@@ -535,6 +535,14 @@ impl Matrix {
     /// fraction of `b` captured by the same retained singular directions, and
     /// the residual-norm slope along the returned solution. No secondary matrix
     /// multiplication is used to reconstruct those model diagnostics.
+    ///
+    /// Each singular solution contribution is formed through exponent-safe
+    /// factor arithmetic and rounded to `f64` before component-order Neumaier
+    /// accumulation. A non-finite contribution or partial compensated total
+    /// returns [`MatrixError::NonFiniteResult`], even if a later singular
+    /// contribution could have cancelled it to a finite value. Finite underflow
+    /// follows ordinary `f64` rounding. This explicit boundary keeps the solver
+    /// auditable without a hidden wider-range reduction type.
     pub fn solve_least_squares_into(
         &self,
         b: &Matrix,
@@ -738,7 +746,7 @@ impl Matrix {
                 continue;
             }
 
-            *projection = if tall_orientation {
+            let projected_rhs = if tall_orientation {
                 // A*V=B=U*Sigma, so this coefficient is
                 // (U_component^T*b)/sigma. Normalizing B before the dot product
                 // prevents squaring a large or tiny singular value explicitly.
@@ -755,6 +763,15 @@ impl Matrix {
                 // the minimum-norm variable vector.
                 Self::normalized_column_dot(&workspace.right_vectors, component, 1.0, b, rhs_scale)
             };
+            if !projected_rhs.is_finite() {
+                // `product_ratio` relies on finite private operands. Reject an
+                // unrepresentable compensated projection here so debug and
+                // optimized builds share the same checked boundary.
+                return Err(MatrixError::NonFiniteResult {
+                    operation: "solve_least_squares",
+                });
+            }
+            *projection = projected_rhs;
         }
 
         // Measure the retained projection and complete right-hand-side norm in
@@ -804,43 +821,61 @@ impl Matrix {
             (fraction, slope)
         };
 
-        // Reconstruct each output coordinate through one exponent-aligned
-        // compensated sum. No singular coefficient or contribution is first
-        // materialized as `f64`; only the final caller-visible variable is
-        // checked for representability.
+        // Reconstruct each output coordinate from individually range-safe
+        // singular contributions. Each completed contribution is rounded to
+        // `f64`, checked, and accumulated in component order through ordinary
+        // Neumaier compensation. This intentionally does not rescue a partial
+        // overflow through a later cancelling singular direction.
         for row in 0..cols {
-            let mut reconstructed = ScaledSum::default();
+            let mut reconstructed = CompensatedSum::default();
             for (component, &projection) in workspace.projections.iter().enumerate() {
                 let singular_value = workspace.singular_values[component];
                 if singular_value <= rank_tolerance {
                     continue;
                 }
 
-                if tall_orientation {
+                let contribution = if tall_orientation {
                     // V maps the projected coordinate back to the original
                     // variable space. The normalized singular value and the
                     // global coefficient scale together restore A's units.
-                    reconstructed.add_product_ratio(
+                    product_ratio(
                         [
                             projection,
                             workspace.right_vectors[(row, component)],
                             rhs_scale,
                         ],
                         [singular_value, coefficient_scale],
-                    );
+                    )
                 } else {
                     // In the transposed orientation, the stored orthogonal
                     // column equals U*sigma. Dividing by sigma once recovers U,
                     // and dividing the projection by the original sigma adds a
                     // second normalized singular-value denominator.
-                    reconstructed.add_product_ratio(
+                    product_ratio(
                         [
                             projection,
                             workspace.orthogonal_columns[(row, component)],
                             rhs_scale,
                         ],
                         [singular_value, singular_value, coefficient_scale],
-                    );
+                    )
+                };
+                if !contribution.is_finite() {
+                    // An individually unrepresentable singular contribution is
+                    // outside the documented ordinary-f64 reduction contract.
+                    return Err(MatrixError::NonFiniteResult {
+                        operation: "solve_least_squares",
+                    });
+                }
+
+                reconstructed.add(contribution);
+                if !reconstructed.total().is_finite() {
+                    // Inspect the Copy accumulator after every component so a
+                    // partial overflow is rejected at the operation that caused
+                    // it instead of being hidden by a later cancellation.
+                    return Err(MatrixError::NonFiniteResult {
+                        operation: "solve_least_squares",
+                    });
                 }
             }
 
@@ -1999,10 +2034,10 @@ mod tests {
         assert!(relative_error < 1e-15, "relative error: {relative_error}");
     }
 
-    /// Preserve finite variables when cancellation occurs while multiple
-    /// singular directions are reconstructed rather than within one projection.
+    /// Reject reconstruction whose ordinary component-order partial total
+    /// exceeds `f64` before a later singular direction could cancel it.
     #[test]
-    fn test_solve_least_squares_scales_cancelling_singular_reconstruction() {
+    fn test_solve_least_squares_rejects_cancelling_singular_reconstruction_overflow() {
         let coefficients = Matrix::from_vec(
             vec![
                 -7.565e-309,
@@ -2022,23 +2057,17 @@ mod tests {
         let right_hand_side = Matrix::from_vec(vec![-1.3260, -1.6941, 2.1713], 3, 1)
             .expect("the right-hand-side fixture has three rows");
 
-        // Ordinary reconstruction adds two same-sign singular contributions
-        // beyond `f64::MAX` before a later direction cancels them. The complete
-        // analytical solution remains finite and close to these independently
-        // computed reference coordinates.
-        let result = solve_default(&coefficients, &right_hand_side);
-        let expected = [1.3761e308, -1.1849e308, 1.6909e308];
-
-        assert_eq!(result.info.rank, 3);
-        assert!(result.solution.all_finite());
-        for (row, expected_value) in expected.into_iter().enumerate() {
-            let relative_error = (result.solution[(row, 0)] / expected_value - 1.0).abs();
-            assert!(
-                relative_error < 5e-4,
-                "row {row}: expected {expected_value:e}, got {:e}",
-                result.solution[(row, 0)]
-            );
-        }
+        // Two same-sign singular contributions exceed `f64::MAX` before a later
+        // direction would cancel them. Although the analytical final vector is
+        // finite, supporting that cancellation requires a hidden wider-range
+        // accumulator, so the checked solver now returns its documented range
+        // failure instead.
+        assert_eq!(
+            solve_error(&coefficients, &right_hand_side),
+            MatrixError::NonFiniteResult {
+                operation: "solve_least_squares",
+            }
+        );
     }
 
     #[test]
