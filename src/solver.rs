@@ -1441,25 +1441,35 @@ impl NewtonRaphsonSolver {
             gradient,
         } = context;
 
-        // Multiplying J by the candidate direction produces the residual-space
-        // velocity used by the chain rule. Checked multiplication retains
-        // structured shape errors for the caller's run diagnostic.
-        let residual_velocity = jacobian.try_mul(direction).map_err(|source| {
-            self.matrix_error(
-                source,
+        // The direction is a single normalized-variable column and must span
+        // every Jacobian column. Validate the private invariant explicitly so a
+        // future caller receives structured state instead of an indexing panic.
+        if scaled_residuals.cols() != 1 || jacobian.rows() != scaled_residuals.rows() {
+            return Err(self.matrix_error(
+                MatrixError::DimensionMismatch {
+                    operation: "residual_norm_directional_derivative",
+                    left: (jacobian.rows(), jacobian.cols()),
+                    right: (scaled_residuals.rows(), scaled_residuals.cols()),
+                },
                 accepted_updates,
                 vars,
                 diagnostic_residuals,
                 gradient,
                 None,
-            )
-        })?;
-        if !residual_velocity.all_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Line-search directional derivative produced NaN or infinity",
+            ));
+        }
+        if direction.cols() != 1 || jacobian.cols() != direction.rows() {
+            return Err(self.matrix_error(
+                MatrixError::DimensionMismatch {
+                    operation: "residual_norm_directional_derivative",
+                    left: (jacobian.rows(), jacobian.cols()),
+                    right: (direction.rows(), direction.cols()),
+                },
                 accepted_updates,
                 vars,
                 diagnostic_residuals,
+                gradient,
+                None,
             ));
         }
 
@@ -1476,14 +1486,26 @@ impl NewtonRaphsonSolver {
             ));
         }
 
-        // Accumulate the normalized dot product through the common scaled
-        // reduction. Dividing each residual first defines the norm derivative,
-        // while exponent alignment keeps both products and partial sums from
-        // failing before a finite completed slope is known.
+        // Fuse J*p with the outer normalized-residual dot product. This keeps
+        // the directional derivative allocation-free and avoids materializing a
+        // residual-space vector that no later solver stage consumes.
         let mut slope = ScaledSum::default();
         for row in 0..scaled_residuals.rows() {
+            let mut velocity = ScaledSum::default();
+            for column in 0..jacobian.cols() {
+                velocity.add_product_ratio([jacobian[(row, column)], direction[(column, 0)]], []);
+            }
+            let velocity = velocity.total();
+            if !velocity.is_finite() {
+                return Err(self.non_finite_evaluation_error(
+                    "Line-search directional derivative produced NaN or infinity",
+                    accepted_updates,
+                    vars,
+                    diagnostic_residuals,
+                ));
+            }
             let normalized_residual = scaled_residuals[(row, 0)] / residual_norm;
-            slope.add_product_ratio([normalized_residual, residual_velocity[(row, 0)]], []);
+            slope.add_product_ratio([normalized_residual, velocity], []);
         }
 
         let residual_norm_derivative = slope.total();
@@ -1739,7 +1761,7 @@ mod tests {
 
     /// Single deterministic execution case used while numerical tests retain
     /// their shared case-oriented structure.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     enum Mode {
         /// The solver's only serial execution policy.
         Serial,

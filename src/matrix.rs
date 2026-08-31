@@ -25,23 +25,23 @@ SOFTWARE.
 //! Dense matrix operations with checked recoverable shapes and
 //! permutation-invariant Jacobi-SVD least-squares solving.
 //!
-//! General arithmetic follows ordinary IEEE-754 `f64` semantics and can
-//! therefore produce NaN or infinity. Its fallible methods report recoverable
-//! operand mismatches; impossible dimensions and allocation exhaustion are
-//! fatal and panic with the requested shape. Callers that require finite
-//! arithmetic results can verify them with [`Matrix::all_finite`]. The
-//! least-squares solver enforces a stricter contract and rejects non-finite
-//! inputs, factors, and results.
+//! Arithmetic writes into exact-shape caller-provided buffers, rejects
+//! non-finite operands, and returns an error when finite operands produce an
+//! unrepresentable `f64` result. Allocation is confined to constructors and
+//! explicit workspaces. The least-squares solver applies the same finite-state
+//! boundary to its inputs, factors, and completed result.
 
 use std::fmt;
-use std::ops::{Add, Index, IndexMut, Mul, Sub};
+use std::ops::{Index, IndexMut};
 
 use crate::scaled::{ScaledSum, ScaledValue};
 
 /// Identifies which matrix operand contained a non-finite value before a
-/// checked linear solve began.
+/// checked arithmetic or linear-solve operation began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixOperand {
+    /// Left-hand matrix supplied to elementwise or multiplicative arithmetic.
+    LeftHandSide,
     /// Coefficient matrix being factorized or applied by the operation.
     CoefficientMatrix,
     /// Right-hand-side matrix supplied to a linear solve.
@@ -52,6 +52,7 @@ impl fmt::Display for MatrixOperand {
     /// Render a stable human-readable operand name for structured error output.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            MatrixOperand::LeftHandSide => write!(f, "left-hand side"),
             MatrixOperand::CoefficientMatrix => write!(f, "coefficient matrix"),
             MatrixOperand::RightHandSide => write!(f, "right-hand side"),
         }
@@ -98,6 +99,15 @@ pub enum MatrixError {
         /// Shape of the secondary or right-hand matrix as `(rows, columns)`.
         right: (usize, usize),
     },
+    /// A caller-provided output buffer does not have the exact result shape.
+    OutputShapeMismatch {
+        /// Stable name of the operation that rejected the output buffer.
+        operation: &'static str,
+        /// Shape the operation requires as `(rows, columns)`.
+        expected: (usize, usize),
+        /// Actual output-buffer shape as `(rows, columns)`.
+        actual: (usize, usize),
+    },
     /// A flat data buffer does not contain exactly one element per requested
     /// matrix position.
     InvalidDataLength {
@@ -110,7 +120,7 @@ pub enum MatrixError {
         /// Actual number of supplied elements.
         actual: usize,
     },
-    /// A coefficient or right-hand-side input contained NaN or infinity before
+    /// A matrix input contained NaN or infinity before checked arithmetic or
     /// factorization began.
     NonFiniteInput {
         /// Stable name of the operation that validated the operand.
@@ -118,16 +128,20 @@ pub enum MatrixError {
         /// Operand in which the invalid value was observed.
         operand: MatrixOperand,
     },
+    /// A scalar arithmetic operand was NaN or infinity.
+    NonFiniteScalar {
+        /// Stable name of the operation that validated the scalar.
+        operation: &'static str,
+    },
     /// Factorization arithmetic produced or encountered a non-finite internal
     /// value.
     NonFiniteFactor {
         /// Stable name of the factorization or solve that detected the value.
         operation: &'static str,
     },
-    /// Finite inputs produced a non-finite solution through arithmetic overflow
-    /// or invalid intermediate cancellation.
+    /// Finite inputs produced a non-finite arithmetic or solve result.
     NonFiniteResult {
-        /// Stable name of the solve that produced the invalid solution.
+        /// Stable name of the operation that produced the invalid result.
         operation: &'static str,
     },
     /// An iterative factorization exhausted its bounded iteration budget before
@@ -173,6 +187,15 @@ impl fmt::Display for MatrixError {
                 "Matrix dimension mismatch for {}: left is {}x{}, right is {}x{}",
                 operation, left.0, left.1, right.0, right.1
             ),
+            MatrixError::OutputShapeMismatch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Output shape mismatch for {operation}: expected {}x{}, got {}x{}",
+                expected.0, expected.1, actual.0, actual.1
+            ),
             MatrixError::InvalidDataLength {
                 rows,
                 cols,
@@ -184,6 +207,9 @@ impl fmt::Display for MatrixError {
             ),
             MatrixError::NonFiniteInput { operation, operand } => {
                 write!(f, "Non-finite {operand} supplied to {operation}")
+            }
+            MatrixError::NonFiniteScalar { operation } => {
+                write!(f, "Non-finite scalar supplied to {operation}")
             }
             MatrixError::NonFiniteFactor { operation } => {
                 write!(f, "Non-finite factor encountered during {operation}")
@@ -346,31 +372,67 @@ impl Matrix {
         self.cols
     }
 
-    /// Return the transpose of this matrix.
+    /// Verify that a caller-owned output matrix has one required shape.
     ///
-    /// # Panics
+    /// Centralizing this check keeps every allocation-free operation consistent:
+    /// output buffers are never resized, replaced, or implicitly allocated.
+    fn require_output_shape(
+        output: &Matrix,
+        expected: (usize, usize),
+        operation: &'static str,
+    ) -> Result<(), MatrixError> {
+        // Shape metadata is sufficient because every constructor has already
+        // proved that its storage length matches its logical dimensions.
+        let actual = (output.rows, output.cols);
+        if actual != expected {
+            return Err(MatrixError::OutputShapeMismatch {
+                operation,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject a non-finite matrix operand before an arithmetic output is touched.
     ///
-    /// Panics when storage for a second matrix of the same element count cannot
-    /// be reserved.
-    #[track_caller]
-    pub fn transpose(&self) -> Matrix {
-        // The transposed shape reverses the logical dimensions while preserving
-        // the same total element count.
-        let mut result = Matrix::new(self.cols, self.rows);
-        if result.data.is_empty() {
+    /// The scaled product accumulator and solver factorization both assume
+    /// finite state. Enforcing that assumption at this public boundary removes
+    /// build-profile-dependent assertions and gives callers a retryable error.
+    fn require_finite_input(
+        input: &Matrix,
+        operation: &'static str,
+        operand: MatrixOperand,
+    ) -> Result<(), MatrixError> {
+        // A complete scan before the first write preserves the output buffer for
+        // operand errors; only an arithmetic result error can leave scratch data.
+        if !input.all_finite() {
+            return Err(MatrixError::NonFiniteInput { operation, operand });
+        }
+        Ok(())
+    }
+
+    /// Copy this matrix's transpose into an exact-shape caller-owned buffer.
+    ///
+    /// This operation performs no allocation and preserves every stored `f64`
+    /// bit pattern, including NaN and infinity, because transposition performs
+    /// no arithmetic. `output` must have shape `self.cols() x self.rows()`.
+    pub fn transpose_into(&self, output: &mut Matrix) -> Result<(), MatrixError> {
+        Self::require_output_shape(output, (self.cols, self.rows), "transpose")?;
+        if output.data.is_empty() {
             // A valid shape such as `usize::MAX x 0` has no coordinates to
             // copy. Returning from storage cardinality avoids walking the huge
             // logical row dimension even though the operation is already
             // complete.
-            return result;
+            return Ok(());
         }
 
         for i in 0..self.rows {
             for j in 0..self.cols {
-                result[(j, i)] = self[(i, j)];
+                output[(j, i)] = self[(i, j)];
             }
         }
-        result
+        Ok(())
     }
 
     /// Solve a possibly rectangular least-squares problem by canonical SVD.
@@ -926,20 +988,15 @@ impl Matrix {
         self.data.iter().all(|value| value.is_finite())
     }
 
-    /// Add two identically shaped matrices element by element.
+    /// Add two matrices into an exact-shape caller-owned output buffer.
     ///
-    /// This method reports operand-shape mismatches. Element arithmetic follows
-    /// ordinary IEEE-754 `f64` semantics, so overflow or invalid operands can
-    /// produce a non-finite value in the returned matrix; use
-    /// [`Matrix::all_finite`] when finite output is required.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the result shape when its storage cannot be allocated.
-    #[track_caller]
-    pub fn try_add(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
+    /// The operation allocates nothing. Both inputs must have identical shapes
+    /// and finite elements, and `output` must have that same shape. A
+    /// `NonFiniteResult` error can leave `output` partially overwritten, so
+    /// callers should treat it as scratch until the method returns `Ok(())`.
+    pub fn add_into(&self, rhs: &Matrix, output: &mut Matrix) -> Result<(), MatrixError> {
         // Elementwise arithmetic has no meaningful broadcasting in this dense
-        // API, so require both dimensions to match exactly.
+        // API, so validate both input dimensions before inspecting the output.
         if self.rows != rhs.rows || self.cols != rhs.cols {
             return Err(MatrixError::DimensionMismatch {
                 operation: "add",
@@ -947,30 +1004,28 @@ impl Matrix {
                 right: (rhs.rows, rhs.cols),
             });
         }
+        Self::require_output_shape(output, (self.rows, self.cols), "add")?;
+        Self::require_finite_input(self, "add", MatrixOperand::LeftHandSide)?;
+        Self::require_finite_input(rhs, "add", MatrixOperand::RightHandSide)?;
 
-        // Allocate the known result shape after recoverable validation. Fatal
-        // resource failures identify this caller and shape through `new`.
-        let mut result = Matrix::new(self.rows, self.cols);
         for i in 0..self.data.len() {
-            result.data[i] = self.data[i] + rhs.data[i];
+            let value = self.data[i] + rhs.data[i];
+            if !value.is_finite() {
+                return Err(MatrixError::NonFiniteResult { operation: "add" });
+            }
+            output.data[i] = value;
         }
-        Ok(result)
+        Ok(())
     }
 
-    /// Subtract an identically shaped right-hand matrix element by element.
+    /// Subtract two matrices into an exact-shape caller-owned output buffer.
     ///
-    /// This method reports operand-shape mismatches. Element arithmetic follows
-    /// ordinary IEEE-754 `f64` semantics, so overflow or invalid operands can
-    /// produce a non-finite value in the returned matrix; use
-    /// [`Matrix::all_finite`] when finite output is required.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the result shape when its storage cannot be allocated.
-    #[track_caller]
-    pub fn try_sub(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
-        // Preserve the same strict shape contract as addition before allocating
-        // the result buffer.
+    /// The operation allocates nothing and applies the same finite-input,
+    /// finite-result, exact-shape, and scratch-on-result-error contract as
+    /// [`Matrix::add_into`].
+    pub fn sub_into(&self, rhs: &Matrix, output: &mut Matrix) -> Result<(), MatrixError> {
+        // Preserve the same strict shape contract as addition before inspecting
+        // the caller-owned output or modifying its storage.
         if self.rows != rhs.rows || self.cols != rhs.cols {
             return Err(MatrixError::DimensionMismatch {
                 operation: "sub",
@@ -978,28 +1033,28 @@ impl Matrix {
                 right: (rhs.rows, rhs.cols),
             });
         }
+        Self::require_output_shape(output, (self.rows, self.cols), "sub")?;
+        Self::require_finite_input(self, "sub", MatrixOperand::LeftHandSide)?;
+        Self::require_finite_input(rhs, "sub", MatrixOperand::RightHandSide)?;
 
-        // Allocate only after shape validation. Resource exhaustion is fatal and
-        // reports this result shape rather than masquerading as operand misuse.
-        let mut result = Matrix::new(self.rows, self.cols);
         for i in 0..self.data.len() {
-            result.data[i] = self.data[i] - rhs.data[i];
+            let value = self.data[i] - rhs.data[i];
+            if !value.is_finite() {
+                return Err(MatrixError::NonFiniteResult { operation: "sub" });
+            }
+            output.data[i] = value;
         }
-        Ok(result)
+        Ok(())
     }
 
-    /// Multiply two shape-compatible matrices in deterministic row-major order.
+    /// Multiply two matrices into an exact-shape caller-owned output buffer.
     ///
-    /// This method reports operand-shape mismatches. Each output cell uses the
-    /// crate's scaled compensated product sum and is converted to `f64` only
-    /// after its reduction; an unrepresentable completed cell remains infinite.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the result shape when its dimensions or storage cannot be
-    /// represented.
-    #[track_caller]
-    pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
+    /// The operation allocates nothing. Inputs must be finite and shape
+    /// compatible; `output` must have shape `self.rows() x rhs.cols()`. Each
+    /// completed dot product is checked before it is stored. A
+    /// `NonFiniteResult` error can leave earlier cells overwritten, so callers
+    /// should treat `output` as scratch until the method returns `Ok(())`.
+    pub fn mul_into(&self, rhs: &Matrix, output: &mut Matrix) -> Result<(), MatrixError> {
         // The shared dimension must match before any row slice is constructed.
         if self.cols != rhs.rows {
             return Err(MatrixError::DimensionMismatch {
@@ -1008,18 +1063,15 @@ impl Matrix {
                 right: (rhs.rows, rhs.cols),
             });
         }
+        Self::require_output_shape(output, (self.rows, rhs.cols), "mul")?;
+        Self::require_finite_input(self, "mul", MatrixOperand::LeftHandSide)?;
+        Self::require_finite_input(rhs, "mul", MatrixOperand::RightHandSide)?;
 
-        // The output combines dimensions from two independently valid inputs.
-        // Zero-sized storage permits shapes such as `usize::MAX x 0`, so input
-        // construction alone cannot prove that `self.rows * rhs.cols` fits.
-        // Constructing the derived output validates element-count arithmetic and
-        // reports impossible storage as a fatal panic with the output shape.
-        let mut result = Matrix::new(self.rows, rhs.cols);
-        if result.data.is_empty() {
+        if output.data.is_empty() {
             // No output cell exists when either output dimension is zero. In
             // particular, a valid `usize::MAX x 0` result must not execute an
             // effectively unbounded outer-row loop whose body can never write.
-            return Ok(result);
+            return Ok(());
         }
         for i in 0..self.rows {
             for j in 0..rhs.cols {
@@ -1030,10 +1082,36 @@ impl Matrix {
                 for k in 0..self.cols {
                     dot.add_product_ratio([self[(i, k)], rhs[(k, j)]], []);
                 }
-                result[(i, j)] = dot.total();
+                let value = dot.total();
+                if !value.is_finite() {
+                    return Err(MatrixError::NonFiniteResult { operation: "mul" });
+                }
+                output[(i, j)] = value;
             }
         }
-        Ok(result)
+        Ok(())
+    }
+
+    /// Multiply every element by a scalar into an exact-shape output buffer.
+    ///
+    /// The matrix, scalar, and completed products must be finite. The operation
+    /// allocates nothing; `output` must match `self` and is scratch after a
+    /// `NonFiniteResult` error.
+    pub fn scale_into(&self, scalar: f64, output: &mut Matrix) -> Result<(), MatrixError> {
+        Self::require_output_shape(output, (self.rows, self.cols), "scale")?;
+        Self::require_finite_input(self, "scale", MatrixOperand::LeftHandSide)?;
+        if !scalar.is_finite() {
+            return Err(MatrixError::NonFiniteScalar { operation: "scale" });
+        }
+
+        for i in 0..self.data.len() {
+            let value = self.data[i] * scalar;
+            if !value.is_finite() {
+                return Err(MatrixError::NonFiniteResult { operation: "scale" });
+            }
+            output.data[i] = value;
+        }
+        Ok(())
     }
 }
 
@@ -1056,66 +1134,6 @@ impl IndexMut<(usize, usize)> for Matrix {
         // guarantees a failed coordinate cannot modify an aliased valid cell.
         let offset = self.offset(row, col);
         &mut self.data[offset]
-    }
-}
-
-impl Add for &Matrix {
-    type Output = Matrix;
-
-    /// Add through [`Matrix::try_add`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a shape mismatch or fatal result allocation failure.
-    #[track_caller]
-    fn add(self, rhs: Self) -> Self::Output {
-        self.try_add(rhs).unwrap_or_else(|err| panic!("{}", err))
-    }
-}
-
-impl Sub for &Matrix {
-    type Output = Matrix;
-
-    /// Subtract through [`Matrix::try_sub`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a shape mismatch or fatal result allocation failure.
-    #[track_caller]
-    fn sub(self, rhs: Self) -> Self::Output {
-        self.try_sub(rhs).unwrap_or_else(|err| panic!("{}", err))
-    }
-}
-
-impl Mul for &Matrix {
-    type Output = Matrix;
-
-    /// Multiply through [`Matrix::try_mul`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a shape mismatch or fatal result allocation failure.
-    #[track_caller]
-    fn mul(self, rhs: Self) -> Self::Output {
-        self.try_mul(rhs).unwrap_or_else(|err| panic!("{}", err))
-    }
-}
-
-impl Mul<f64> for &Matrix {
-    type Output = Matrix;
-
-    /// Multiply every stored element by one scalar.
-    ///
-    /// # Panics
-    ///
-    /// Panics if cloning storage for the result cannot be completed.
-    #[track_caller]
-    fn mul(self, scalar: f64) -> Self::Output {
-        let mut result = self.clone();
-        for val in &mut result.data {
-            *val *= scalar;
-        }
-        result
     }
 }
 
@@ -1296,7 +1314,10 @@ mod tests {
         m[(1, 1)] = 5.0;
         m[(1, 2)] = 6.0;
 
-        let transposed = m.transpose();
+        let mut transposed = Matrix::new(3, 2);
+        let allocation = transposed.data.as_ptr();
+        m.transpose_into(&mut transposed).unwrap();
+        assert_eq!(transposed.data.as_ptr(), allocation);
         assert_eq!(transposed.rows(), 3);
         assert_eq!(transposed.cols(), 2);
         assert_eq!(transposed[(0, 0)], 1.0);
@@ -1314,13 +1335,15 @@ mod tests {
         let empty_right =
             Matrix::from_vec(Vec::new(), 0, 0).expect("a zero-by-zero matrix is valid");
 
-        let transposed = huge_empty.transpose();
+        let mut transposed = Matrix::from_vec(Vec::new(), 0, usize::MAX).unwrap();
+        huge_empty.transpose_into(&mut transposed).unwrap();
         assert_eq!(transposed.rows(), 0);
         assert_eq!(transposed.cols(), usize::MAX);
         assert_eq!(transposed.norm(), 0.0);
 
-        let product = huge_empty
-            .try_mul(&empty_right)
+        let mut product = Matrix::from_vec(Vec::new(), usize::MAX, 0).unwrap();
+        huge_empty
+            .mul_into(&empty_right, &mut product)
             .expect("a product with zero output columns is already complete");
         assert_eq!(product.rows(), usize::MAX);
         assert_eq!(product.cols(), 0);
@@ -1345,7 +1368,10 @@ mod tests {
         b[(2, 0)] = 11.0;
         b[(2, 1)] = 12.0;
 
-        let product = a.try_mul(&b).unwrap();
+        let mut product = Matrix::new(2, 2);
+        let allocation = product.data.as_ptr();
+        a.mul_into(&b, &mut product).unwrap();
+        assert_eq!(product.data.as_ptr(), allocation);
         assert_eq!(product.rows(), 2);
         assert_eq!(product.cols(), 2);
         assert_eq!(product[(0, 0)], 58.0);
@@ -1355,11 +1381,14 @@ mod tests {
     }
 
     #[test]
-    fn test_try_add_dimension_mismatch() {
+    fn test_add_into_dimension_mismatch() {
         let a = Matrix::new(2, 2);
         let b = Matrix::new(2, 3);
+        let mut output = Matrix::new(2, 2);
 
-        let err = a.try_add(&b).expect_err("expected dimension mismatch");
+        let err = a
+            .add_into(&b, &mut output)
+            .expect_err("expected dimension mismatch");
         assert_eq!(
             err,
             MatrixError::DimensionMismatch {
@@ -1371,11 +1400,14 @@ mod tests {
     }
 
     #[test]
-    fn test_try_sub_dimension_mismatch() {
+    fn test_sub_into_dimension_mismatch() {
         let a = Matrix::new(3, 2);
         let b = Matrix::new(2, 2);
+        let mut output = Matrix::new(3, 2);
 
-        let err = a.try_sub(&b).expect_err("expected dimension mismatch");
+        let err = a
+            .sub_into(&b, &mut output)
+            .expect_err("expected dimension mismatch");
         assert_eq!(
             err,
             MatrixError::DimensionMismatch {
@@ -1389,44 +1421,45 @@ mod tests {
     /// Exercise successful explicit elementwise arithmetic instead of covering
     /// only the recoverable shape-error branches.
     #[test]
-    fn test_try_add_and_subtract_matching_matrices() {
+    fn test_add_subtract_and_scale_into_reuse_output_storage() {
         let left = Matrix::from_vec(vec![1.0, -2.0, 3.5, 4.0], 2, 2)
             .expect("left fixture has four elements");
         let right = Matrix::from_vec(vec![0.5, 2.0, -1.5, 6.0], 2, 2)
             .expect("right fixture has four elements");
 
-        let sum = left.try_add(&right).expect("matching shapes must add");
-        let difference = left.try_sub(&right).expect("matching shapes must subtract");
+        let mut output = Matrix::new(2, 2);
+        let allocation = output.data.as_ptr();
+        left.add_into(&right, &mut output)
+            .expect("matching shapes must add");
 
         assert_eq!(
-            sum,
+            output,
             Matrix::from_vec(vec![1.5, 0.0, 2.0, 10.0], 2, 2).unwrap()
         );
+        left.sub_into(&right, &mut output)
+            .expect("matching shapes must subtract");
         assert_eq!(
-            difference,
+            output,
             Matrix::from_vec(vec![0.5, -4.0, 5.0, -2.0], 2, 2).unwrap()
         );
-    }
-
-    /// Keep the convenience operator's fatal shape diagnostic visible rather
-    /// than allowing an opaque unwrap panic to replace the matrix context.
-    #[test]
-    #[should_panic(expected = "Matrix dimension mismatch for add: left is 1x2, right is 2x1")]
-    fn test_add_operator_panic_explains_shape_mismatch() {
-        let left = Matrix::new(1, 2);
-        let right = Matrix::new(2, 1);
-
-        // Operator syntax is intentionally infallible; callers that need to
-        // recover from shape mismatch use `try_add` instead.
-        let _ = &left + &right;
+        left.scale_into(2.0, &mut output)
+            .expect("finite products must be written");
+        assert_eq!(
+            output,
+            Matrix::from_vec(vec![2.0, -4.0, 7.0, 8.0], 2, 2).unwrap()
+        );
+        assert_eq!(output.data.as_ptr(), allocation);
     }
 
     #[test]
-    fn test_try_mul_dimension_mismatch() {
+    fn test_mul_into_dimension_mismatch() {
         let a = Matrix::new(2, 3);
         let b = Matrix::new(2, 2);
+        let mut output = Matrix::new(2, 2);
 
-        let error = a.try_mul(&b).expect_err("expected dimension mismatch");
+        let error = a
+            .mul_into(&b, &mut output)
+            .expect_err("expected dimension mismatch");
         assert_eq!(
             error,
             MatrixError::DimensionMismatch {
@@ -1435,6 +1468,146 @@ mod tests {
                 right: (2, 2),
             }
         );
+    }
+
+    /// Reject every invalid public arithmetic buffer shape before performing a
+    /// write, including the independently derived multiplication and transpose
+    /// shapes.
+    #[test]
+    fn test_into_operations_reject_output_shape_mismatches_without_writing() {
+        let left = Matrix::new(2, 2);
+        let right = Matrix::new(2, 2);
+        let mut wrong = Matrix::from_vec(vec![7.0, 7.0], 2, 1).unwrap();
+
+        for (operation, error) in [
+            ("add", left.add_into(&right, &mut wrong).unwrap_err()),
+            ("sub", left.sub_into(&right, &mut wrong).unwrap_err()),
+            ("mul", left.mul_into(&right, &mut wrong).unwrap_err()),
+            ("scale", left.scale_into(2.0, &mut wrong).unwrap_err()),
+            ("transpose", left.transpose_into(&mut wrong).unwrap_err()),
+        ] {
+            assert_eq!(
+                error,
+                MatrixError::OutputShapeMismatch {
+                    operation,
+                    expected: (2, 2),
+                    actual: (2, 1),
+                }
+            );
+            assert_eq!(wrong, Matrix::from_vec(vec![7.0, 7.0], 2, 1).unwrap());
+        }
+    }
+
+    /// Establish one profile-independent finite boundary for matrix arithmetic.
+    /// These are the special values that previously reached `ScaledSum` and
+    /// changed multiplication behavior between debug and release builds.
+    #[test]
+    fn test_arithmetic_rejects_non_finite_operands_before_writing_output() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let invalid_matrix = Matrix::from_vec(vec![invalid], 1, 1).unwrap();
+            let finite_matrix = Matrix::from_vec(vec![1.0], 1, 1).unwrap();
+            let zero_matrix = Matrix::from_vec(vec![0.0], 1, 1).unwrap();
+            let mut output = Matrix::from_vec(vec![42.0], 1, 1).unwrap();
+
+            assert_eq!(
+                invalid_matrix
+                    .mul_into(&zero_matrix, &mut output)
+                    .unwrap_err(),
+                MatrixError::NonFiniteInput {
+                    operation: "mul",
+                    operand: MatrixOperand::LeftHandSide,
+                }
+            );
+            assert_eq!(output[(0, 0)], 42.0);
+
+            assert_eq!(
+                finite_matrix
+                    .mul_into(&invalid_matrix, &mut output)
+                    .unwrap_err(),
+                MatrixError::NonFiniteInput {
+                    operation: "mul",
+                    operand: MatrixOperand::RightHandSide,
+                }
+            );
+            assert_eq!(output[(0, 0)], 42.0);
+
+            assert_eq!(
+                invalid_matrix
+                    .add_into(&finite_matrix, &mut output)
+                    .unwrap_err(),
+                MatrixError::NonFiniteInput {
+                    operation: "add",
+                    operand: MatrixOperand::LeftHandSide,
+                }
+            );
+            assert_eq!(output[(0, 0)], 42.0);
+
+            assert_eq!(
+                finite_matrix
+                    .sub_into(&invalid_matrix, &mut output)
+                    .unwrap_err(),
+                MatrixError::NonFiniteInput {
+                    operation: "sub",
+                    operand: MatrixOperand::RightHandSide,
+                }
+            );
+            assert_eq!(output[(0, 0)], 42.0);
+
+            assert_eq!(
+                invalid_matrix.scale_into(1.0, &mut output).unwrap_err(),
+                MatrixError::NonFiniteInput {
+                    operation: "scale",
+                    operand: MatrixOperand::LeftHandSide,
+                }
+            );
+            assert_eq!(output[(0, 0)], 42.0);
+        }
+    }
+
+    /// Distinguish invalid inputs from finite arithmetic whose completed `f64`
+    /// result lies outside the representable range.
+    #[test]
+    fn test_arithmetic_reports_non_finite_completed_results() {
+        let maximum = Matrix::from_vec(vec![f64::MAX], 1, 1).unwrap();
+        let negative_maximum = Matrix::from_vec(vec![-f64::MAX], 1, 1).unwrap();
+        let two = Matrix::from_vec(vec![2.0], 1, 1).unwrap();
+        let mut output = Matrix::new(1, 1);
+
+        assert_eq!(
+            maximum.add_into(&maximum, &mut output).unwrap_err(),
+            MatrixError::NonFiniteResult { operation: "add" }
+        );
+        assert_eq!(
+            maximum
+                .sub_into(&negative_maximum, &mut output)
+                .unwrap_err(),
+            MatrixError::NonFiniteResult { operation: "sub" }
+        );
+        assert_eq!(
+            maximum.mul_into(&two, &mut output).unwrap_err(),
+            MatrixError::NonFiniteResult { operation: "mul" }
+        );
+        assert_eq!(
+            maximum.scale_into(2.0, &mut output).unwrap_err(),
+            MatrixError::NonFiniteResult { operation: "scale" }
+        );
+        assert_eq!(
+            maximum.scale_into(f64::NAN, &mut output).unwrap_err(),
+            MatrixError::NonFiniteScalar { operation: "scale" }
+        );
+    }
+
+    /// Transposition is a bitwise data movement operation rather than
+    /// arithmetic, so it deliberately preserves non-finite diagnostic values.
+    #[test]
+    fn test_transpose_into_preserves_ieee_special_values() {
+        let input = Matrix::from_vec(vec![f64::NAN, f64::INFINITY], 1, 2).unwrap();
+        let mut output = Matrix::new(2, 1);
+
+        input.transpose_into(&mut output).unwrap();
+
+        assert!(output[(0, 0)].is_nan());
+        assert_eq!(output[(1, 0)], f64::INFINITY);
     }
 
     /// Preserve a finite least-squares solution when same-sign projection terms
@@ -1651,7 +1824,8 @@ mod tests {
             }
             let x_true = vec![rng.next_f64(), rng.next_f64(), rng.next_f64()];
             let x_mat = Matrix::from_vec(x_true.clone(), 3, 1).unwrap();
-            let b = &a * &x_mat;
+            let mut b = Matrix::new(6, 1);
+            a.mul_into(&x_mat, &mut b).unwrap();
 
             let result = solve_default(&a, &b);
             assert_eq!(result.info.rank, 3);
@@ -1844,7 +2018,10 @@ mod tests {
         assert!((result.solution[(0, 0)] - 1.0).abs() < 1e-12);
         assert!((result.solution[(1, 0)] - 1.0).abs() < 1e-12);
         assert_eq!(result.info.rank, 1);
-        let residual = &(&a * &result.solution) - &b;
+        let mut reconstructed = Matrix::new(3, 1);
+        let mut residual = Matrix::new(3, 1);
+        a.mul_into(&result.solution, &mut reconstructed).unwrap();
+        reconstructed.sub_into(&b, &mut residual).unwrap();
         assert!((residual.norm() - 2.0_f64.sqrt()).abs() < 1e-12);
     }
 
@@ -1863,8 +2040,11 @@ mod tests {
         assert!(result.solution[(1, 0)].abs() < 1e-12);
         assert!((result.solution[(2, 0)] - 0.5).abs() < 1e-12);
         assert_eq!(result.info.rank, 1);
-        let reconstructed = &a * &result.solution;
-        assert!((&reconstructed - &b).norm() < 1e-12);
+        let mut reconstructed = Matrix::new(2, 1);
+        let mut residual = Matrix::new(2, 1);
+        a.mul_into(&result.solution, &mut reconstructed).unwrap();
+        reconstructed.sub_into(&b, &mut residual).unwrap();
+        assert!(residual.norm() < 1e-12);
     }
 
     /// Solve the exact rank-deficient Jacobian produced by the graphical

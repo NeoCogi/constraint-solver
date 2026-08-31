@@ -311,13 +311,13 @@ the harness on the target machine when making performance decisions.
   independent of variable ordering. Rank uses the scale-relative threshold
   `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
   level cutoff.
-- General `Matrix::try_*` arithmetic returns recoverable operand-shape errors.
-  Impossible dimensions and allocation exhaustion are fatal: allocating APIs
-  panic with the requested matrix shape, and `RUST_BACKTRACE=1` identifies the
-  calling path. Elementwise addition and subtraction retain ordinary IEEE-754
-  behavior; matrix products use scaled compensated reductions. Call
-  `Matrix::all_finite()` where finite output is required. Factorization and
-  solver boundaries perform stricter non-finite validation.
+- Matrix arithmetic uses `add_into`, `sub_into`, `mul_into`, and `scale_into`
+  with exact-shape caller-owned output buffers. Construct buffers once and
+  reuse them; these operations never resize or allocate. Arithmetic rejects NaN
+  and infinity before writing, and reports a non-finite completed result such as
+  overflow. `transpose_into` is a bitwise copy and therefore preserves special
+  values. Constructors remain the explicit allocation boundary and panic when
+  a requested shape or allocation is impossible.
 - Regularization uses the augmented ridge system
   `[J; sqrt(lambda) I] * delta ~= [-f; 0]`. Its policy is explicit and defaults
   to zero: zero solves the original Jacobian once, while a positive value solves

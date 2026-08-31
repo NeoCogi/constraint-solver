@@ -12,6 +12,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry points. Solver arithmetic now has one serial traversal order, Rayon is
   no longer a default dependency, and independent solves remain safe to run on
   separate application threads.
+- Replaced allocating matrix arithmetic and infallible operator traits with
+  checked `*_into` operations over caller-owned buffers. Arithmetic now rejects
+  non-finite operands consistently in debug and release builds and reports
+  unrepresentable completed results without hiding errors behind operator
+  panics.
 
 ## [0.3.0] - 2026-08-30
 

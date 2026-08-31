@@ -48,10 +48,10 @@ fn bench_matmul(c: &mut Criterion) {
         let mut rng = LcgRng::new(123 + size as u64);
         let a = random_matrix(size, size, &mut rng);
         let b = random_matrix(size, size, &mut rng);
+        let mut result = Matrix::new(size, size);
         group.bench_with_input(BenchmarkId::new("square", size), &size, |bench, _| {
             bench.iter(|| {
-                let result = a.try_mul(black_box(&b)).unwrap();
-                black_box(result)
+                a.mul_into(black_box(&b), black_box(&mut result)).unwrap();
             })
         });
     }
@@ -61,11 +61,11 @@ fn bench_matmul(c: &mut Criterion) {
         let mut rng = LcgRng::new(0x51_1a_7e + inner as u64);
         let a = random_matrix(rows, inner, &mut rng);
         let b = random_matrix(inner, cols, &mut rng);
+        let mut result = Matrix::new(rows, cols);
         let shape = format!("{rows}x{inner}x{cols}");
         group.bench_with_input(BenchmarkId::new("skinny", &shape), &shape, |bench, _| {
             bench.iter(|| {
-                let result = a.try_mul(black_box(&b)).unwrap();
-                black_box(result)
+                a.mul_into(black_box(&b), black_box(&mut result)).unwrap();
             })
         });
     }
@@ -77,10 +77,10 @@ fn bench_transpose(c: &mut Criterion) {
     for &size in DENSE_SIZES {
         let mut rng = LcgRng::new(456 + size as u64);
         let a = random_matrix(size, size, &mut rng);
+        let mut result = Matrix::new(size, size);
         group.bench_with_input(BenchmarkId::new("square", size), &size, |bench, _| {
             bench.iter(|| {
-                let result = a.transpose();
-                black_box(result)
+                a.transpose_into(black_box(&mut result)).unwrap();
             })
         });
     }
