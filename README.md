@@ -320,14 +320,20 @@ the harness on the target machine when making performance decisions.
 - Underdetermined systems use the Moore-Penrose minimum-norm Newton correction,
   preserving the current Jacobian-null-space component for continuity.
 - Least squares solving uses one one-sided Jacobi SVD pseudoinverse for every
-  matrix shape and rank. This avoids normal equations and makes numerical rank
-  independent of variable ordering. Rank uses the scale-relative threshold
+  matrix shape and rank. This avoids normal equations and the former
+  order-sensitive QR pre-classification. Rank uses the scale-relative threshold
   `f64::EPSILON * max(rows, columns)` rather than a caller-provided application-
-  level cutoff. Each singular solution contribution forms its products and
-  quotients through binary-exponent scaling, then rounds to `f64` before an
-  ordinary compensated component-order sum. A non-finite contribution or
-  partial total is a structured error even if a later component could cancel
-  it; no hidden wider-range accumulator is used.
+  level cutoff. Column permutations have the same mathematical singular
+  spectrum, while uniform unit changes multiply that spectrum by one common
+  factor; practical fixtures away from the cutoff retain the same directions. A
+  singular value near the cutoff can still cross it because of ordinary input
+  rounding or Jacobi traversal order, so the reported numerical rank is a
+  diagnostic rather than an exact algebraic proof.
+  Each singular solution contribution forms its products and quotients through
+  binary-exponent scaling, then rounds to `f64` before an ordinary compensated
+  component-order sum. A non-finite contribution or partial total is a
+  structured error even if a later component could cancel it; no hidden
+  wider-range accumulator is used.
 - Matrix arithmetic uses `add_into`, `sub_into`, `mul_into`, and `scale_into`
   with exact-shape caller-owned output buffers. Construct buffers once and
   reuse them; these operations never resize or allocate. Arithmetic rejects NaN

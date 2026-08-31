@@ -146,11 +146,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stationarity, Armijo acceptance, rank and condition diagnostics, the
   linearized correction, and failure diagnostics, which retain both raw and
   scaled per-equation residuals.
-- Made rank classification and Moore-Penrose solutions invariant under column
-  permutation by removing the unpivoted QR pre-classification path. Uniform
-  coefficient normalization also prevents finite extreme-scale systems from
-  overflowing during factorization, including cases whose unscaled largest
-  singular value exceeds `f64::MAX` while the final solution remains finite.
+- Removed the unpivoted QR pre-classification that made the former dispatcher
+  strongly column-order-sensitive. Rank and correction now come from the same
+  Jacobi SVD, with ordinary floating-point sensitivity when a singular value is
+  near the cutoff. Uniform coefficient normalization also prevents finite
+  extreme-scale systems from overflowing during factorization, including cases
+  whose unscaled largest singular value exceeds `f64::MAX` while the final
+  solution remains finite.
 - Deflated roundoff-sized Jacobi columns at the same numerical-rank boundary
   used by the pseudoinverse, preventing exact rank-deficient systems such as the
   graphical IK startup pose from cycling until factorization exhaustion.

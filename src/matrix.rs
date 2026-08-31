@@ -22,8 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-//! Dense matrix operations with checked recoverable shapes and
-//! permutation-invariant Jacobi-SVD least-squares solving.
+//! Dense matrix operations with checked recoverable shapes and one Jacobi-SVD
+//! least-squares path for square, tall, and wide systems.
 //!
 //! Arithmetic writes into exact-shape caller-provided buffers, rejects
 //! non-finite operands, and returns an error when finite operands produce an
@@ -66,8 +66,9 @@ impl fmt::Display for MatrixOperand {
 /// comparisons use strict inequality. Non-finite factors are rejected by the
 /// factorization before this helper's result is consumed.
 fn numerical_rank_tolerance(max_factor_value: f64, relative_tolerance: f64) -> f64 {
-    // Multiplication, rather than `max_factor_value.max(1.0)`, preserves rank
-    // under uniform scaling of the input matrix.
+    // Multiplication, rather than `max_factor_value.max(1.0)`, keeps the cutoff
+    // proportional to the computed spectrum instead of injecting a fixed
+    // application-unit floor.
     relative_tolerance * max_factor_value
 }
 
@@ -77,8 +78,7 @@ fn numerical_rank_tolerance(max_factor_value: f64, relative_tolerance: f64) -> f
 /// Multiplying machine epsilon by the larger dimension accounts for roundoff
 /// accumulated across one factorization dimension without imposing a fixed
 /// application-scale cutoff. The resulting threshold is then multiplied by the
-/// factor scale through [`numerical_rank_tolerance`], preserving uniform-scale
-/// invariance.
+/// computed factor scale through [`numerical_rank_tolerance`].
 fn numerical_rank_relative_tolerance(rows: usize, cols: usize) -> f64 {
     f64::EPSILON * rows.max(cols) as f64
 }
@@ -168,6 +168,10 @@ pub enum MatrixError {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LeastSquaresInfo {
     /// Numerical rank using a threshold relative to the largest singular value.
+    ///
+    /// This is a floating-point classification, not an exact algebraic rank
+    /// proof. A singular value close to the cutoff can cross it after ordinary
+    /// input rounding or a different Jacobi column traversal.
     pub rank: usize,
     /// Ratio of the largest to smallest retained singular value. Infinity means
     /// the matrix has no retained non-zero singular subspace.
@@ -518,11 +522,13 @@ impl Matrix {
     /// Solve a rectangular least-squares problem into reusable caller storage.
     ///
     /// A one-sided Jacobi decomposition classifies numerical rank from singular
-    /// values and computes the Moore-Penrose minimum-norm solution for square,
-    /// tall, and wide systems. Using the same decomposition for classification
-    /// and solution makes rank invariant under column permutation and avoids a
-    /// competing factorization policy whose intermediate arithmetic could fail
-    /// on otherwise representable systems.
+    /// values and computes the truncated Moore-Penrose minimum-norm solution for
+    /// square, tall, and wide systems. Using the same decomposition for both
+    /// decisions removes the former order-sensitive QR pre-classification and
+    /// avoids a competing factorization path. Column permutations have the same
+    /// mathematical singular spectrum, but finite Jacobi sweeps can round
+    /// differently; rank is not guaranteed identical when a singular value lies
+    /// near the numerical cutoff.
     ///
     /// The coefficient matrix, right-hand side, solution, and workspace must
     /// respectively have shapes `m x n`, `m x 1`, `n x 1`, and a workspace
@@ -653,10 +659,12 @@ impl Matrix {
         // Normalize the complete coefficient matrix before factorization. A
         // matrix can contain only finite entries while its largest singular
         // value exceeds `f64::MAX` (for example, a 2x2 matrix filled with
-        // `1e308`). Uniform normalization preserves singular vectors, relative
-        // rank, condition, and the exact least-squares problem while keeping
-        // every factorization norm representable. The all-zero matrix uses a
-        // neutral scale because it has no non-zero direction to normalize.
+        // `1e308`). In exact arithmetic, uniform normalization preserves
+        // singular vectors, relative rank, condition, and—after restoring this
+        // scale during reconstruction—the least-squares problem. Division and
+        // Jacobi sweeps still round in `f64`, so a singular value near the rank
+        // cutoff can change classification. The all-zero matrix uses a neutral
+        // scale because it has no non-zero direction to normalize.
         let coefficient_scale = a
             .data
             .iter()
@@ -708,8 +716,9 @@ impl Matrix {
             relative_rank_tolerance,
         )?;
 
-        // A relative threshold preserves the numerical rank under uniform unit
-        // changes. The strict comparison deliberately classifies an all-zero
+        // A relative threshold keeps the cutoff tied to the computed spectrum
+        // under uniform unit changes instead of imposing an application-scale
+        // floor. The strict comparison deliberately classifies an all-zero
         // factor as rank zero when both the maximum and tolerance are zero.
         let max_singular_value = workspace
             .singular_values
@@ -2118,10 +2127,10 @@ mod tests {
         assert!((result.solution[(1, 0)] - 0.5).abs() < 1e-12);
     }
 
-    /// Ensure that uniformly scaling a tall matrix does not change its
-    /// numerical rank or condition estimate.
+    /// Keep a clearly retained tall direction across two representable unit
+    /// scales far from the numerical-rank cutoff.
     #[test]
-    fn test_solve_least_squares_tall_rank_is_scale_invariant() {
+    fn test_solve_least_squares_tall_rank_matches_away_from_cutoff() {
         // This matrix is exactly the small-scale case that the former absolute
         // tolerance floor misreported as rank zero.
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 2, 1).unwrap();
@@ -2138,10 +2147,10 @@ mod tests {
         assert!((tiny_result.solution[(0, 0)] - 1.0).abs() < 1e-12);
     }
 
-    /// Ensure that the wide SVD orientation applies the same scale-relative
-    /// rank rule as the tall orientation.
+    /// Retain a tiny wide-system direction that remains clearly above the
+    /// scale-relative numerical-rank cutoff.
     #[test]
-    fn test_solve_least_squares_wide_rank_is_scale_invariant() {
+    fn test_solve_least_squares_retains_tiny_wide_direction_above_cutoff() {
         // The equation 1e-15*x0 + 2e-15*x1 = 1e-15 is full row rank and has
         // minimum-norm solution [0.2, 0.4].
         let tiny = Matrix::from_vec(vec![1e-15, 2e-15], 1, 2).unwrap();
@@ -2169,15 +2178,17 @@ mod tests {
         assert!((result.solution[(1, 0)] - 1e13).abs() < 1e-3);
     }
 
-    /// Keep numerical rank and the Moore-Penrose solution invariant when a
-    /// caller merely reorders the variables represented by matrix columns.
+    /// Keep the historical variable-ordering regression fixture consistent
+    /// without promoting one observed case into a universal cutoff guarantee.
     #[test]
-    fn test_solve_least_squares_is_invariant_under_column_permutation() {
+    fn test_solve_least_squares_matches_column_permutation_fixture() {
         // The tiny determinant makes this matrix numerically rank one under the
         // precision-derived SVD threshold. The former unpivoted QR dispatcher
         // classified the original ordering as rank two but the permutation as
         // rank one, so equivalent variable orderings followed different solve
-        // policies and produced unrelated answers.
+        // policies and produced unrelated answers. This fixture checks that
+        // removed dispatcher bug; singular values at the current cutoff remain
+        // subject to ordinary floating-point rounding.
         let original = Matrix::from_vec(vec![1e-8, 1.0, 0.0, 1e-8], 2, 2).unwrap();
         let permuted = Matrix::from_vec(vec![1.0, 1e-8, 1e-8, 0.0], 2, 2).unwrap();
         let right_hand_side = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
@@ -2396,19 +2407,20 @@ mod tests {
         assert!((result.info.cond_est - 1.0).abs() < 1e-12);
     }
 
-    /// Ensure SVD rank classification and its pseudoinverse solution remain
-    /// invariant across very small and very large finite unit scales.
+    /// Match one exactly rank-deficient fixture across very small and very large
+    /// finite unit scales.
     #[test]
-    fn test_solve_least_squares_rank_deficient_scale_invariance() {
+    fn test_solve_least_squares_matches_rank_deficient_scale_fixture() {
         for scale in [1e-200_f64, 1.0, 1e200] {
             let a = Matrix::from_vec(vec![scale, scale, 2.0 * scale, 2.0 * scale], 2, 2).unwrap();
             let b = Matrix::from_vec(vec![scale, 2.0 * scale], 2, 1).unwrap();
 
             let result = solve_default(&a, &b);
 
-            // Uniformly scaling both operands leaves the Moore-Penrose answer
-            // unchanged, including at magnitudes where naïve squared norms
-            // would underflow or overflow.
+            // In exact arithmetic, scaling both operands by the same non-zero
+            // value leaves the Moore-Penrose answer unchanged. This fixture
+            // verifies that practical range handling retains that answer at
+            // magnitudes where naïve squared norms would underflow or overflow.
             assert!((result.solution[(0, 0)] - 0.5).abs() < 1e-12);
             assert!((result.solution[(1, 0)] - 0.5).abs() < 1e-12);
             assert_eq!(result.info.rank, 1);

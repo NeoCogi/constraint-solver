@@ -28,7 +28,7 @@ SOFTWARE.
 //! Build residual expressions with [`Exp`], compile their variable names once
 //! with [`Compiler`], and solve square, underdetermined, or overdetermined
 //! systems with [`NewtonRaphsonSolver`]. Every linearized shape uses one
-//! Jacobi-SVD pseudoinverse policy for permutation-invariant rank decisions.
+//! Jacobi-SVD pseudoinverse policy and one scale-relative numerical-rank cutoff.
 //!
 //! The solver differentiates the supplied expression tree symbolically. It
 //! does not estimate or repair derivatives with finite differences. At a
