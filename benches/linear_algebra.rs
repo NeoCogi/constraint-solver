@@ -1,4 +1,4 @@
-use constraint_solver::Matrix;
+use constraint_solver::{LeastSquaresWorkspace, Matrix};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -103,15 +103,25 @@ fn bench_least_squares(c: &mut Criterion) {
         for diagonal in 0..size {
             square[(diagonal, diagonal)] += 2.0 * size as f64;
         }
-        let square_check = square.solve_least_squares(&square_rhs).unwrap();
-        assert_eq!(square_check.info.rank, size);
+        let mut square_solution = Matrix::new(size, 1);
+        let mut square_workspace = LeastSquaresWorkspace::new(size, size);
+        let square_check = square
+            .solve_least_squares_into(&square_rhs, &mut square_solution, &mut square_workspace)
+            .unwrap();
+        assert_eq!(square_check.rank, size);
         group.bench_with_input(
             BenchmarkId::new("square", size),
             &square,
             |bench, matrix| {
                 bench.iter(|| {
-                    let result = matrix.solve_least_squares(black_box(&square_rhs)).unwrap();
-                    black_box(result);
+                    let info = matrix
+                        .solve_least_squares_into(
+                            black_box(&square_rhs),
+                            black_box(&mut square_solution),
+                            black_box(&mut square_workspace),
+                        )
+                        .unwrap();
+                    black_box(info);
                 })
             },
         );
@@ -120,30 +130,50 @@ fn bench_least_squares(c: &mut Criterion) {
         // orientations under the same bounded dimension schedule.
         let tall = random_matrix(long_dimension, size, &mut rng);
         let tall_rhs = random_matrix(long_dimension, 1, &mut rng);
-        let tall_check = tall.solve_least_squares(&tall_rhs).unwrap();
-        assert_eq!(tall_check.info.rank, size);
+        let mut tall_solution = Matrix::new(size, 1);
+        let mut tall_workspace = LeastSquaresWorkspace::new(long_dimension, size);
+        let tall_check = tall
+            .solve_least_squares_into(&tall_rhs, &mut tall_solution, &mut tall_workspace)
+            .unwrap();
+        assert_eq!(tall_check.rank, size);
         group.bench_with_input(
             BenchmarkId::new("tall", format!("{long_dimension}x{size}")),
             &tall,
             |bench, matrix| {
                 bench.iter(|| {
-                    let result = matrix.solve_least_squares(black_box(&tall_rhs)).unwrap();
-                    black_box(result);
+                    let info = matrix
+                        .solve_least_squares_into(
+                            black_box(&tall_rhs),
+                            black_box(&mut tall_solution),
+                            black_box(&mut tall_workspace),
+                        )
+                        .unwrap();
+                    black_box(info);
                 })
             },
         );
 
         let wide = random_matrix(size, long_dimension, &mut rng);
         let wide_rhs = random_matrix(size, 1, &mut rng);
-        let wide_check = wide.solve_least_squares(&wide_rhs).unwrap();
-        assert_eq!(wide_check.info.rank, size);
+        let mut wide_solution = Matrix::new(long_dimension, 1);
+        let mut wide_workspace = LeastSquaresWorkspace::new(size, long_dimension);
+        let wide_check = wide
+            .solve_least_squares_into(&wide_rhs, &mut wide_solution, &mut wide_workspace)
+            .unwrap();
+        assert_eq!(wide_check.rank, size);
         group.bench_with_input(
             BenchmarkId::new("wide", format!("{size}x{long_dimension}")),
             &wide,
             |bench, matrix| {
                 bench.iter(|| {
-                    let result = matrix.solve_least_squares(black_box(&wide_rhs)).unwrap();
-                    black_box(result);
+                    let info = matrix
+                        .solve_least_squares_into(
+                            black_box(&wide_rhs),
+                            black_box(&mut wide_solution),
+                            black_box(&mut wide_workspace),
+                        )
+                        .unwrap();
+                    black_box(info);
                 })
             },
         );
@@ -155,17 +185,29 @@ fn bench_least_squares(c: &mut Criterion) {
         for row in 0..size {
             deficient[(row, size - 1)] = deficient[(row, 0)];
         }
-        let deficient_check = deficient.solve_least_squares(&deficient_rhs).unwrap();
-        assert!(deficient_check.info.rank < size);
+        let mut deficient_solution = Matrix::new(size, 1);
+        let mut deficient_workspace = LeastSquaresWorkspace::new(size, size);
+        let deficient_check = deficient
+            .solve_least_squares_into(
+                &deficient_rhs,
+                &mut deficient_solution,
+                &mut deficient_workspace,
+            )
+            .unwrap();
+        assert!(deficient_check.rank < size);
         group.bench_with_input(
             BenchmarkId::new("rank_deficient", size),
             &deficient,
             |bench, matrix| {
                 bench.iter(|| {
-                    let result = matrix
-                        .solve_least_squares(black_box(&deficient_rhs))
+                    let info = matrix
+                        .solve_least_squares_into(
+                            black_box(&deficient_rhs),
+                            black_box(&mut deficient_solution),
+                            black_box(&mut deficient_workspace),
+                        )
                         .unwrap();
-                    black_box(result);
+                    black_box(info);
                 })
             },
         );

@@ -27,7 +27,7 @@ SOFTWARE.
 //! exhaustive device behavior of a production circuit simulator.
 
 use crate::common::Sample;
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError, SolverWorkspace};
 use std::collections::{BTreeMap, HashMap};
 
 /// Characteristic KCL scale used to make ampere residuals dimensionless.
@@ -341,7 +341,12 @@ impl Circuit {
             .into_iter()
             .map(|name| (name, 0.0))
             .collect();
-        CircuitSimulation { solver, state }
+        let workspace = solver.workspace();
+        CircuitSimulation {
+            solver,
+            workspace,
+            state,
+        }
     }
 }
 
@@ -349,6 +354,8 @@ impl Circuit {
 pub struct CircuitSimulation {
     /// Compiled nonlinear KCL system shared across every time sample.
     solver: NewtonRaphsonSolver,
+    /// Numerical buffers reused across every warm-started operating point.
+    workspace: SolverWorkspace,
     /// Complete variable map from the most recently accepted operating point.
     state: HashMap<String, f64>,
 }
@@ -363,7 +370,7 @@ impl CircuitSimulation {
         // Keep solved node values as the nonlinear initial guess while known
         // sources and history terms are overwritten for the new time point.
         self.state.extend(parameters);
-        let solution = self.solver.solve(self.state.clone())?;
+        let solution = self.solver.solve(self.state.clone(), &mut self.workspace)?;
         self.state = solution.values.clone();
         Ok(Sample::new(time, solution.values))
     }

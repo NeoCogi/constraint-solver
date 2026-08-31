@@ -98,7 +98,10 @@ let initial = HashMap::from([
     ("x".to_string(), 0.0),
     ("current".to_string(), 0.0),
 ]);
-let solution = solver.solve(initial).expect("solve failed");
+let mut workspace = solver.workspace();
+let solution = solver
+    .solve(initial, &mut workspace)
+    .expect("solve failed");
 assert!((solution.values["current"] - 1e3).abs() < 1e-8);
 ```
 
@@ -124,7 +127,10 @@ let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.5);
 initial.insert("y".to_string(), 0.866);
 
-let solution = solver.solve(initial).expect("solve failed");
+let mut workspace = solver.workspace();
+let solution = solver
+    .solve(initial, &mut workspace)
+    .expect("solve failed");
 assert!(solution.error < 1e-10);
 ```
 
@@ -146,7 +152,10 @@ let solver = NewtonRaphsonSolver::new(compiled);
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 10.0);
 initial.insert("y".to_string(), -10.0);
-let solution = solver.solve(initial).expect("solve failed");
+let mut workspace = solver.workspace();
+let solution = solver
+    .solve(initial, &mut workspace)
+    .expect("solve failed");
 assert!(solution.error < 1e-10);
 assert!((solution.values["x"] - 10.5).abs() < 1e-10);
 assert!((solution.values["y"] + 9.5).abs() < 1e-10);
@@ -169,7 +178,10 @@ let solver = NewtonRaphsonSolver::new(compiled);
 
 let mut initial = HashMap::new();
 initial.insert("x".to_string(), 0.0);
-let solution = solver.solve(initial).expect("solve failed");
+let mut workspace = solver.workspace();
+let solution = solver
+    .solve(initial, &mut workspace)
+    .expect("solve failed");
 assert!(solution.error < 1e-10);
 ```
 
@@ -195,7 +207,10 @@ initial.insert("y".to_string(), 0.25);
 
 // Every solve uses Armijo backtracking; accepted candidates are evaluated
 // before they replace the current state.
-let solution = solver.solve(initial).expect("solve failed");
+let mut workspace = solver.workspace();
+let solution = solver
+    .solve(initial, &mut workspace)
+    .expect("solve failed");
 assert!(solution.error < 1e-8);
 ```
 
@@ -331,12 +346,12 @@ the harness on the target machine when making performance decisions.
 - Expressions are built by variable name, then compiled into a solver-friendly
   representation. Provide all variables referenced by equations in the initial
   guess map; missing variables are treated as errors.
-- Internally, the solver differentiates and simplifies its symbolic Jacobian
-  once during construction. Each solve creates independent numerical storage
-  and reuses residual, Jacobian, and line-search candidate workspaces between
-  iterations. When positive regularization is configured, each correction
-  allocates and fills its augmented ridge matrices. Matrix factorizations also
-  allocate their own working storage.
+- The solver differentiates and simplifies its symbolic Jacobian once during
+  construction. Call `solver.workspace()` after configuration to allocate
+  residual, Jacobian, candidate, correction, optional ridge, and Jacobi-SVD
+  buffers once. Passing that workspace to successive `solve` calls reuses every
+  numerical allocation; use one workspace per concurrent solve. Only the final
+  owned `Solution` or terminal diagnostic allocates its name-keyed public data.
 - Derivatives are evaluated from the exact symbolic tree; the solver does not
   replace non-finite derivatives with finite differences. A finite residual at
   a domain boundary may therefore still return

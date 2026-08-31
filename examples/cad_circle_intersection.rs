@@ -47,12 +47,13 @@ fn main() {
 
     let compiled = Compiler::compile(&[eq1, eq2]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new(compiled);
+    let mut workspace = solver.workspace();
 
     let mut initial = HashMap::new();
     initial.insert("x".to_string(), 2.0);
     initial.insert("y".to_string(), 1.0);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let x_sol = solution.values.get("x").copied().unwrap();
     let y_sol = solution.values.get("y").copied().unwrap();
 

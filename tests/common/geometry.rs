@@ -26,7 +26,7 @@ SOFTWARE.
 //! state for the animated geometry integration tests.
 
 use crate::common::Sample;
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverError, SolverWorkspace};
 use std::collections::HashMap;
 
 /// Characteristic coordinate size used for normalized geometric corrections.
@@ -188,8 +188,10 @@ impl Geometry {
             .with_variable_scales(self.variable_scales)
             .expect("geometric scales name only declared unknowns")
             .with_residual_tolerance(1e-9);
+        let workspace = solver.workspace();
         GeometrySimulation {
             solver,
+            workspace,
             state: self.initial_values,
         }
     }
@@ -213,6 +215,8 @@ impl Geometry {
 pub struct GeometrySimulation {
     /// Compiled constraint solver reused for all animation samples.
     solver: NewtonRaphsonSolver,
+    /// Numerical buffers reused across every warm-started animation sample.
+    workspace: SolverWorkspace,
     /// Complete most-recent accepted values and known parameters.
     state: HashMap<String, f64>,
 }
@@ -227,7 +231,7 @@ impl GeometrySimulation {
         // The preceding solution supplies a continuous branch initial guess,
         // while explicit parameters replace only externally animated values.
         self.state.extend(parameters);
-        let solution = self.solver.solve(self.state.clone())?;
+        let solution = self.solver.solve(self.state.clone(), &mut self.workspace)?;
         self.state = solution.values.clone();
         Ok(Sample::new(time, solution.values))
     }

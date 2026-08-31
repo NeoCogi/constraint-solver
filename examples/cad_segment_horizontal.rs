@@ -46,6 +46,7 @@ fn main() {
     let compiled = Compiler::compile(&[length_eq, horizontal_eq]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new_with_variables(compiled, &["bx", "by"])
         .expect("solver init failed");
+    let mut workspace = solver.workspace();
 
     // Start away from both the horizontal line and the requested length so the
     // example exercises actual nonlinear Newton updates instead of returning
@@ -56,7 +57,7 @@ fn main() {
     initial.insert("bx".to_string(), 5.0);
     initial.insert("by".to_string(), 2.5);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let bx_sol = solution.values.get("bx").copied().unwrap();
     let by_sol = solution.values.get("by").copied().unwrap();
 

@@ -335,7 +335,9 @@ mod tests {
         let solver = NewtonRaphsonSolver::new(compiled);
         let initial = HashMap::from([("x".to_string(), 0.0)]);
 
-        let solution = solver.solve(initial).expect("operator tree must solve");
+        let solution = solver
+            .solve_once(initial)
+            .expect("operator tree must solve");
         assert!((solution.values["x"] - 1.0).abs() < 1e-10);
     }
 
@@ -356,7 +358,7 @@ mod tests {
         let initial = HashMap::from([("x".to_string(), 2.0)]);
 
         let solution = solver
-            .solve(initial)
+            .solve_once(initial)
             .expect("logarithm equation must solve");
 
         assert!((solution.values["x"] - std::f64::consts::E).abs() < 1e-10);

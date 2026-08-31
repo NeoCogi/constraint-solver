@@ -108,6 +108,15 @@ pub enum MatrixError {
         /// Actual output-buffer shape as `(rows, columns)`.
         actual: (usize, usize),
     },
+    /// A least-squares workspace was constructed for another coefficient shape.
+    WorkspaceShapeMismatch {
+        /// Stable name of the operation that rejected the workspace.
+        operation: &'static str,
+        /// Coefficient shape required by the current operation.
+        expected: (usize, usize),
+        /// Coefficient shape accepted by the supplied workspace.
+        actual: (usize, usize),
+    },
     /// A flat data buffer does not contain exactly one element per requested
     /// matrix position.
     InvalidDataLength {
@@ -165,16 +174,6 @@ pub struct LeastSquaresInfo {
     pub cond_est: f64,
 }
 
-/// Checked least-squares solution paired with the factorization diagnostics
-/// that justify its numerical interpretation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LeastSquaresSolution {
-    /// Full-column, least-squares, or minimum-norm solution vector.
-    pub solution: Matrix,
-    /// Rank and retained-subspace condition estimate from the canonical SVD.
-    pub info: LeastSquaresInfo,
-}
-
 impl fmt::Display for MatrixError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -194,6 +193,15 @@ impl fmt::Display for MatrixError {
             } => write!(
                 f,
                 "Output shape mismatch for {operation}: expected {}x{}, got {}x{}",
+                expected.0, expected.1, actual.0, actual.1
+            ),
+            MatrixError::WorkspaceShapeMismatch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Workspace shape mismatch for {operation}: expected {}x{}, got {}x{}",
                 expected.0, expected.1, actual.0, actual.1
             ),
             MatrixError::InvalidDataLength {
@@ -238,20 +246,55 @@ pub struct Matrix {
     cols: usize,
 }
 
-/// Internal one-sided Jacobi SVD representation for a matrix with at least as
-/// many rows as columns.
+/// Reusable storage for one fixed-shape Jacobi-SVD least-squares problem.
 ///
-/// If the input is `A`, the fields satisfy `A * right_vectors =
-/// orthogonal_columns`. Each non-zero orthogonal column is a left singular
-/// vector scaled by the corresponding singular value. Keeping this compact
-/// representation avoids allocating a separate dense left-singular matrix.
-struct JacobiSvd {
-    /// Rotated columns whose pairwise inner products are numerically zero.
+/// Construct this workspace once for coefficient shape `rows x cols`, then pass
+/// it to every [`Matrix::solve_least_squares_into`] call with that shape. Its
+/// fields are private so callers cannot invalidate factorization dimensions or
+/// accidentally depend on transient decomposition values.
+pub struct LeastSquaresWorkspace {
+    /// Coefficient row count this workspace accepts.
+    rows: usize,
+    /// Coefficient column count and solution row count this workspace accepts.
+    cols: usize,
+    /// Normalized coefficient matrix, transposed for wide input, rotated in
+    /// place until its columns are mutually orthogonal.
     orthogonal_columns: Matrix,
-    /// Accumulated orthogonal right-singular-vector matrix.
+    /// Orthogonal right-singular vectors accumulated during Jacobi rotations.
     right_vectors: Matrix,
-    /// Euclidean norm of each rotated column.
+    /// Euclidean norms of the rotated columns.
     singular_values: Vec<f64>,
+    /// Scale-preserving right-hand-side projections for reconstruction.
+    projections: Vec<ScaledValue>,
+}
+
+impl LeastSquaresWorkspace {
+    /// Allocate all numerical storage required for a coefficient matrix shape.
+    ///
+    /// The workspace accepts both tall and wide matrices by storing the taller
+    /// orientation as `max(rows, cols) x min(rows, cols)`. No solve using this
+    /// workspace allocates, resizes, or replaces these buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the requested factor shape if its dimensions or storage are
+    /// impossible to represent.
+    #[track_caller]
+    pub fn new(rows: usize, cols: usize) -> Self {
+        let factor_rows = rows.max(cols);
+        let component_count = rows.min(cols);
+
+        // Allocate every buffer at its final length. Solve calls overwrite all
+        // active entries, so reuse never depends on a preceding decomposition.
+        Self {
+            rows,
+            cols,
+            orthogonal_columns: Matrix::new(factor_rows, component_count),
+            right_vectors: Matrix::new(component_count, component_count),
+            singular_values: vec![0.0; component_count],
+            projections: vec![ScaledValue::ZERO; component_count],
+        }
+    }
 }
 
 impl Matrix {
@@ -372,6 +415,15 @@ impl Matrix {
         self.cols
     }
 
+    /// Return the backing allocation address for storage-reuse unit tests.
+    ///
+    /// This is crate-visible only in test builds; numerical callers must reason
+    /// through the documented no-allocation contract rather than storage layout.
+    #[cfg(test)]
+    pub(crate) fn storage_address(&self) -> *const f64 {
+        self.data.as_ptr()
+    }
+
     /// Verify that a caller-owned output matrix has one required shape.
     ///
     /// Centralizing this check keeps every allocation-free operation consistent:
@@ -435,7 +487,7 @@ impl Matrix {
         Ok(())
     }
 
-    /// Solve a possibly rectangular least-squares problem by canonical SVD.
+    /// Solve a rectangular least-squares problem into reusable caller storage.
     ///
     /// A one-sided Jacobi decomposition classifies numerical rank from singular
     /// values and computes the Moore-Penrose minimum-norm solution for square,
@@ -444,13 +496,18 @@ impl Matrix {
     /// competing factorization policy whose intermediate arithmetic could fail
     /// on otherwise representable systems.
     ///
-    /// # Panics
-    ///
-    /// Panics with the requested workspace or result shape if its dimensions or
-    /// storage cannot be represented. Numerical and operand-shape failures are
-    /// returned through [`MatrixError`].
-    #[track_caller]
-    pub fn solve_least_squares(&self, b: &Matrix) -> Result<LeastSquaresSolution, MatrixError> {
+    /// The coefficient matrix, right-hand side, solution, and workspace must
+    /// respectively have shapes `m x n`, `m x 1`, `n x 1`, and a workspace
+    /// constructed by [`LeastSquaresWorkspace::new(m, n)`]. The method performs
+    /// no allocation and overwrites the solution only after all input and shape
+    /// validation succeeds. A later numerical error can leave it partially
+    /// overwritten, so it remains scratch until `Ok` is returned.
+    pub fn solve_least_squares_into(
+        &self,
+        b: &Matrix,
+        solution: &mut Matrix,
+        workspace: &mut LeastSquaresWorkspace,
+    ) -> Result<LeastSquaresInfo, MatrixError> {
         // Validate the vector shape before the factorization reads it. The
         // solve API intentionally accepts one right-hand side so its
         // minimum-norm and diagnostic contract remains unambiguous.
@@ -459,6 +516,15 @@ impl Matrix {
                 operation: "solve_least_squares",
                 left: (self.rows, 1),
                 right: (b.rows, b.cols),
+            });
+        }
+        Self::require_output_shape(solution, (self.cols, 1), "solve_least_squares")?;
+        let workspace_shape = (workspace.rows, workspace.cols);
+        if workspace_shape != (self.rows, self.cols) {
+            return Err(MatrixError::WorkspaceShapeMismatch {
+                operation: "solve_least_squares",
+                expected: (self.rows, self.cols),
+                actual: workspace_shape,
             });
         }
         if b.rows != self.rows {
@@ -492,34 +558,34 @@ impl Matrix {
         let relative_rank_tolerance = numerical_rank_relative_tolerance(m, n);
 
         // Trivial cases have a unique zero-length or minimum-norm zero solution
-        // and require no numerical factorization. The returned variable vector
-        // can still be impossibly large when the coefficient matrix has zero
-        // rows, so preserve the fallible solve contract while allocating it.
+        // and require no numerical factorization. Overwrite a non-empty
+        // solution because the caller may be reusing values from a prior solve.
         if n == 0 || m == 0 {
-            return Ok(LeastSquaresSolution {
-                solution: Matrix::new(n, 1),
-                info: LeastSquaresInfo {
-                    rank: 0,
-                    cond_est: f64::INFINITY,
-                },
+            solution.data.fill(0.0);
+            return Ok(LeastSquaresInfo {
+                rank: 0,
+                cond_est: f64::INFINITY,
             });
         }
 
         // The decomposition supplies both the returned correction and the rank
         // diagnostics, so classification cannot disagree with solution policy.
-        let result = Self::solve_least_squares_svd_with_info(self, b, relative_rank_tolerance)?;
+        let info = Self::solve_least_squares_svd_into(
+            self,
+            b,
+            solution,
+            workspace,
+            relative_rank_tolerance,
+        )?;
 
         // A successful checked solve must never smuggle NaN or infinity through
         // its `Ok` channel, even when finite inputs overflow during substitution.
-        if !result.0.all_finite() {
+        if !solution.all_finite() {
             return Err(MatrixError::NonFiniteResult {
                 operation: "solve_least_squares",
             });
         }
-        Ok(LeastSquaresSolution {
-            solution: result.0,
-            info: result.1,
-        })
+        Ok(info)
     }
 
     /// Compute a Moore-Penrose pseudoinverse solution with a one-sided Jacobi
@@ -530,11 +596,13 @@ impl Matrix {
     /// transpose and apply the transposed SVD identities. In both orientations,
     /// singular directions below the relative rank tolerance are omitted,
     /// which selects the unique minimum-Euclidean-norm least-squares solution.
-    fn solve_least_squares_svd_with_info(
+    fn solve_least_squares_svd_into(
         a: &Matrix,
         b: &Matrix,
+        solution: &mut Matrix,
+        workspace: &mut LeastSquaresWorkspace,
         relative_rank_tolerance: f64,
-    ) -> Result<(Matrix, LeastSquaresInfo), MatrixError> {
+    ) -> Result<LeastSquaresInfo, MatrixError> {
         let rows = a.rows;
         let cols = a.cols;
         let tall_orientation = rows >= cols;
@@ -559,13 +627,9 @@ impl Matrix {
 
         // Decomposing A^T for a wide system keeps the Jacobi kernel compact and
         // avoids manufacturing zero singular columns merely to make A tall.
-        // Build either orientation directly instead of cloning or invoking the
-        // public transpose, keeping normalization and orientation in one pass.
-        // Fatal storage exhaustion is reported by `Matrix::new` with this
-        // requested factor shape.
-        let factor_rows = rows.max(cols);
-        let factor_cols = rows.min(cols);
-        let mut factor_input = Matrix::new(factor_rows, factor_cols);
+        // Populate the workspace orientation directly so normalization,
+        // transposition, and reuse remain one pass over caller-owned storage.
+        let factor_input = &mut workspace.orthogonal_columns;
         if tall_orientation {
             // Combine the copy and coefficient normalization into one pass so
             // the owned Jacobi workspace is the only duplicate of A.
@@ -582,13 +646,17 @@ impl Matrix {
                 }
             }
         }
-        let decomposition =
-            Self::one_sided_jacobi_svd_columns(factor_input, relative_rank_tolerance)?;
+        Self::one_sided_jacobi_svd_columns(
+            &mut workspace.orthogonal_columns,
+            &mut workspace.right_vectors,
+            &mut workspace.singular_values,
+            relative_rank_tolerance,
+        )?;
 
         // A relative threshold preserves the numerical rank under uniform unit
         // changes. The strict comparison deliberately classifies an all-zero
         // factor as rank zero when both the maximum and tolerance are zero.
-        let max_singular_value = decomposition
+        let max_singular_value = workspace
             .singular_values
             .iter()
             .copied()
@@ -596,7 +664,7 @@ impl Matrix {
         let rank_tolerance = numerical_rank_tolerance(max_singular_value, relative_rank_tolerance);
         let mut rank = 0usize;
         let mut min_retained_singular_value = f64::INFINITY;
-        for &singular_value in &decomposition.singular_values {
+        for &singular_value in &workspace.singular_values {
             if singular_value > rank_tolerance {
                 rank += 1;
                 min_retained_singular_value = min_retained_singular_value.min(singular_value);
@@ -610,18 +678,13 @@ impl Matrix {
         } else {
             max_singular_value / min_retained_singular_value
         };
-        // Allocate the public result once. Fatal storage failure includes this
-        // exact output shape in the constructor's caller-aware panic.
-        let mut solution = Matrix::new(cols, 1);
-
         // Project the right-hand side onto every retained singular direction
         // without converting those intermediate coordinates back to `f64`.
         // A projection may exceed the scalar exponent range even when division
         // by its singular value and reconstruction produce finite variables.
-        let component_count = decomposition.singular_values.len();
-        let mut projections = vec![ScaledValue::ZERO; component_count];
-        for (component, projection) in projections.iter_mut().enumerate() {
-            let singular_value = decomposition.singular_values[component];
+        workspace.projections.fill(ScaledValue::ZERO);
+        for (component, projection) in workspace.projections.iter_mut().enumerate() {
+            let singular_value = workspace.singular_values[component];
             if singular_value <= rank_tolerance {
                 // Omitting this singular direction is exactly the pseudoinverse
                 // rule that removes unsupported null-space components.
@@ -632,17 +695,12 @@ impl Matrix {
                 // A*V=B=U*Sigma, so this coefficient is
                 // (U_component^T*b)/sigma. Normalizing B before the dot product
                 // prevents squaring a large or tiny singular value explicitly.
-                Self::scaled_column_dot(
-                    &decomposition.orthogonal_columns,
-                    component,
-                    singular_value,
-                    b,
-                )
+                Self::scaled_column_dot(&workspace.orthogonal_columns, component, singular_value, b)
             } else {
                 // A^T*V=B=U*Sigma implies A=V*Sigma*U^T. Project the right-hand
                 // side onto V, then map the scaled coefficient into U to obtain
                 // the minimum-norm variable vector.
-                Self::scaled_column_dot(&decomposition.right_vectors, component, 1.0, b)
+                Self::scaled_column_dot(&workspace.right_vectors, component, 1.0, b)
             };
         }
 
@@ -652,8 +710,8 @@ impl Matrix {
         // checked for representability.
         for row in 0..cols {
             let mut reconstructed = ScaledSum::default();
-            for (component, &projection) in projections.iter().enumerate() {
-                let singular_value = decomposition.singular_values[component];
+            for (component, &projection) in workspace.projections.iter().enumerate() {
+                let singular_value = workspace.singular_values[component];
                 if singular_value <= rank_tolerance {
                     continue;
                 }
@@ -664,7 +722,7 @@ impl Matrix {
                     // global coefficient scale together restore A's units.
                     reconstructed.add_scaled_product_ratio(
                         projection,
-                        [decomposition.right_vectors[(row, component)]],
+                        [workspace.right_vectors[(row, component)]],
                         [singular_value, coefficient_scale],
                     );
                 } else {
@@ -674,7 +732,7 @@ impl Matrix {
                     // second normalized singular-value denominator.
                     reconstructed.add_scaled_product_ratio(
                         projection,
-                        [decomposition.orthogonal_columns[(row, component)]],
+                        [workspace.orthogonal_columns[(row, component)]],
                         [singular_value, singular_value, coefficient_scale],
                     );
                 }
@@ -689,7 +747,7 @@ impl Matrix {
             solution[(row, 0)] = value;
         }
 
-        Ok((solution, LeastSquaresInfo { rank, cond_est }))
+        Ok(LeastSquaresInfo { rank, cond_est })
     }
 
     /// Orthogonalize the columns of a tall-or-square matrix with cyclic Jacobi
@@ -702,18 +760,23 @@ impl Matrix {
     /// allowing the factorization and solution phases to share one definition of
     /// a numerical null direction.
     fn one_sided_jacobi_svd_columns(
-        mut orthogonal_columns: Matrix,
+        orthogonal_columns: &mut Matrix,
+        right_vectors: &mut Matrix,
+        singular_values: &mut [f64],
         relative_rank_tolerance: f64,
-    ) -> Result<JacobiSvd, MatrixError> {
+    ) -> Result<(), MatrixError> {
         debug_assert!(orthogonal_columns.rows >= orthogonal_columns.cols);
 
-        // Take ownership of the normalized factor input so the Jacobi kernel
-        // can rotate it in place without a second full-matrix clone. The right
-        // singular-vector basis is a required factorization workspace; fatal
-        // allocation failure reports its square shape through `Matrix::new`.
+        // Rotate the normalized factor in place and reset the reused right-vector
+        // matrix to the identity that begins every independent decomposition.
         let row_count = orthogonal_columns.rows;
         let column_count = orthogonal_columns.cols;
-        let mut right_vectors = Matrix::new(column_count, column_count);
+        debug_assert_eq!(
+            (right_vectors.rows, right_vectors.cols),
+            (column_count, column_count)
+        );
+        debug_assert_eq!(singular_values.len(), column_count);
+        right_vectors.data.fill(0.0);
         for diagonal in 0..column_count {
             right_vectors[(diagonal, diagonal)] = 1.0;
         }
@@ -863,10 +926,6 @@ impl Matrix {
 
         // Column norms are the singular values after orthogonalization. Repeated
         // `hypot` calls avoid overflow and underflow in the sum of squares.
-        // The compact singular-value vector is required to complete the
-        // factorization. Like other fatal Rust allocation failures, inability
-        // to reserve it terminates at this allocation site.
-        let mut singular_values = Vec::with_capacity(column_count);
         for column in 0..column_count {
             let mut singular_value = 0.0_f64;
             for row in 0..row_count {
@@ -877,14 +936,10 @@ impl Matrix {
                     operation: "one_sided_jacobi_svd",
                 });
             }
-            singular_values.push(singular_value);
+            singular_values[column] = singular_value;
         }
 
-        Ok(JacobiSvd {
-            orthogonal_columns,
-            right_vectors,
-            singular_values,
-        })
+        Ok(())
     }
 
     /// Compute a scaled compensated dot product between one matrix column and a
@@ -1187,14 +1242,31 @@ mod tests {
         m
     }
 
-    /// Run the canonical least-squares API with its automatic singular-value
-    /// rank policy.
-    fn solve_default(coefficients: &Matrix, rhs: &Matrix) -> LeastSquaresSolution {
-        // Unwrap here so individual numerical tests can focus on their expected
-        // solution and diagnostic fields.
+    /// Owned test view pairing a caller output buffer with returned diagnostics.
+    struct TestLeastSquaresSolution {
+        /// Solution buffer populated by the allocation-free public operation.
+        solution: Matrix,
+        /// Rank and condition metadata returned independently from storage.
+        info: LeastSquaresInfo,
+    }
+
+    /// Run the canonical least-squares API with freshly constructed test storage.
+    fn solve_default(coefficients: &Matrix, rhs: &Matrix) -> TestLeastSquaresSolution {
+        let mut solution = Matrix::new(coefficients.cols(), 1);
+        let mut workspace = LeastSquaresWorkspace::new(coefficients.rows(), coefficients.cols());
+        let info = coefficients
+            .solve_least_squares_into(rhs, &mut solution, &mut workspace)
+            .expect("least-squares solve failed");
+        TestLeastSquaresSolution { solution, info }
+    }
+
+    /// Return the structured failure from one checked least-squares invocation.
+    fn solve_error(coefficients: &Matrix, rhs: &Matrix) -> MatrixError {
+        let mut solution = Matrix::new(coefficients.cols(), 1);
+        let mut workspace = LeastSquaresWorkspace::new(coefficients.rows(), coefficients.cols());
         coefficients
-            .solve_least_squares(rhs)
-            .expect("least-squares solve failed")
+            .solve_least_squares_into(rhs, &mut solution, &mut workspace)
+            .expect_err("least-squares fixture must fail")
     }
 
     #[test]
@@ -1260,7 +1332,7 @@ mod tests {
         let nan_rhs = Matrix::from_vec(vec![f64::NAN, 1.0], 2, 1).unwrap();
 
         assert_eq!(
-            identity.solve_least_squares(&nan_rhs).unwrap_err(),
+            solve_error(&identity, &nan_rhs),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
                 operand: MatrixOperand::RightHandSide,
@@ -1270,9 +1342,7 @@ mod tests {
         let nan_coefficient = Matrix::from_vec(vec![1.0, f64::NAN, 0.0, 1.0], 2, 2).unwrap();
         let finite_rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1).unwrap();
         assert_eq!(
-            nan_coefficient
-                .solve_least_squares(&finite_rhs)
-                .unwrap_err(),
+            solve_error(&nan_coefficient, &finite_rhs),
             MatrixError::NonFiniteInput {
                 operation: "solve_least_squares",
                 operand: MatrixOperand::CoefficientMatrix,
@@ -1288,9 +1358,82 @@ mod tests {
         let huge_rhs = Matrix::from_vec(vec![f64::MAX], 1, 1).unwrap();
 
         assert_eq!(
-            tiny_coefficient.solve_least_squares(&huge_rhs).unwrap_err(),
+            solve_error(&tiny_coefficient, &huge_rhs),
             MatrixError::NonFiniteResult {
                 operation: "solve_least_squares",
+            }
+        );
+    }
+
+    /// Reuse the complete factorization, projection, and output storage across
+    /// independent right-hand sides without retaining stale numerical state.
+    #[test]
+    fn test_least_squares_into_reuses_all_allocations() {
+        let coefficients = Matrix::from_vec(vec![2.0, 0.0, 0.0, 4.0], 2, 2).unwrap();
+        let first_rhs = Matrix::from_vec(vec![2.0, 8.0], 2, 1).unwrap();
+        let second_rhs = Matrix::from_vec(vec![-4.0, 4.0], 2, 1).unwrap();
+        let mut solution = Matrix::new(2, 1);
+        let mut workspace = LeastSquaresWorkspace::new(2, 2);
+        let addresses = (
+            solution.data.as_ptr(),
+            workspace.orthogonal_columns.data.as_ptr(),
+            workspace.right_vectors.data.as_ptr(),
+            workspace.singular_values.as_ptr(),
+            workspace.projections.as_ptr(),
+        );
+
+        let first_info = coefficients
+            .solve_least_squares_into(&first_rhs, &mut solution, &mut workspace)
+            .unwrap();
+        assert_eq!(solution, Matrix::from_vec(vec![1.0, 2.0], 2, 1).unwrap());
+        assert_eq!(first_info.rank, 2);
+
+        let second_info = coefficients
+            .solve_least_squares_into(&second_rhs, &mut solution, &mut workspace)
+            .unwrap();
+        assert_eq!(solution, Matrix::from_vec(vec![-2.0, 1.0], 2, 1).unwrap());
+        assert_eq!(second_info.rank, 2);
+        assert_eq!(
+            addresses,
+            (
+                solution.data.as_ptr(),
+                workspace.orthogonal_columns.data.as_ptr(),
+                workspace.right_vectors.data.as_ptr(),
+                workspace.singular_values.as_ptr(),
+                workspace.projections.as_ptr(),
+            )
+        );
+    }
+
+    /// Reject output and workspace mismatches with their exact expected and
+    /// actual shapes before factorization touches reusable scratch storage.
+    #[test]
+    fn test_least_squares_into_rejects_mismatched_caller_storage() {
+        let coefficients = Matrix::identity(2);
+        let rhs = Matrix::new(2, 1);
+        let mut wrong_solution = Matrix::new(1, 1);
+        let mut matching_workspace = LeastSquaresWorkspace::new(2, 2);
+        assert_eq!(
+            coefficients
+                .solve_least_squares_into(&rhs, &mut wrong_solution, &mut matching_workspace,)
+                .unwrap_err(),
+            MatrixError::OutputShapeMismatch {
+                operation: "solve_least_squares",
+                expected: (2, 1),
+                actual: (1, 1),
+            }
+        );
+
+        let mut solution = Matrix::new(2, 1);
+        let mut wrong_workspace = LeastSquaresWorkspace::new(3, 2);
+        assert_eq!(
+            coefficients
+                .solve_least_squares_into(&rhs, &mut solution, &mut wrong_workspace)
+                .unwrap_err(),
+            MatrixError::WorkspaceShapeMismatch {
+                operation: "solve_least_squares",
+                expected: (2, 2),
+                actual: (3, 2),
             }
         );
     }
@@ -2067,9 +2210,7 @@ mod tests {
         let right_hand_side = Matrix::from_vec(vec![0.0, 0.0, 0.0, 0.0, -300.0, 200.0], 6, 1)
             .expect("the IK residual fixture has six entries");
 
-        let result = coefficients
-            .solve_least_squares(&right_hand_side)
-            .expect("a finite rank-deficient IK correction must factorize");
+        let result = solve_default(&coefficients, &right_hand_side);
 
         assert_eq!(result.info.rank, 5);
         assert!(result.solution.all_finite());

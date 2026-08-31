@@ -17,6 +17,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-finite operands consistently in debug and release builds and reports
   unrepresentable completed results without hiding errors behind operator
   panics.
+- Added caller-owned `LeastSquaresWorkspace` and `SolverWorkspace` storage.
+  Least-squares factorization, regularized corrections, residual evaluation,
+  and line-search candidates now reuse fixed allocations across iterations and
+  repeated solve calls; the public solve API requires that storage explicitly.
+- Removed `Solution::convergence_history`; retaining an unbounded per-iteration
+  vector conflicts with fixed numerical storage, while final error, gradient,
+  accepted-update count, and last linear attempt remain explicit diagnostics.
 
 ## [0.3.0] - 2026-08-30
 

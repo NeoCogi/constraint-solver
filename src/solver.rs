@@ -26,8 +26,8 @@ SOFTWARE.
 //! results, and structured failure diagnostics.
 
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
-use crate::jacobian::Jacobian;
-use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
+use crate::jacobian::{Jacobian, JacobianWorkspace};
+use crate::matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError};
 use crate::scaled::{ScaledSum, product_ratio};
 use std::collections::HashMap;
 use std::fmt;
@@ -91,16 +91,6 @@ struct DirectionalDerivativeContext<'a> {
     gradient: ResidualGradientMeasure,
 }
 
-/// Metadata for a candidate that satisfied the solver's acceptance policy.
-///
-/// Candidate variables and residuals remain in the mutable buffers supplied to
-/// [`NewtonRaphsonSolver::line_search`]. Keeping only scalar metadata here makes
-/// acceptance explicit without allocating or copying a second owned state.
-struct AcceptedStep {
-    /// Scaled residual norm evaluated at the accepted candidate variables.
-    residual_norm: f64,
-}
-
 /// Counts why candidates were rejected during one exhausted line search.
 ///
 /// The categories stay private implementation detail because callers already
@@ -141,8 +131,6 @@ struct ResidualGradientMeasure {
 /// Internal correction vector paired with the public diagnostic that describes
 /// how its linearized system was solved.
 struct LinearSolveResult {
-    /// Minimum-norm Newton correction produced by the solve.
-    solution: Matrix,
     /// Factorization and regularization details for caller-facing results.
     diagnostic: LinearSolveDiagnostic,
 }
@@ -273,9 +261,47 @@ pub struct Solution {
     /// therefore required no linearized solve. A failed factorization returns a
     /// [`SolverError`] and cannot produce `Solution`.
     pub last_linear_attempt: Option<LinearSolveDiagnostic>,
-    /// Scaled residual norms for the initial point and each accepted update
-    /// through the returned point.
-    pub convergence_history: Vec<f64>,
+}
+
+/// Caller-owned numerical storage reusable across solves of one system shape.
+///
+/// Create a workspace with [`NewtonRaphsonSolver::workspace`] after configuring
+/// the solver, then pass it to every [`NewtonRaphsonSolver::solve`] call. The
+/// solver overwrites these private buffers but never resizes or replaces them.
+/// Use a separate workspace for each concurrently executing solve.
+pub struct SolverWorkspace {
+    /// Residual-equation count this workspace accepts.
+    equation_count: usize,
+    /// Solved-variable count this workspace accepts.
+    variable_count: usize,
+    /// Linear-system row count, including ridge rows when configured.
+    linear_row_count: usize,
+    /// Accepted internal variable values keyed by compact compiled IDs.
+    vars: HashMap<VarId, f64>,
+    /// Transaction buffer for line-search candidate variable values.
+    candidate_vars: HashMap<VarId, f64>,
+    /// Reusable evaluated symbolic Jacobian storage.
+    jacobian: JacobianWorkspace,
+    /// Raw residuals at the current accepted point.
+    residuals: Matrix,
+    /// Equation-scaled residuals at the current accepted point.
+    scaled_residuals: Matrix,
+    /// Negated scaled residual right-hand side for the Newton correction.
+    correction_rhs: Matrix,
+    /// Equation- and variable-scaled Jacobian at the accepted point.
+    scaled_jacobian: Matrix,
+    /// Minimum-norm normalized correction produced by the linear solve.
+    correction: Matrix,
+    /// Raw residuals at the current line-search candidate.
+    candidate_residuals: Matrix,
+    /// Equation-scaled residuals at the current line-search candidate.
+    candidate_scaled_residuals: Matrix,
+    /// Augmented ridge coefficient matrix, present only for regularized policy.
+    augmented_jacobian: Option<Matrix>,
+    /// Augmented ridge right-hand side, present only for regularized policy.
+    augmented_rhs: Option<Matrix>,
+    /// Reusable Jacobi-SVD factorization and projection storage.
+    least_squares: LeastSquaresWorkspace,
 }
 
 /// Metadata connecting one compiled residual equation to its source constraint.
@@ -427,6 +453,73 @@ impl From<EvaluationError> for SolverError {
         SolverError::InvalidInput(format!(
             "Internal compiled-system invariant failed: {value}"
         ))
+    }
+}
+
+impl SolverWorkspace {
+    /// Allocate every mutable numerical buffer required by one configured solver.
+    ///
+    /// This constructor stays behind [`NewtonRaphsonSolver::workspace`] so the
+    /// workspace always reflects equation count, selected variables, and the
+    /// configured direct-versus-ridge linear problem.
+    #[track_caller]
+    fn new(solver: &NewtonRaphsonSolver) -> Self {
+        let equation_count = solver.jacobian.equation_count();
+        let variable_count = solver.variables.len();
+        let regularized = solver.options.regularization > 0.0;
+        let linear_row_count = if regularized {
+            equation_count
+                .checked_add(variable_count)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "regularized least-squares row count overflows usize: {equation_count} + {variable_count}"
+                    )
+                })
+        } else {
+            equation_count
+        };
+
+        // All matrices are constructed at their final shape. Option-wrapped
+        // augmented buffers avoid paying ridge storage when direct SVD is the
+        // configured policy, while still keeping the selected hot path fixed.
+        Self {
+            equation_count,
+            variable_count,
+            linear_row_count,
+            vars: HashMap::with_capacity(solver.var_table.len()),
+            candidate_vars: HashMap::with_capacity(solver.var_table.len()),
+            jacobian: solver.jacobian.workspace(),
+            residuals: Matrix::new(equation_count, 1),
+            scaled_residuals: Matrix::new(equation_count, 1),
+            correction_rhs: Matrix::new(equation_count, 1),
+            scaled_jacobian: Matrix::new(equation_count, variable_count),
+            correction: Matrix::new(variable_count, 1),
+            candidate_residuals: Matrix::new(equation_count, 1),
+            candidate_scaled_residuals: Matrix::new(equation_count, 1),
+            augmented_jacobian: regularized.then(|| Matrix::new(linear_row_count, variable_count)),
+            augmented_rhs: regularized.then(|| Matrix::new(linear_row_count, 1)),
+            least_squares: LeastSquaresWorkspace::new(linear_row_count, variable_count),
+        }
+    }
+
+    /// Return whether this workspace matches a solver's immutable numerical shape.
+    fn is_compatible_with(&self, solver: &NewtonRaphsonSolver) -> bool {
+        let equation_count = solver.jacobian.equation_count();
+        let variable_count = solver.variables.len();
+        let linear_row_count = if solver.options.regularization > 0.0 {
+            equation_count.checked_add(variable_count)
+        } else {
+            Some(equation_count)
+        };
+
+        // Option presence is implied by the linear row count but checked
+        // explicitly so a future workspace field change cannot weaken the
+        // direct-versus-ridge invariant.
+        self.equation_count == equation_count
+            && self.variable_count == variable_count
+            && Some(self.linear_row_count) == linear_row_count
+            && self.augmented_jacobian.is_some() == (solver.options.regularization > 0.0)
+            && self.augmented_rhs.is_some() == (solver.options.regularization > 0.0)
     }
 }
 
@@ -689,13 +782,52 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Solve the system using Newton corrections accepted by Armijo backtracking.
-    pub fn solve(&self, initial_guess: HashMap<String, f64>) -> Result<Solution, SolverError> {
+    /// Allocate reusable numerical storage for this configured solver.
+    ///
+    /// Construct one workspace after applying all solver builders and reuse it
+    /// across sequential solves. Concurrent solves require distinct workspaces
+    /// because each invocation mutates its accepted and candidate buffers.
+    #[track_caller]
+    pub fn workspace(&self) -> SolverWorkspace {
+        SolverWorkspace::new(self)
+    }
+
+    /// Solve using caller-owned numerical storage and Armijo backtracking.
+    ///
+    /// The numerical iteration and factorization allocate nothing. The returned
+    /// owned [`Solution`] or a terminal [`SolverError`] may allocate its public
+    /// name-keyed values and diagnostic text after iteration terminates.
+    pub fn solve(
+        &self,
+        initial_guess: HashMap<String, f64>,
+        workspace: &mut SolverWorkspace,
+    ) -> Result<Solution, SolverError> {
         // Reject invalid reusable settings before translating or validating the
         // caller's variable map.
         self.validate_configuration()?;
-        let vars = self.map_initial_guess(initial_guess)?;
-        self.solve_internal(vars)
+        if !workspace.is_compatible_with(self) {
+            return Err(SolverError::InvalidInput(
+                "solver workspace does not match equation, variable, or regularization shape"
+                    .to_string(),
+            ));
+        }
+        self.map_initial_guess_into(initial_guess, &mut workspace.vars)?;
+        workspace.candidate_vars.clone_from(&workspace.vars);
+        self.solve_internal(workspace)
+    }
+
+    /// Allocate one temporary workspace for tests focused on numerical policy.
+    ///
+    /// Production examples and allocation regressions exercise the explicit
+    /// reusable API. This helper keeps unrelated unit fixtures concise without
+    /// adding an allocating convenience method to the public solver contract.
+    #[cfg(test)]
+    pub(crate) fn solve_once(
+        &self,
+        initial_guess: HashMap<String, f64>,
+    ) -> Result<Solution, SolverError> {
+        let mut workspace = self.workspace();
+        self.solve(initial_guess, &mut workspace)
     }
 
     /// Run the solver's single accepted-state Newton iteration.
@@ -709,69 +841,64 @@ impl NewtonRaphsonSolver {
     ///    it once with the caller's exact ridge strength when requested
     /// 4. Backtrack transactionally until Armijo sufficient decrease holds
     /// 5. Commit the already-evaluated candidate as the next accepted state
-    fn solve_internal(&self, initial_guess: HashMap<VarId, f64>) -> Result<Solution, SolverError> {
-        // The public entry point has validated both the selected policy and this
-        // owned internal map, so move it directly into mutable solver state.
-        let mut vars = initial_guess;
-        // Borrow the construction-time symbolic cache and allocate only the
-        // mutable numerical derivative storage owned by this solve invocation.
+    fn solve_internal(&self, workspace: &mut SolverWorkspace) -> Result<Solution, SolverError> {
+        // Borrow the construction-time symbolic cache and every caller-owned
+        // numerical buffer for the duration of this solve.
         let jacobian = &self.jacobian;
-        let mut jacobian_workspace = jacobian.workspace();
-        // Grow history with actual progress instead of reserving the caller's
-        // entire theoretical update budget. A very large valid budget must not
-        // panic before an already-solved initial point can be inspected.
-        let mut convergence_history = Vec::new();
         // Retain the most recent successful linear solve attempt independently
         // from line-search acceptance. This is attempt provenance, while `iter`
-        // and convergence history continue to count accepted state changes.
+        // continues to count only accepted state changes.
         let mut last_linear_attempt: Option<LinearSolveDiagnostic> = None;
 
-        let num_equations = jacobian.equation_count();
-        let mut f_vals = Matrix::new(num_equations, 1);
-        let mut scaled_f_vals = Matrix::new(num_equations, 1);
-        let mut f_neg = Matrix::new(num_equations, 1);
-        let mut scaled_jacobian = Matrix::new(num_equations, self.variables.len());
+        let num_equations = workspace.equation_count;
+        let SolverWorkspace {
+            vars,
+            candidate_vars,
+            jacobian: jacobian_workspace,
+            residuals: f_vals,
+            scaled_residuals: scaled_f_vals,
+            correction_rhs: f_neg,
+            scaled_jacobian,
+            correction: delta,
+            candidate_residuals: candidate_f_vals,
+            candidate_scaled_residuals: candidate_scaled_f_vals,
+            augmented_jacobian,
+            augmented_rhs,
+            least_squares,
+            ..
+        } = workspace;
         // Populate the complete initial accepted state once. Subsequent
         // residuals arrive from successful line-search candidates, while each
         // newly accepted point receives exactly one Jacobian evaluation.
-        jacobian.evaluate_functions_checked_into(&vars, &mut f_vals)?;
-        jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
-        self.scale_residuals_into(&f_vals, &mut scaled_f_vals);
-        self.scale_jacobian_into(jacobian_workspace.jacobian(), &mut scaled_jacobian);
-
-        // Candidate buffers are separate from accepted state until Armijo
-        // succeeds. Swapping them on acceptance avoids both rollback logic and
-        // reevaluation of an already-tested residual vector.
-        let mut candidate_vars = vars.clone();
-        let mut candidate_f_vals = Matrix::new(num_equations, 1);
-        let mut candidate_scaled_f_vals = Matrix::new(num_equations, 1);
+        jacobian.evaluate_functions_checked_into(vars, f_vals)?;
+        jacobian.evaluate_checked_in_workspace(vars, jacobian_workspace)?;
+        self.scale_residuals_into(f_vals, scaled_f_vals);
+        self.scale_jacobian_into(jacobian_workspace.jacobian(), scaled_jacobian);
 
         if !f_vals.all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Residual evaluation produced NaN or infinity",
                 0,
-                &vars,
-                &f_vals,
+                vars,
+                f_vals,
             ));
         }
         if !jacobian_workspace.jacobian().all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Jacobian evaluation produced NaN or infinity",
                 0,
-                &vars,
-                &f_vals,
+                vars,
+                f_vals,
             ));
         }
         if !scaled_f_vals.all_finite() || !scaled_jacobian.all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Equation or variable scaling produced NaN or infinity",
                 0,
-                &vars,
-                &f_vals,
+                vars,
+                f_vals,
             ));
         }
-        convergence_history.push(scaled_f_vals.norm());
-
         // The current state is always fully evaluated at loop entry. A mutable
         // accepted-update count lets the budget-exhausted state receive the same
         // root and stationarity checks without a special final evaluation path.
@@ -787,27 +914,20 @@ impl NewtonRaphsonSolver {
                 // The Jacobian workspace already corresponds to `vars`, so the
                 // reported gradient norm is evaluated at the same point as the
                 // residual and returned values.
-                let gradient = Self::residual_gradient_measure(&scaled_jacobian, &scaled_f_vals);
-                return Ok(self.build_solution(
-                    &vars,
-                    iter,
-                    error,
-                    gradient,
-                    last_linear_attempt,
-                    convergence_history,
-                ));
+                let gradient = Self::residual_gradient_measure(scaled_jacobian, scaled_f_vals);
+                return Ok(self.build_solution(vars, iter, error, gradient, last_linear_attempt));
             }
 
             // Every system shape can reach a first-order fixed point that is not
             // a root, particularly after rank truncation or regularization.
             // Detect it before another identical linear solve or backtracking
             // attempt and return a non-success result at the stationary state.
-            let gradient = Self::residual_gradient_measure(&scaled_jacobian, &scaled_f_vals);
+            let gradient = Self::residual_gradient_measure(scaled_jacobian, scaled_f_vals);
             if gradient.is_stationary(self.options.stationarity_tolerance) {
                 return Err(self.stationary_non_root_error(
                     iter,
-                    &vars,
-                    &f_vals,
+                    vars,
+                    f_vals,
                     gradient,
                     last_linear_attempt,
                 ));
@@ -823,8 +943,8 @@ impl NewtonRaphsonSolver {
                         self.options.max_iterations, error
                     ),
                     iter,
-                    &vars,
-                    &f_vals,
+                    vars,
+                    f_vals,
                     Some(gradient),
                     last_linear_attempt,
                 );
@@ -841,27 +961,33 @@ impl NewtonRaphsonSolver {
             // current null-space component without introducing a second point
             // objective into nonlinear root finding.
             let linear_solve = self
-                .solve_least_squares_system(&scaled_jacobian, &f_neg)
+                .solve_least_squares_system(
+                    scaled_jacobian,
+                    f_neg,
+                    delta,
+                    augmented_jacobian,
+                    augmented_rhs,
+                    least_squares,
+                )
                 .map_err(|source| {
                     self.matrix_error(
                         source,
                         iter,
-                        &vars,
-                        &f_vals,
+                        vars,
+                        f_vals,
                         gradient,
                         last_linear_attempt.clone(),
                     )
                 })?;
             last_linear_attempt = Some(linear_solve.diagnostic.clone());
-            let delta = linear_solve.solution;
 
             if !delta.all_finite() {
                 return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Linear solve produced a non-finite Newton correction",
                         iter,
-                        &vars,
-                        &f_vals,
+                        vars,
+                        f_vals,
                     ),
                     last_linear_attempt,
                 ));
@@ -872,67 +998,64 @@ impl NewtonRaphsonSolver {
             // require rollback or consume an update count.
             let residual_norm_directional_derivative = self
                 .residual_norm_directional_derivative(DirectionalDerivativeContext {
-                    jacobian: &scaled_jacobian,
-                    scaled_residuals: &scaled_f_vals,
-                    direction: &delta,
-                    vars: &vars,
-                    diagnostic_residuals: &f_vals,
+                    jacobian: scaled_jacobian,
+                    scaled_residuals: scaled_f_vals,
+                    direction: delta,
+                    vars,
+                    diagnostic_residuals: f_vals,
                     accepted_updates: iter,
                     gradient,
                 })
                 .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
-            let accepted_step = self
-                .line_search(LineSearchContext {
-                    jacobian,
-                    vars: &vars,
-                    candidate_vars: &mut candidate_vars,
-                    delta: &delta,
-                    current_residual_norm: error,
-                    residual_norm_directional_derivative,
-                    accepted_updates: iter,
-                    current_residuals: &f_vals,
-                    gradient,
-                    candidate_residuals: &mut candidate_f_vals,
-                    candidate_scaled_residuals: &mut candidate_scaled_f_vals,
-                })
-                .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
+            self.line_search(LineSearchContext {
+                jacobian,
+                vars,
+                candidate_vars,
+                delta,
+                current_residual_norm: error,
+                residual_norm_directional_derivative,
+                accepted_updates: iter,
+                current_residuals: f_vals,
+                gradient,
+                candidate_residuals: candidate_f_vals,
+                candidate_scaled_residuals: candidate_scaled_f_vals,
+            })
+            .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
 
             // The candidate residual has already passed finite and Armijo
             // checks. Swap both buffers together so variables and residuals
             // become one atomic accepted state without evaluating f(x) again.
-            std::mem::swap(&mut vars, &mut candidate_vars);
-            std::mem::swap(&mut f_vals, &mut candidate_f_vals);
-            std::mem::swap(&mut scaled_f_vals, &mut candidate_scaled_f_vals);
+            std::mem::swap(vars, candidate_vars);
+            std::mem::swap(f_vals, candidate_f_vals);
+            std::mem::swap(scaled_f_vals, candidate_scaled_f_vals);
 
             // Only the Jacobian was not needed by candidate acceptance. Evaluate
             // it once for the newly committed state and retain it through the
             // next iteration's convergence and correction calculations.
-            jacobian.evaluate_checked_in_workspace(&vars, &mut jacobian_workspace)?;
+            jacobian.evaluate_checked_in_workspace(vars, jacobian_workspace)?;
             if !jacobian_workspace.jacobian().all_finite() {
                 return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Accepted Newton update produced a non-finite Jacobian",
                         iter + 1,
-                        &vars,
-                        &f_vals,
+                        vars,
+                        f_vals,
                     ),
                     last_linear_attempt,
                 ));
             }
-            self.scale_jacobian_into(jacobian_workspace.jacobian(), &mut scaled_jacobian);
+            self.scale_jacobian_into(jacobian_workspace.jacobian(), scaled_jacobian);
             if !scaled_jacobian.all_finite() {
                 return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
                         "Variable or equation scaling produced a non-finite Jacobian",
                         iter + 1,
-                        &vars,
-                        &f_vals,
+                        vars,
+                        f_vals,
                     ),
                     last_linear_attempt,
                 ));
             }
-            let updated_error = accepted_step.residual_norm;
-            convergence_history.push(updated_error);
             iter += 1;
 
             // Root and stationarity checks occur once at the next loop entry,
@@ -951,36 +1074,43 @@ impl NewtonRaphsonSolver {
         &self,
         j_matrix: &Matrix,
         rhs: &Matrix,
+        solution: &mut Matrix,
+        augmented_jacobian: &mut Option<Matrix>,
+        augmented_rhs: &mut Option<Matrix>,
+        workspace: &mut LeastSquaresWorkspace,
     ) -> Result<LinearSolveResult, MatrixError> {
         if self.options.regularization == 0.0 {
             // The direct SVD path returns the minimum-norm correction for every
             // rank. Conditioning remains diagnostic data; it never silently
             // changes the equation being solved.
-            let result = j_matrix.solve_least_squares(rhs)?;
+            let info = j_matrix.solve_least_squares_into(rhs, solution, workspace)?;
             return Ok(LinearSolveResult {
-                solution: result.solution,
                 diagnostic: LinearSolveDiagnostic {
-                    effective: result.info,
+                    effective: info,
                     regularization: None,
                 },
             });
         }
 
-        // Ridge regularization is an explicit alternate linear problem. Build
-        // its storage only when the caller selected it; exact roots and default
-        // unregularized solves never allocate an augmented matrix.
-        let augmented_rows = j_matrix
-            .rows()
-            .checked_add(j_matrix.cols())
-            .unwrap_or_else(|| {
-                panic!(
-                    "regularized least-squares row count overflows usize: {} + {}",
-                    j_matrix.rows(),
-                    j_matrix.cols()
-                )
-            });
-        let mut augmented_j = Matrix::new(augmented_rows, j_matrix.cols());
-        let mut augmented_b = Matrix::new(augmented_rows, 1);
+        // Ridge regularization is an explicit alternate linear problem. Its
+        // buffers were allocated with the solver workspace and are guaranteed
+        // present by compatibility validation at the public solve boundary.
+        let augmented_j = augmented_jacobian
+            .as_mut()
+            .expect("regularized workspace must contain an augmented Jacobian");
+        let augmented_b = augmented_rhs
+            .as_mut()
+            .expect("regularized workspace must contain an augmented right-hand side");
+
+        // Reset complete reused buffers because a prior factorization consumed
+        // their previous contents and the lower ridge block contains structural
+        // zeros as well as its diagonal.
+        for row in 0..augmented_j.rows() {
+            for column in 0..augmented_j.cols() {
+                augmented_j[(row, column)] = 0.0;
+            }
+            augmented_b[(row, 0)] = 0.0;
+        }
 
         // Copy the nonlinear linearization into the upper block. Fresh
         // zero-filled matrices already contain the lower off-diagonal and
@@ -999,23 +1129,28 @@ impl NewtonRaphsonSolver {
             augmented_j[(j_matrix.rows() + variable, variable)] = sqrt_regularization;
         }
 
-        let result = augmented_j.solve_least_squares(&augmented_b)?;
+        let info = augmented_j.solve_least_squares_into(augmented_b, solution, workspace)?;
         Ok(LinearSolveResult {
-            solution: result.solution,
             diagnostic: LinearSolveDiagnostic {
-                effective: result.info,
+                effective: info,
                 regularization: Some(self.options.regularization),
             },
         })
     }
 
-    fn map_initial_guess(
+    /// Translate a public name-keyed initial guess into reusable compact storage.
+    ///
+    /// The destination map was preallocated by [`SolverWorkspace`]. Valid input
+    /// therefore clears and refills existing buckets without allocating; error
+    /// paths may allocate sorted name lists for caller-facing diagnostics.
+    fn map_initial_guess_into(
         &self,
         initial_guess: HashMap<String, f64>,
-    ) -> Result<HashMap<VarId, f64>, SolverError> {
+        vars: &mut HashMap<VarId, f64>,
+    ) -> Result<(), SolverError> {
         let mut unknown = Vec::new();
         let mut non_finite = Vec::new();
-        let mut vars = HashMap::new();
+        vars.clear();
 
         for (name, value) in initial_guess {
             if let Some(id) = self.var_table.get_id(&name) {
@@ -1047,8 +1182,8 @@ impl NewtonRaphsonSolver {
             )));
         }
 
-        self.validate_initial_guess(&vars)?;
-        Ok(vars)
+        self.validate_initial_guess(vars)?;
+        Ok(())
     }
 
     /// Convert one option predicate into the solver's consistent configuration
@@ -1253,7 +1388,6 @@ impl NewtonRaphsonSolver {
         error: f64,
         gradient: ResidualGradientMeasure,
         last_linear_attempt: Option<LinearSolveDiagnostic>,
-        convergence_history: Vec<f64>,
     ) -> Solution {
         // Convert internal IDs only after all numerical convergence checks have
         // succeeded, keeping the hot iteration path in its compact ID form.
@@ -1264,7 +1398,6 @@ impl NewtonRaphsonSolver {
             gradient_norm: gradient.absolute_norm,
             relative_gradient_norm: gradient.relative_norm,
             last_linear_attempt,
-            convergence_history,
         }
     }
 
@@ -1603,12 +1736,11 @@ impl NewtonRaphsonSolver {
     /// * `candidate_residuals` - Reusable storage for each trial point
     /// * `candidate_scaled_residuals` - Reusable normalized candidate residuals
     ///
-    /// # Returns
-    /// Metadata for an accepted candidate whose variables and residuals remain
-    /// in the supplied transaction buffers. If no tested step is acceptable,
-    /// the method returns `NoConvergence`; it never substitutes an untested or
+    /// On success, the accepted candidate variables and residuals remain in the
+    /// supplied transaction buffers. If no tested step is acceptable, the
+    /// method returns `NoConvergence`; it never substitutes an untested or
     /// previously rejected fallback step.
-    fn line_search(&self, context: LineSearchContext<'_>) -> Result<AcceptedStep, SolverError> {
+    fn line_search(&self, context: LineSearchContext<'_>) -> Result<(), SolverError> {
         // Give the context fields concise numerical names for the candidate loop
         // while preserving their documented grouping at the call boundary.
         let LineSearchContext {
@@ -1704,9 +1836,7 @@ impl NewtonRaphsonSolver {
                     // so record the cause and continue backtracking.
                     rejections.non_finite_residuals += 1;
                 } else if new_error <= required_error {
-                    return Ok(AcceptedStep {
-                        residual_norm: new_error,
-                    });
+                    return Ok(());
                 } else {
                     // Preserve the final finite norm to show how close the last
                     // admissible trial came to improving the accepted state.
@@ -1919,7 +2049,7 @@ mod tests {
         let initial = HashMap::from([("x".to_string(), 0.0)]);
 
         let solver_error = solver
-            .solve(initial)
+            .solve_once(initial)
             .expect_err("the required correction lies outside the f64 range");
         let expected_source = MatrixError::NonFiniteResult {
             operation: "solve_least_squares",
@@ -1976,7 +2106,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("the finite extreme-scale pseudoinverse root must solve");
             for variable in ["x", "y"] {
                 let relative_error = (solution.values[variable] / -5e-309 - 1.0).abs();
@@ -2009,7 +2139,7 @@ mod tests {
             initial.insert("x".to_string(), 0.5);
             initial.insert("y".to_string(), 0.866);
 
-            let solution = solver.solve(initial).expect("Failed to solve system");
+            let solution = solver.solve_once(initial).expect("Failed to solve system");
             if is_serial {
                 serial_solution = Some(solution.clone());
             } else {
@@ -2025,8 +2155,7 @@ mod tests {
         }
     }
 
-    /// Exercise one solver across multiple runs so its cached symbolic
-    /// derivatives are shared while each run retains independent numeric state.
+    /// Reuse every caller-owned numerical buffer across distinct solve calls.
     #[test]
     fn test_reused_solver_handles_distinct_initial_guesses() {
         for mode in test_modes() {
@@ -2039,17 +2168,78 @@ mod tests {
                 .with_residual_tolerance(1e-12)
                 .with_max_iterations(20);
 
-            // Both calls borrow the same construction-time symbolic Jacobian
-            // but allocate their own residual and derivative matrices.
+            let mut workspace = solver.workspace();
+            let mut matrix_addresses = [
+                workspace.residuals.storage_address() as usize,
+                workspace.scaled_residuals.storage_address() as usize,
+                workspace.correction_rhs.storage_address() as usize,
+                workspace.scaled_jacobian.storage_address() as usize,
+                workspace.correction.storage_address() as usize,
+                workspace.candidate_residuals.storage_address() as usize,
+                workspace.candidate_scaled_residuals.storage_address() as usize,
+                workspace.jacobian.jacobian().storage_address() as usize,
+            ];
+            matrix_addresses.sort_unstable();
+            let map_capacities = (
+                workspace.vars.capacity(),
+                workspace.candidate_vars.capacity(),
+            );
+
+            // Both calls overwrite the same construction-time workspace. Owned
+            // result maps are created only after each numerical run terminates.
             let positive_solution = solver
-                .solve(HashMap::from([("x".to_string(), 3.0)]))
+                .solve(HashMap::from([("x".to_string(), 3.0)]), &mut workspace)
                 .expect("positive initial guess should converge");
             let negative_solution = solver
-                .solve(HashMap::from([("x".to_string(), -3.0)]))
+                .solve(HashMap::from([("x".to_string(), -3.0)]), &mut workspace)
                 .expect("negative initial guess should converge");
 
             assert!((positive_solution.values["x"] - 2.0).abs() < 1e-10);
             assert!((negative_solution.values["x"] + 2.0).abs() < 1e-10);
+            let mut reused_addresses = [
+                workspace.residuals.storage_address() as usize,
+                workspace.scaled_residuals.storage_address() as usize,
+                workspace.correction_rhs.storage_address() as usize,
+                workspace.scaled_jacobian.storage_address() as usize,
+                workspace.correction.storage_address() as usize,
+                workspace.candidate_residuals.storage_address() as usize,
+                workspace.candidate_scaled_residuals.storage_address() as usize,
+                workspace.jacobian.jacobian().storage_address() as usize,
+            ];
+            reused_addresses.sort_unstable();
+            assert_eq!(matrix_addresses, reused_addresses);
+            assert_eq!(
+                map_capacities,
+                (
+                    workspace.vars.capacity(),
+                    workspace.candidate_vars.capacity()
+                )
+            );
+        }
+    }
+
+    /// Reject a workspace whose linear-system shape no longer matches solver
+    /// configuration before either object mutates numerical state.
+    #[test]
+    fn test_solver_rejects_workspace_from_incompatible_configuration() {
+        let compiled = Compiler::compile(&[Exp::var("x")]).unwrap();
+        let direct_solver = NewtonRaphsonSolver::new(compiled);
+        let mut direct_workspace = direct_solver.workspace();
+
+        let compiled = Compiler::compile(&[Exp::var("x")]).unwrap();
+        let regularized_solver = NewtonRaphsonSolver::new(compiled).with_regularization(1e-8);
+        let error = regularized_solver
+            .solve(
+                HashMap::from([("x".to_string(), 0.0)]),
+                &mut direct_workspace,
+            )
+            .expect_err("ridge policy requires a ridge-shaped workspace");
+
+        match error {
+            SolverError::InvalidInput(message) => {
+                assert!(message.contains("workspace does not match"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
     }
 
@@ -2065,17 +2255,19 @@ mod tests {
                 .with_max_iterations(20);
             let initial_values = [3.0, -3.0, 5.0, -5.0];
 
-            // Scoped threads borrow the same solver by shared reference. Each
-            // invocation owns its variables, residuals, Jacobian workspace, and
-            // convergence history, including when all calls install work into
-            // the same dedicated Rayon pool.
+            // Scoped threads borrow the same immutable symbolic solver while
+            // each thread owns a distinct mutable numerical workspace.
             std::thread::scope(|scope| {
                 let handles: Vec<_> = initial_values
                     .into_iter()
                     .map(|initial_value| {
                         let solver = &solver;
                         scope.spawn(move || {
-                            solver.solve(HashMap::from([("x".to_string(), initial_value)]))
+                            let mut workspace = solver.workspace();
+                            solver.solve(
+                                HashMap::from([("x".to_string(), initial_value)]),
+                                &mut workspace,
+                            )
                         })
                     })
                     .collect();
@@ -2118,7 +2310,7 @@ mod tests {
             initial.insert("y".to_string(), 0.25);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("Failed to solve transcendental system");
 
             if is_serial {
@@ -2151,7 +2343,7 @@ mod tests {
             initial.insert("x".to_string(), 1.0);
 
             let err = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("expected missing variable error");
             if is_serial {
                 serial_error = Some(err.clone());
@@ -2183,7 +2375,7 @@ mod tests {
             initial.insert("x".to_string(), 0.0);
 
             let err = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("expected invalid input due to missing y");
             if is_serial {
                 serial_error = Some(err.clone());
@@ -2283,7 +2475,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("invalid active configuration must be rejected");
             match error {
                 SolverError::InvalidInput(message) => {
@@ -2372,7 +2564,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), invalid_value)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("non-finite initial values must be rejected");
             match error {
                 SolverError::InvalidInput(message) => {
@@ -2406,7 +2598,7 @@ mod tests {
                 |options| options.line_search_max_trials = 1,
             );
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("an overflowing line-search candidate must be rejected");
             match error {
                 SolverError::NoConvergence(diagnostic) => {
@@ -2443,7 +2635,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), -1.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("ln of a negative value is outside the real domain");
             match error {
                 SolverError::NonFiniteEvaluation(diagnostic) => {
@@ -2468,7 +2660,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("non-finite derivative must be reported explicitly");
             match error {
                 SolverError::NonFiniteEvaluation(diagnostic) => {
@@ -2498,7 +2690,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial.clone())
+                .solve_once(initial.clone())
                 .expect_err("the written product has a non-finite derivative at zero");
             match error {
                 SolverError::NonFiniteEvaluation(diagnostic) => {
@@ -2513,7 +2705,7 @@ mod tests {
             // Newton iteration leave the domain boundary and certify the root.
             let boundary_safe = Exp::sub(Exp::add(Exp::power(x.clone(), 1.5), x), Exp::val(1.0));
             let solution = solver_for_mode(vec![boundary_safe], mode)
-                .solve(initial)
+                .solve_once(initial)
                 .expect("the rewritten expression has a finite boundary derivative");
             assert!(solution.error < 1e-10);
         }
@@ -2584,14 +2776,21 @@ mod tests {
         )
         .with_equation_traces(vec![Some(trace.clone()), None])
         .expect("trace cardinality matches equation cardinality");
-        let vars = solver
-            .map_initial_guess(HashMap::from([("x".to_string(), 0.0)]))
+        let mut workspace = solver.workspace();
+        solver
+            .map_initial_guess_into(HashMap::from([("x".to_string(), 0.0)]), &mut workspace.vars)
             .expect("initial guess should map to the compiled variable");
         let residuals = Matrix::from_vec(vec![-1.0, -2.0], 2, 1)
             .expect("residual vector shape should be valid");
 
-        let diagnostic =
-            solver.build_diagnostic("test failure".to_string(), 0, &vars, &residuals, None, None);
+        let diagnostic = solver.build_diagnostic(
+            "test failure".to_string(),
+            0,
+            &workspace.vars,
+            &residuals,
+            None,
+            None,
+        );
 
         assert_eq!(diagnostic.equations.len(), 2);
         assert_eq!(
@@ -2629,7 +2828,7 @@ mod tests {
             initial.insert("a".to_string(), 2.0);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("solver should converge when fixed variables are provided");
             if is_serial {
                 serial_solution = Some(solution.clone());
@@ -2660,7 +2859,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("deep backtracking should recover a finite step");
 
             if is_serial {
@@ -2690,7 +2889,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), -20.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("one rejected candidate must exhaust the configured search");
 
             match error {
@@ -2740,7 +2939,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("the finite full step must fail Armijo decrease");
             match error {
                 SolverError::NoConvergence(diagnostic) => {
@@ -2779,7 +2978,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("scale-safe residual-norm slope should permit the Newton step");
 
             assert_eq!(solution.values["x"], 1.0);
@@ -2800,7 +2999,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("a constant residual is stationary but not a root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -2829,7 +3028,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("one half-step cannot yet reach the root");
             match error {
                 SolverError::NoConvergence(diagnostic) => {
@@ -2860,7 +3059,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("capped linear updates should eventually reach the root");
 
             assert!(solution.error < 1e-10);
@@ -2880,14 +3079,13 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("scaled linear root should solve");
 
             let returned_residual = 1e20 * solution.values["x"] + 1.0;
             assert_eq!(solution.iterations, 1);
             assert_eq!(solution.error, returned_residual.abs());
             assert_eq!(solution.error, 0.0);
-            assert_eq!(solution.convergence_history.last(), Some(&0.0));
         }
     }
 
@@ -2907,7 +3105,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("stationary least-squares state is not a constraint root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -2957,7 +3155,7 @@ mod tests {
                 ("underdetermined", wide_equations, wide_initial),
             ] {
                 let error = solver_for_mode(equations, mode.clone())
-                    .solve(initial)
+                    .solve_once(initial)
                     .expect_err("a stationary non-root must never be successful");
                 let diagnostic = expect_stationary_non_root(error);
 
@@ -2987,7 +3185,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("normalized stationary non-root should survive raw overflow");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -3015,7 +3213,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("the non-zero residual is stationary at the initial point");
             let diagnostic = expect_stationary_non_root(error);
             let gradient_norm = diagnostic
@@ -3049,7 +3247,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("a scaled consistent linear system should reach its root");
 
             assert_eq!(solution.iterations, 1);
@@ -3074,7 +3272,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("a zero-Jacobian local maximum must not be successful");
 
             let diagnostic = expect_stationary_non_root(error);
@@ -3107,7 +3305,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("Armijo should identify a stationary non-root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -3157,7 +3355,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.1)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("Armijo line search should reach a stationary non-root");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -3185,10 +3383,9 @@ mod tests {
             let solver = solver_for_mode(vec![equation], mode);
             let initial = HashMap::from([("x".to_string(), 1.0)]);
 
-            let solution = solver.solve(initial).expect("initial point is a root");
+            let solution = solver.solve_once(initial).expect("initial point is a root");
 
             assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.convergence_history, vec![0.0]);
             assert_eq!(solution.last_linear_attempt, None);
         }
     }
@@ -3206,7 +3403,7 @@ mod tests {
                 solver_for_mode(vec![x.clone()], mode.clone()).with_residual_tolerance(1.0);
             let initial = HashMap::from([("x".to_string(), 1.0)]);
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("a residual equal to tolerance must be successful");
 
             assert_eq!(solution.error, 1.0);
@@ -3222,7 +3419,7 @@ mod tests {
                 .with_max_iterations(1);
             let initial = HashMap::from([("x".to_string(), 2.0)]);
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("an accepted update on the tolerance boundary must succeed");
 
             assert_eq!(solution.values["x"], 1.0);
@@ -3232,9 +3429,9 @@ mod tests {
     }
 
     /// Ensure an intentionally unbounded-looking iteration budget does not
-    /// become an eager allocation request before convergence is evaluated.
+    /// affect fixed-shape workspace construction before convergence is checked.
     #[test]
-    fn test_large_iteration_budget_does_not_preallocate_history() {
+    fn test_large_iteration_budget_does_not_change_workspace_allocation() {
         for mode in test_modes() {
             // The initial point is an exact root, so only one history entry is
             // required regardless of the permitted maximum number of updates.
@@ -3244,11 +3441,10 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 1.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("an exact root must not reserve the full update budget");
 
             assert_eq!(solution.iterations, 0);
-            assert_eq!(solution.convergence_history, vec![0.0]);
         }
     }
 
@@ -3290,7 +3486,7 @@ mod tests {
             initial.insert("y".to_string(), 0.0);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("expected solver to converge with SVD least squares");
 
             if is_serial {
@@ -3328,7 +3524,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("a direction above factorization roundoff must be retained");
 
             assert_eq!(solution.iterations, 1);
@@ -3364,7 +3560,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("normalized variable coordinates should solve");
             let linear = solution
                 .last_linear_attempt
@@ -3419,7 +3615,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("the representable normalized derivative must reach the root");
 
             assert_eq!(solution.iterations, 1);
@@ -3448,7 +3644,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("the equally weighted equations are inconsistent");
             let diagnostic = expect_stationary_non_root(error);
 
@@ -3479,7 +3675,7 @@ mod tests {
 
             let exact_root = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 0.5)]);
             let solution = solver
-                .solve(exact_root)
+                .solve_once(exact_root)
                 .expect("an exact nonlinear root must remain unchanged");
             assert_eq!(solution.iterations, 0);
             assert_eq!(solution.values["x"], 2.0);
@@ -3489,7 +3685,7 @@ mod tests {
             // iteration must be a residual-reducing Newton correction.
             let initial = HashMap::from([("x".to_string(), 2.0), ("y".to_string(), 1.0)]);
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("a nonlinear wide system must execute Newton corrections");
             assert!(solution.iterations > 0);
             assert!((solution.values["x"] * solution.values["y"] - 1.0).abs() < 1e-12);
@@ -3510,7 +3706,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 10.0), ("y".to_string(), -10.0)]);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("linear constraint should solve");
 
             assert!((solution.values["x"] - 10.5).abs() < 1e-10);
@@ -3548,7 +3744,9 @@ mod tests {
             initial.insert("x".to_string(), 0.0);
             initial.insert("y".to_string(), 0.0);
 
-            let solution = solver.solve(initial).expect("expected solver to converge");
+            let solution = solver
+                .solve_once(initial)
+                .expect("expected solver to converge");
             if is_serial {
                 serial_solution = Some(solution.clone());
             } else {
@@ -3593,7 +3791,7 @@ mod tests {
             initial.insert("y".to_string(), 0.0);
 
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("the SVD pseudoinverse should solve without implicit regularization");
             if is_serial {
                 serial_solution = Some(solution.clone());
@@ -3631,7 +3829,7 @@ mod tests {
             // diagonal perturbation of the singular Jacobian.
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
             let solution = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect("the canonical SVD should solve dependent equations");
 
             // Both execution modes must select the same pseudoinverse solution
@@ -3675,7 +3873,7 @@ mod tests {
             let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
             let error = solver
-                .solve(initial)
+                .solve_once(initial)
                 .expect_err("one regularized update should not masquerade as an exact root");
 
             match error {
@@ -3700,8 +3898,7 @@ mod tests {
     fn test_regularization_uses_exact_configured_strength() {
         let x = Exp::var("x");
         let y = Exp::var("y");
-        let equation = Exp::add(x, y);
-        let solver = solver_for_mode(vec![equation], Mode::Serial).with_regularization(1e-8);
+        let solver = solver_for_mode(vec![x, y], Mode::Serial).with_regularization(1e-8);
 
         // The fixture is deliberately ill-conditioned, but conditioning no
         // longer selects or changes policy: positive regularization means the
@@ -3710,7 +3907,15 @@ mod tests {
             .expect("the fixture has a valid square shape");
         let rhs = Matrix::from_vec(vec![1.0, 1.0], 2, 1)
             .expect("the fixture has a valid right-hand-side shape");
-        let result = match solver.solve_least_squares_system(&jacobian, &rhs) {
+        let mut workspace = solver.workspace();
+        let result = match solver.solve_least_squares_system(
+            &jacobian,
+            &rhs,
+            &mut workspace.correction,
+            &mut workspace.augmented_jacobian,
+            &mut workspace.augmented_rhs,
+            &mut workspace.least_squares,
+        ) {
             Ok(result) => result,
             Err(_) => panic!("finite ridge systems must remain solvable"),
         };
@@ -3739,7 +3944,9 @@ mod tests {
             let mut initial = HashMap::new();
             initial.insert("x".to_string(), 0.0);
 
-            let solution = solver.solve(initial).expect("expected solver to converge");
+            let solution = solver
+                .solve_once(initial)
+                .expect("expected solver to converge");
             if is_serial {
                 serial_solution = Some(solution.clone());
             } else {
@@ -3790,7 +3997,7 @@ mod tests {
                     initial.insert(format!("x{i}"), 0.0);
                 }
 
-                let solution = solver.solve(initial).expect("expected to solve");
+                let solution = solver.solve_once(initial).expect("expected to solve");
                 if is_serial {
                     serial_solutions.push(solution.clone());
                 } else {
@@ -3848,7 +4055,7 @@ mod tests {
                     initial.insert(format!("x{i}"), 0.0);
                 }
 
-                let solution = solver.solve(initial).expect("expected to solve");
+                let solution = solver.solve_once(initial).expect("expected to solve");
                 if is_serial {
                     serial_solutions.push(solution.clone());
                 } else {
@@ -3889,7 +4096,7 @@ mod tests {
                     initial.insert(format!("x{i}"), 0.0);
                 }
 
-                let solution = solver.solve(initial).expect("expected to solve");
+                let solution = solver.solve_once(initial).expect("expected to solve");
                 if is_serial {
                     serial_solutions.push(solution.clone());
                 } else {

@@ -49,12 +49,13 @@ fn main() {
 
     let compiled = Compiler::compile(&[kvl, diode_eq]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new(compiled);
+    let mut workspace = solver.workspace();
 
     let mut initial = HashMap::new();
     initial.insert("i".to_string(), 0.005);
     initial.insert("vd".to_string(), 0.7);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let i_sol = solution.values.get("i").copied().unwrap();
     let vd_sol = solution.values.get("vd").copied().unwrap();
 

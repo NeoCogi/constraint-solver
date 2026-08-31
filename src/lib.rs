@@ -52,7 +52,8 @@ SOFTWARE.
 //! let solver = NewtonRaphsonSolver::new(compiled);
 //! let initial = HashMap::from([("x".to_string(), 0.0)]);
 //!
-//! let solution = solver.solve(initial)?;
+//! let mut workspace = solver.workspace();
+//! let solution = solver.solve(initial, &mut workspace)?;
 //! assert!(solution.error < 1e-10);
 //! assert!((solution.values["x"] - 2.0).abs() < 1e-10);
 //! # Ok(())
@@ -70,10 +71,10 @@ pub mod solver;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
-pub use matrix::{LeastSquaresInfo, LeastSquaresSolution, Matrix, MatrixError, MatrixOperand};
+pub use matrix::{LeastSquaresInfo, LeastSquaresWorkspace, Matrix, MatrixError, MatrixOperand};
 pub use solver::{
     EquationDiagnostic, EquationTrace, LinearSolveDiagnostic, NewtonRaphsonSolver, Solution,
-    SolverError, SolverOptions, SolverRunDiagnostic,
+    SolverError, SolverOptions, SolverRunDiagnostic, SolverWorkspace,
 };
 
 /// Documentation-only container that makes every Rust block in the repository

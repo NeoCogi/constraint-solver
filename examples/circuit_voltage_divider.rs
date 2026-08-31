@@ -47,6 +47,7 @@ fn main() {
 
     let compiled = Compiler::compile(&[eq1, eq2, eq3]).expect("compile failed");
     let solver = NewtonRaphsonSolver::new(compiled);
+    let mut workspace = solver.workspace();
 
     // Deliberately violate both Ohm's-law equations and KCL so this example
     // demonstrates the solver rather than merely validating an exact initial
@@ -56,7 +57,7 @@ fn main() {
     initial.insert("i1".to_string(), 0.005);
     initial.insert("i2".to_string(), 0.002);
 
-    let solution = solver.solve(initial).expect("solve failed");
+    let solution = solver.solve(initial, &mut workspace).expect("solve failed");
     let vout_sol = solution.values.get("vout").copied().unwrap();
     let i_sol = solution.values.get("i1").copied().unwrap();
 

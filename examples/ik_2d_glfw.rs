@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver};
+use constraint_solver::{Compiler, Exp, NewtonRaphsonSolver, SolverWorkspace};
 use glfw::{Action, Context, Key, WindowEvent};
 use glow::HasContext;
 use rs_math3d::Vec2d;
@@ -376,6 +376,8 @@ struct IkModel {
     target: Target,
     /// Compiled nonlinear solver reused across graphical frames.
     solver: NewtonRaphsonSolver,
+    /// Numerical buffers reused across graphical frames and headless tests.
+    workspace: SolverWorkspace,
 }
 
 impl IkModel {
@@ -414,10 +416,12 @@ impl IkModel {
         let solver = NewtonRaphsonSolver::new_with_variables(compiled, &solve_variable_refs)
             .expect("all selected IK variables belong to the compiled system");
 
+        let workspace = solver.workspace();
         Self {
             joints: [joint1, joint2, joint3, joint4],
             target,
             solver,
+            workspace,
         }
     }
 
@@ -426,7 +430,11 @@ impl IkModel {
     /// A successful result contains every joint coordinate. Solver failures and
     /// an impossible missing-coordinate invariant are both converted to the
     /// graphical example's existing displayable error channel.
-    fn solve_pose(&self, current: &IkState, target_position: &Vec2d) -> Result<IkState, String> {
+    fn solve_pose(
+        &mut self,
+        current: &IkState,
+        target_position: &Vec2d,
+    ) -> Result<IkState, String> {
         // Seed joint variables from the previous frame for continuity and add
         // the requested target as the two fixed parameters referenced by the
         // final constraints.
@@ -446,7 +454,7 @@ impl IkModel {
 
         let solution = self
             .solver
-            .solve(initial)
+            .solve(initial, &mut self.workspace)
             .map_err(|error| error.to_string())?;
         let missing_coordinate =
             || "successful IK solve omitted one or more compiled joint coordinates".to_string();
@@ -542,7 +550,7 @@ mod tests {
     /// every returned target and link-length geometry.
     #[test]
     fn ik_model_tracks_reachable_targets_from_graphical_startup_pose() {
-        let model = IkModel::new();
+        let mut model = IkModel::new();
 
         // Use the exact fully extended pose shown on graphical startup. Its
         // Jacobian is rank deficient, so this headless path must exercise the
@@ -630,7 +638,7 @@ fn main() {
 
     // Compile the reusable constraint graph independently of window state so
     // every frame and the headless regression share one model implementation.
-    let ik_model = IkModel::new();
+    let mut ik_model = IkModel::new();
 
     // Initial pose: straight chain along +X axis.
     let mut state = IkState {
