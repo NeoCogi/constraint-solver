@@ -40,7 +40,6 @@ benchmarks = []
 glfw-example = ["dep:glfw", "dep:glow", "dep:rs-math3d"]
 
 [dependencies]
-rayon = "1.8"
 # The IK example needs window/context creation only. Disabling GLFW's `all`
 # default avoids unrelated image, Vulkan, logging, and dual-backend dependency
 # trees. Optional dependencies ensure ordinary crate consumers and test runs do

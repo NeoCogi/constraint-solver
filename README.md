@@ -199,17 +199,12 @@ let solution = solver.solve(initial).expect("solve failed");
 assert!(solution.error < 1e-8);
 ```
 
-### Execution mode (serial vs parallel)
+### Deterministic execution
 
-```rust
-use constraint_solver::{Compiler, Exp, Mode, NewtonRaphsonSolver};
-
-let equation = Exp::sub(Exp::var("x"), Exp::val(1.0));
-let compiled = Compiler::compile(&[equation]).expect("compile failed");
-let _solver = NewtonRaphsonSolver::new(compiled)
-    .with_mode(Mode::Parallel { thread_count: 8 })
-    .expect("solver");
-```
+The solver and its dense linear algebra execute serially in a fixed traversal
+order. Repeated runs with the same compiled system, options, and input therefore
+follow the same arithmetic path. Applications can solve independent systems on
+different threads, but each solver invocation itself has one execution policy.
 
 ### Introspection and failure diagnostics
 
@@ -293,28 +288,18 @@ cargo test --test real_world_geometry -- --show-output
 
 ## Benchmarks
 
-Benchmarks are in `benches/linear_algebra.rs` and compare the core matrix
-operations used by the solver. Dense multiplication and transpose compare
-serial and parallel variants; bounded square, tall, wide, and rank-deficient
-groups measure the canonical Jacobi SVD.
+Benchmarks are in `benches/linear_algebra.rs` and measure the core matrix
+operations used by the solver. Dense multiplication and transpose cover square
+and long-inner-dimension workloads; bounded square, tall, wide, and
+rank-deficient groups measure the canonical Jacobi SVD.
 
 ```bash
-# Use all available cores
 cargo bench --features benchmarks
-
-# Pin the parallel thread count
-BENCH_THREADS=16 cargo bench --features benchmarks
 ```
 
-The parallel path uses Rayon for matrix multiplication and transpose when the
-working set is large enough. The compact Jacobi SVD is deterministic and
-serial in both solver execution modes.
-
 Benchmark timings are intentionally not checked into this README: results vary
-substantially with CPU topology, memory bandwidth, compiler version, and Rayon
-thread count. The harness verifies serial/parallel result equivalence before it
-records timings, so run it on the target machine when making performance
-decisions.
+substantially with CPU topology, memory bandwidth, and compiler version. Run
+the harness on the target machine when making performance decisions.
 
 ## Notes
 

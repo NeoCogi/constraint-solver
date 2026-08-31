@@ -28,9 +28,7 @@ SOFTWARE.
 use crate::compiler::{CompiledSystem, EvaluationError, VarId, VarTable};
 use crate::jacobian::Jacobian;
 use crate::matrix::{LeastSquaresInfo, Matrix, MatrixError};
-use crate::mode::{Mode, build_thread_pool};
 use crate::scaled::{ScaledSum, product_ratio};
-use rayon::ThreadPool;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -83,8 +81,6 @@ struct DirectionalDerivativeContext<'a> {
     scaled_residuals: &'a Matrix,
     /// Newton correction expressed in normalized variable coordinates.
     direction: &'a Matrix,
-    /// Whether matrix multiplication may use the configured Rayon pool.
-    parallel: bool,
     /// Accepted variables preserved for a possible numerical failure report.
     vars: &'a HashMap<VarId, f64>,
     /// Raw residuals preserved for per-equation diagnostics.
@@ -244,10 +240,6 @@ pub struct NewtonRaphsonSolver {
     options: SolverOptions,
     /// Optional metadata describing the source of each equation in the system
     equation_traces: Vec<Option<EquationTrace>>,
-    /// Execution mode for linear algebra (serial vs parallel)
-    mode: Mode,
-    /// Optional thread pool for parallel execution
-    pool: Option<ThreadPool>,
 }
 
 /// Successful solver result with values and explicit convergence diagnostics.
@@ -497,20 +489,7 @@ impl NewtonRaphsonSolver {
             // APIs change iteration budgets and regularization unexpectedly.
             options: SolverOptions::default(),
             equation_traces: Vec::new(),
-            mode: Mode::Serial,
-            pool: None,
         }
-    }
-
-    /// Update the execution mode for this solver.
-    pub fn with_mode(mut self, mode: Mode) -> Result<Self, SolverError> {
-        self.set_mode(mode)?;
-        Ok(self)
-    }
-
-    /// Returns the current execution mode.
-    pub fn mode(&self) -> &Mode {
-        &self.mode
     }
 
     /// Borrow the complete numerical policy currently installed on the solver.
@@ -611,29 +590,6 @@ impl NewtonRaphsonSolver {
             .iter()
             .position(|candidate| *candidate == variable_id)?;
         Some(self.variable_scales[column])
-    }
-
-    fn set_mode(&mut self, mode: Mode) -> Result<(), SolverError> {
-        let pool = build_thread_pool(&mode).map_err(SolverError::InvalidInput)?;
-        self.mode = mode;
-        self.pool = pool;
-        Ok(())
-    }
-
-    fn parallel_enabled(&self) -> bool {
-        self.pool.is_some()
-    }
-
-    fn run_in_mode<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R + Send,
-        R: Send,
-    {
-        if let Some(pool) = &self.pool {
-            pool.install(f)
-        } else {
-            f()
-        }
     }
 
     /// Attach optional source metadata for every equation in compilation order.
@@ -739,7 +695,7 @@ impl NewtonRaphsonSolver {
         // caller's variable map.
         self.validate_configuration()?;
         let vars = self.map_initial_guess(initial_guess)?;
-        self.run_in_mode(|| self.solve_internal(vars))
+        self.solve_internal(vars)
     }
 
     /// Run the solver's single accepted-state Newton iteration.
@@ -789,8 +745,6 @@ impl NewtonRaphsonSolver {
         let mut candidate_vars = vars.clone();
         let mut candidate_f_vals = Matrix::new(num_equations, 1);
         let mut candidate_scaled_f_vals = Matrix::new(num_equations, 1);
-
-        let parallel = self.parallel_enabled();
 
         if !f_vals.all_finite() {
             return Err(self.non_finite_evaluation_error(
@@ -921,7 +875,6 @@ impl NewtonRaphsonSolver {
                     jacobian: &scaled_jacobian,
                     scaled_residuals: &scaled_f_vals,
                     direction: &delta,
-                    parallel,
                     vars: &vars,
                     diagnostic_residuals: &f_vals,
                     accepted_updates: iter,
@@ -1482,7 +1435,6 @@ impl NewtonRaphsonSolver {
             jacobian,
             scaled_residuals,
             direction,
-            parallel,
             vars,
             diagnostic_residuals,
             accepted_updates,
@@ -1490,20 +1442,18 @@ impl NewtonRaphsonSolver {
         } = context;
 
         // Multiplying J by the candidate direction produces the residual-space
-        // velocity used by the chain rule. The multiplication honors the
-        // solver's selected execution mode and retains structured shape errors.
-        let residual_velocity = jacobian
-            .try_mul_with_parallel(direction, parallel)
-            .map_err(|source| {
-                self.matrix_error(
-                    source,
-                    accepted_updates,
-                    vars,
-                    diagnostic_residuals,
-                    gradient,
-                    None,
-                )
-            })?;
+        // velocity used by the chain rule. Checked multiplication retains
+        // structured shape errors for the caller's run diagnostic.
+        let residual_velocity = jacobian.try_mul(direction).map_err(|source| {
+            self.matrix_error(
+                source,
+                accepted_updates,
+                vars,
+                diagnostic_residuals,
+                gradient,
+                None,
+            )
+        })?;
         if !residual_velocity.all_finite() {
             return Err(self.non_finite_evaluation_error(
                 "Line-search directional derivative produced NaN or infinity",
@@ -1784,9 +1734,16 @@ impl NewtonRaphsonSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mode;
     use crate::compiler::Compiler;
     use crate::exp::Exp;
+
+    /// Single deterministic execution case used while numerical tests retain
+    /// their shared case-oriented structure.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        /// The solver's only serial execution policy.
+        Serial,
+    }
 
     /// Apply the documented inclusive maximum at the exact dimensionless
     /// stationarity boundary.
@@ -1839,17 +1796,8 @@ mod tests {
         Exp::sub(sum, Exp::val(rhs))
     }
 
-    fn test_modes() -> Vec<Mode> {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 4);
-        vec![
-            Mode::Serial,
-            Mode::Parallel {
-                thread_count: threads,
-            },
-        ]
+    fn test_modes() -> [Mode; 1] {
+        [Mode::Serial]
     }
 
     fn assert_solution_close(serial: &Solution, parallel: &Solution, tol: f64) {
@@ -1915,22 +1863,19 @@ mod tests {
         solver.with_options(options)
     }
 
-    fn solver_for_mode(equations: Vec<Exp>, mode: Mode) -> NewtonRaphsonSolver {
+    fn solver_for_mode(equations: Vec<Exp>, _mode: Mode) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new(compiled)
-            .with_mode(mode)
-            .expect("failed to set solver mode")
     }
 
     fn solver_for_with_vars_mode(
         equations: Vec<Exp>,
         variables: &[&str],
-        mode: Mode,
+        _mode: Mode,
     ) -> NewtonRaphsonSolver {
         let compiled = Compiler::compile(&equations).expect("compile failed");
         NewtonRaphsonSolver::new_with_variables(compiled, variables)
-            .and_then(|solver| solver.with_mode(mode))
-            .expect("failed to select solve variables or set mode")
+            .expect("failed to select solve variables")
     }
 
     /// Preserve every machine-readable matrix field and the complete nonlinear

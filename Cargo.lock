@@ -140,7 +140,6 @@ dependencies = [
  "criterion",
  "glfw",
  "glow",
- "rayon",
  "rs-math3d",
 ]
 

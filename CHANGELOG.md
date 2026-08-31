@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the `Mode` abstraction, dedicated Rayon pools, and parallel matrix
+  entry points. Solver arithmetic now has one serial traversal order, Rayon is
+  no longer a default dependency, and independent solves remain safe to run on
+  separate application threads.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

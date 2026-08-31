@@ -37,9 +37,6 @@ use std::fmt;
 use std::ops::{Add, Index, IndexMut, Mul, Sub};
 
 use crate::scaled::{ScaledSum, ScaledValue};
-use rayon::prelude::*;
-
-const PARALLEL_THRESHOLD: usize = 16_384;
 
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked linear solve began.
@@ -59,14 +56,6 @@ impl fmt::Display for MatrixOperand {
             MatrixOperand::RightHandSide => write!(f, "right-hand side"),
         }
     }
-}
-
-/// Decide whether an operation contains enough independent scalar work to
-/// amortize Rayon scheduling overhead.
-fn should_parallelize_work(estimated_scalar_work: usize) -> bool {
-    // Callers use saturating arithmetic when deriving work estimates, so an
-    // unrepresentably large operation is conservatively classified as large.
-    estimated_scalar_work >= PARALLEL_THRESHOLD
 }
 
 /// Convert the relative numerical-rank threshold into the scale of a singular-
@@ -357,7 +346,7 @@ impl Matrix {
         self.cols
     }
 
-    /// Return a serially computed transpose of this matrix.
+    /// Return the transpose of this matrix.
     ///
     /// # Panics
     ///
@@ -365,20 +354,6 @@ impl Matrix {
     /// be reserved.
     #[track_caller]
     pub fn transpose(&self) -> Matrix {
-        // Route through the mode-aware implementation so the two paths share
-        // allocation, indexing, and empty-shape semantics.
-        self.transpose_with_parallel(false)
-    }
-
-    /// Return the transpose while optionally parallelizing a sufficiently large
-    /// element copy.
-    ///
-    /// # Panics
-    ///
-    /// Panics when storage for a second matrix of the same element count cannot
-    /// be reserved.
-    #[track_caller]
-    pub fn transpose_with_parallel(&self, parallel: bool) -> Matrix {
         // The transposed shape reverses the logical dimensions while preserving
         // the same total element count.
         let mut result = Matrix::new(self.cols, self.rows);
@@ -386,20 +361,7 @@ impl Matrix {
             // A valid shape such as `usize::MAX x 0` has no coordinates to
             // copy. Returning from storage cardinality avoids walking the huge
             // logical row dimension even though the operation is already
-            // complete, and also avoids zero-sized parallel chunks.
-            return result;
-        }
-        let element_count = self.rows.saturating_mul(self.cols);
-        if parallel && should_parallelize_work(element_count) {
-            result
-                .data
-                .par_chunks_mut(self.rows)
-                .enumerate()
-                .for_each(|(j, row)| {
-                    for i in 0..self.rows {
-                        row[i] = self[(i, j)];
-                    }
-                });
+            // complete.
             return result;
         }
 
@@ -1026,7 +988,7 @@ impl Matrix {
         Ok(result)
     }
 
-    /// Multiply two shape-compatible matrices serially.
+    /// Multiply two shape-compatible matrices in deterministic row-major order.
     ///
     /// This method reports operand-shape mismatches. Each output cell uses the
     /// crate's scaled compensated product sum and is converted to `f64` only
@@ -1038,28 +1000,6 @@ impl Matrix {
     /// represented.
     #[track_caller]
     pub fn try_mul(&self, rhs: &Matrix) -> Result<Matrix, MatrixError> {
-        // Delegate validation and arithmetic to the mode-aware implementation so
-        // both public entry points retain identical error behavior.
-        self.try_mul_with_parallel(rhs, false)
-    }
-
-    /// Multiply two matrices while optionally parallelizing sufficiently large
-    /// row computations.
-    ///
-    /// This method has the same recoverable-shape and scaled-arithmetic contract
-    /// as [`Matrix::try_mul`]. Parallel execution changes work distribution but
-    /// preserves the serial accumulation order within each result cell.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the result shape when its dimensions or storage cannot be
-    /// represented.
-    #[track_caller]
-    pub fn try_mul_with_parallel(
-        &self,
-        rhs: &Matrix,
-        parallel: bool,
-    ) -> Result<Matrix, MatrixError> {
         // The shared dimension must match before any row slice is constructed.
         if self.cols != rhs.rows {
             return Err(MatrixError::DimensionMismatch {
@@ -1081,31 +1021,6 @@ impl Matrix {
             // effectively unbounded outer-row loop whose body can never write.
             return Ok(result);
         }
-        // Each output cell performs `self.cols` multiply-adds. Including that
-        // inner dimension recognizes skinny products with few output cells but
-        // substantial arithmetic, which the former output-size test missed.
-        let scalar_work = self.rows.saturating_mul(rhs.cols).saturating_mul(self.cols);
-        if parallel && should_parallelize_work(scalar_work) {
-            let rhs_cols = rhs.cols;
-            // Assign complete output rows to workers. Each row is disjoint, and
-            // every cell traverses the shared dimension in the same order as
-            // the serial path, so scaling and compensation remain deterministic.
-            result
-                .data
-                .par_chunks_mut(rhs_cols)
-                .enumerate()
-                .for_each(|(i, row)| {
-                    for (j, output) in row.iter_mut().enumerate() {
-                        let mut dot = ScaledSum::default();
-                        for k in 0..self.cols {
-                            dot.add_product_ratio([self[(i, k)], rhs[(k, j)]], []);
-                        }
-                        *output = dot.total();
-                    }
-                });
-            return Ok(result);
-        }
-
         for i in 0..self.rows {
             for j in 0..rhs.cols {
                 // Delay every product and partial-sum range check until the
@@ -1254,17 +1169,6 @@ mod tests {
         m
     }
 
-    fn assert_matrix_close(a: &Matrix, b: &Matrix, tol: f64) {
-        assert_eq!(a.rows(), b.rows());
-        assert_eq!(a.cols(), b.cols());
-        for i in 0..a.rows() {
-            for j in 0..a.cols() {
-                let diff = (a[(i, j)] - b[(i, j)]).abs();
-                assert!(diff <= tol, "mismatch at ({i},{j}): {diff}");
-            }
-        }
-    }
-
     /// Run the canonical least-squares API with its automatic singular-value
     /// rank policy.
     fn solve_default(coefficients: &Matrix, rhs: &Matrix) -> LeastSquaresSolution {
@@ -1392,15 +1296,13 @@ mod tests {
         m[(1, 1)] = 5.0;
         m[(1, 2)] = 6.0;
 
-        let mt_serial = m.transpose_with_parallel(false);
-        let mt_parallel = m.transpose_with_parallel(true);
-        assert_matrix_close(&mt_serial, &mt_parallel, 0.0);
-        assert_eq!(mt_serial.rows(), 3);
-        assert_eq!(mt_serial.cols(), 2);
-        assert_eq!(mt_serial[(0, 0)], 1.0);
-        assert_eq!(mt_serial[(1, 0)], 2.0);
-        assert_eq!(mt_serial[(2, 0)], 3.0);
-        assert_eq!(mt_serial[(0, 1)], 4.0);
+        let transposed = m.transpose();
+        assert_eq!(transposed.rows(), 3);
+        assert_eq!(transposed.cols(), 2);
+        assert_eq!(transposed[(0, 0)], 1.0);
+        assert_eq!(transposed[(1, 0)], 2.0);
+        assert_eq!(transposed[(2, 0)], 3.0);
+        assert_eq!(transposed[(0, 1)], 4.0);
     }
 
     /// Complete zero-storage operations from physical cardinality rather than
@@ -1412,19 +1314,17 @@ mod tests {
         let empty_right =
             Matrix::from_vec(Vec::new(), 0, 0).expect("a zero-by-zero matrix is valid");
 
-        for parallel in [false, true] {
-            let transposed = huge_empty.transpose_with_parallel(parallel);
-            assert_eq!(transposed.rows(), 0);
-            assert_eq!(transposed.cols(), usize::MAX);
-            assert_eq!(transposed.norm(), 0.0);
+        let transposed = huge_empty.transpose();
+        assert_eq!(transposed.rows(), 0);
+        assert_eq!(transposed.cols(), usize::MAX);
+        assert_eq!(transposed.norm(), 0.0);
 
-            let product = huge_empty
-                .try_mul_with_parallel(&empty_right, parallel)
-                .expect("a product with zero output columns is already complete");
-            assert_eq!(product.rows(), usize::MAX);
-            assert_eq!(product.cols(), 0);
-            assert_eq!(product.norm(), 0.0);
-        }
+        let product = huge_empty
+            .try_mul(&empty_right)
+            .expect("a product with zero output columns is already complete");
+        assert_eq!(product.rows(), usize::MAX);
+        assert_eq!(product.cols(), 0);
+        assert_eq!(product.norm(), 0.0);
     }
 
     #[test]
@@ -1445,58 +1345,13 @@ mod tests {
         b[(2, 0)] = 11.0;
         b[(2, 1)] = 12.0;
 
-        let c_serial = a.try_mul_with_parallel(&b, false).unwrap();
-        let c_parallel = a.try_mul_with_parallel(&b, true).unwrap();
-        assert_matrix_close(&c_serial, &c_parallel, 0.0);
-        assert_eq!(c_serial.rows(), 2);
-        assert_eq!(c_serial.cols(), 2);
-        assert_eq!(c_serial[(0, 0)], 58.0);
-        assert_eq!(c_serial[(0, 1)], 64.0);
-        assert_eq!(c_serial[(1, 0)], 139.0);
-        assert_eq!(c_serial[(1, 1)], 154.0);
-    }
-
-    /// Verify that a product with few outputs but a long shared dimension is
-    /// classified by its actual arithmetic and remains numerically equivalent.
-    #[test]
-    fn test_parallel_matmul_counts_inner_dimension_work() {
-        let rows = 4usize;
-        let inner = 4_096usize;
-        let cols = 4usize;
-
-        // Sixteen output cells alone fall below the scheduling threshold, while
-        // their 65,536 multiply-adds correctly qualify as substantial work.
-        let estimated_work = rows.saturating_mul(cols).saturating_mul(inner);
-        assert!(should_parallelize_work(estimated_work));
-
-        let a = Matrix::from_vec(vec![1.0; rows * inner], rows, inner).unwrap();
-        let b = Matrix::from_vec(vec![1.0; inner * cols], inner, cols).unwrap();
-        let serial = a.try_mul_with_parallel(&b, false).unwrap();
-        let parallel = a.try_mul_with_parallel(&b, true).unwrap();
-
-        assert_matrix_close(&serial, &parallel, 0.0);
-        for row in 0..rows {
-            for column in 0..cols {
-                assert_eq!(serial[(row, column)], inner as f64);
-            }
-        }
-    }
-
-    #[test]
-    fn test_parallel_equivalence_threshold_size() {
-        let size = 128;
-        let mut rng = TestRng::new(0x3e5a_9f21_d00d_cafe);
-
-        let a = random_matrix(size, size, &mut rng);
-        let b = random_matrix(size, size, &mut rng);
-
-        let c_serial = a.try_mul_with_parallel(&b, false).unwrap();
-        let c_parallel = a.try_mul_with_parallel(&b, true).unwrap();
-        assert_matrix_close(&c_serial, &c_parallel, 1e-10);
-
-        let t_serial = a.transpose_with_parallel(false);
-        let t_parallel = a.transpose_with_parallel(true);
-        assert_matrix_close(&t_serial, &t_parallel, 0.0);
+        let product = a.try_mul(&b).unwrap();
+        assert_eq!(product.rows(), 2);
+        assert_eq!(product.cols(), 2);
+        assert_eq!(product[(0, 0)], 58.0);
+        assert_eq!(product[(0, 1)], 64.0);
+        assert_eq!(product[(1, 0)], 139.0);
+        assert_eq!(product[(1, 1)], 154.0);
     }
 
     #[test]
@@ -1571,21 +1426,15 @@ mod tests {
         let a = Matrix::new(2, 3);
         let b = Matrix::new(2, 2);
 
-        let err_serial = a
-            .try_mul_with_parallel(&b, false)
-            .expect_err("expected dimension mismatch");
-        let err_parallel = a
-            .try_mul_with_parallel(&b, true)
-            .expect_err("expected dimension mismatch");
+        let error = a.try_mul(&b).expect_err("expected dimension mismatch");
         assert_eq!(
-            err_serial,
+            error,
             MatrixError::DimensionMismatch {
                 operation: "mul",
                 left: (2, 3),
                 right: (2, 2),
             }
         );
-        assert_eq!(err_serial, err_parallel);
     }
 
     /// Preserve a finite least-squares solution when same-sign projection terms

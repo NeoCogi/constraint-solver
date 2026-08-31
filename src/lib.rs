@@ -65,14 +65,12 @@ pub mod compiler;
 pub mod exp;
 mod jacobian;
 pub mod matrix;
-pub mod mode;
 mod scaled;
 pub mod solver;
 
 pub use compiler::{CompileError, CompiledSystem, Compiler};
 pub use exp::Exp;
 pub use matrix::{LeastSquaresInfo, LeastSquaresSolution, Matrix, MatrixError, MatrixOperand};
-pub use mode::Mode;
 pub use solver::{
     EquationDiagnostic, EquationTrace, LinearSolveDiagnostic, NewtonRaphsonSolver, Solution,
     SolverError, SolverOptions, SolverRunDiagnostic,
