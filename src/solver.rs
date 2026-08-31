@@ -79,25 +79,6 @@ struct LineSearchContext<'a> {
     candidate_scaled_residuals: &'a mut Matrix,
 }
 
-/// Borrowed normalized state used to compute one Armijo slope while retaining
-/// raw residuals for any caller-facing failure diagnostic.
-struct DirectionalDerivativeContext<'a> {
-    /// Equation- and variable-scaled Jacobian at the current accepted point.
-    jacobian: &'a Matrix,
-    /// Equation-scaled residual vector at the same point.
-    scaled_residuals: &'a Matrix,
-    /// Newton correction expressed in normalized variable coordinates.
-    direction: &'a Matrix,
-    /// Accepted variables preserved for a possible numerical failure report.
-    vars: &'a HashMap<VarId, f64>,
-    /// Raw residuals preserved for per-equation diagnostics.
-    diagnostic_residuals: &'a Matrix,
-    /// Number of corrections accepted before this slope calculation.
-    accepted_updates: usize,
-    /// Gradient measures already evaluated at the current accepted point.
-    gradient: ResidualGradientMeasure,
-}
-
 /// Counts why candidates were rejected during one exhausted line search.
 ///
 /// The categories stay private implementation detail because callers already
@@ -130,8 +111,9 @@ struct ResidualGradientMeasure {
     ///
     /// The value is absent only when `f` is zero. Zero Jacobian columns
     /// contribute zero, so an entirely zero Jacobian at a non-root produces
-    /// `Some(0.0)` and is classified as first-order stationary without implying
-    /// a local minimum.
+    /// `Some(0.0)`. This remains a descriptive gradient diagnostic; termination
+    /// is derived from the retained singular subspace that also produces the
+    /// Newton correction.
     relative_norm: Option<f64>,
 }
 
@@ -140,17 +122,6 @@ struct ResidualGradientMeasure {
 struct LinearSolveResult {
     /// Factorization and regularization details for caller-facing results.
     diagnostic: LinearSolveDiagnostic,
-}
-
-impl ResidualGradientMeasure {
-    /// Return whether the dimensionless gradient meets the configured
-    /// first-order stationarity tolerance.
-    fn is_stationary(self, tolerance: f64) -> bool {
-        // A zero residual is handled by the root-success checks before
-        // stationarity is queried. Every non-root therefore has a defined
-        // column-scaled measure, including the zero-Jacobian case.
-        self.relative_norm.is_some_and(|norm| norm <= tolerance)
-    }
 }
 
 /// Complete numerical policy for one reusable nonlinear solver.
@@ -166,8 +137,6 @@ pub struct SolverOptions {
     /// Inclusive maximum norm of equation-scale-normalized residuals for a
     /// successful [`Solution`].
     pub residual_tolerance: f64,
-    /// Maximum residual/Jacobian-column cosine used for `StationaryNonRoot`.
-    pub stationarity_tolerance: f64,
     /// Explicit ridge parameter on the normalized variable correction; zero
     /// selects the unregularized SVD solve.
     pub regularization: f64,
@@ -187,7 +156,6 @@ impl Default for SolverOptions {
         Self {
             max_iterations: 100,
             residual_tolerance: 1e-10,
-            stationarity_tolerance: 1e-10,
             regularization: 0.0,
             max_backtracks: 40,
         }
@@ -217,8 +185,8 @@ pub struct NewtonRaphsonSolver {
     ///
     /// Entry order matches compiled equations. The solver divides residual row
     /// `i` and Jacobian row `i` by this value, so larger scales reduce an
-    /// equation's weight in convergence, stationarity, Armijo, and least
-    /// squares without changing raw diagnostic residuals.
+    /// equation's weight in convergence, retained-model classification, Armijo,
+    /// and least squares without changing raw diagnostic residuals.
     equation_scales: Vec<f64>,
     /// Positive characteristic magnitude for each solve variable.
     ///
@@ -249,12 +217,12 @@ pub struct Solution {
     /// exactly the values returned in `values`.
     pub error: f64,
     /// Norm of the normalized gradient `J_scaled^T f_scaled` at the returned
-    /// values, measuring first-order least-squares stationarity.
+    /// values, provided as a descriptive least-squares diagnostic.
     ///
     /// This diagnostic may be positive infinity when every underlying value and
-    /// relative stationarity decision is finite but the absolute physical
-    /// gradient magnitude exceeds `f64::MAX`. Such representational overflow is
-    /// not a non-finite solver state and does not invalidate a converged root.
+    /// relative gradient geometry is finite but the absolute physical gradient
+    /// magnitude exceeds `f64::MAX`. Such representational overflow is not a
+    /// non-finite solver state and does not invalidate a converged root.
     pub gradient_norm: f64,
     /// Largest absolute cosine between the residual and a Jacobian column.
     ///
@@ -329,7 +297,8 @@ pub struct EquationDiagnostic {
     /// Signed scalar residual evaluated at the diagnostic's `values`.
     pub residual: f64,
     /// Dimensionless residual `residual / equation_scale` used by convergence,
-    /// stationarity, Armijo acceptance, and the linearized solve.
+    /// retained-model classification, Armijo acceptance, and the linearized
+    /// solve.
     pub scaled_residual: f64,
     /// Caller-provided source metadata, or `None` when no trace was attached for
     /// this equation.
@@ -357,9 +326,9 @@ pub struct SolverRunDiagnostic {
     pub iterations: usize,
     /// Euclidean norm of all `EquationDiagnostic::scaled_residual` entries.
     pub error: f64,
-    /// Norm of `J_scaled^T f_scaled` when the terminating path evaluated
-    /// stationarity. The contained value may be positive infinity when only the
-    /// reconstructed absolute diagnostic exceeds `f64` range.
+    /// Norm of `J_scaled^T f_scaled` when the terminating path evaluated the
+    /// current Jacobian. The contained value may be positive infinity when only
+    /// the reconstructed absolute diagnostic exceeds `f64` range.
     ///
     /// Other failures report `None` because computing a fresh Jacobian merely
     /// for diagnostics could itself fail or obscure the original error.
@@ -371,7 +340,9 @@ pub struct SolverRunDiagnostic {
     /// failure state, whether or not line search accepted its correction.
     ///
     /// `None` means failure occurred before any correction was produced, such as
-    /// an invalid initial evaluation or an initially stationary non-root.
+    /// an invalid initial residual or Jacobian evaluation. A stationary non-root
+    /// has `Some` because its zero retained projection is established by a
+    /// completed factorization.
     pub last_linear_attempt: Option<LinearSolveDiagnostic>,
     /// Variable values at the end of the run, keyed by compiled variable name.
     pub values: HashMap<String, f64>,
@@ -391,15 +362,16 @@ pub enum SolverError {
     /// Non-finite line-search candidates are rejected transactionally and may
     /// instead end as [`SolverError::NoConvergence`] after all backtracks. An
     /// infinite absolute gradient *diagnostic* is also permitted when its
-    /// finite relative stationarity measure remains meaningful.
+    /// finite relative column-alignment measure remains meaningful.
     /// The diagnostic is boxed to keep the error enum compact.
     NonFiniteEvaluation(Box<SolverRunDiagnostic>),
-    /// The residual remains above its root tolerance while the first-order
-    /// residual gradient satisfies the stationarity tolerance.
+    /// The residual remains above its root tolerance while its effective
+    /// linear correction model retains no reducible right-hand-side component.
     ///
     /// This applies uniformly to square, underdetermined, and overdetermined
-    /// systems. It does not claim the state is a local minimum; stationary
-    /// maxima and saddles use the same non-success result.
+    /// systems. It describes the rank-truncated local linear model and does not
+    /// claim that the nonlinear state is a local minimum; maxima and saddles can
+    /// produce the same non-success result.
     StationaryNonRoot(Box<SolverRunDiagnostic>),
     /// A matrix operation failed while constructing or solving a nonlinear
     /// correction.
@@ -756,19 +728,6 @@ impl NewtonRaphsonSolver {
         self
     }
 
-    /// Override the positive, finite column-scaled threshold used to
-    /// identify stationary non-roots.
-    ///
-    /// This value does not permit a successful least-squares result. It controls
-    /// when the solver stops with [`SolverError::StationaryNonRoot`] instead of
-    /// spending the remaining update budget at a first-order fixed point.
-    pub fn with_stationarity_tolerance(mut self, stationarity_tolerance: f64) -> Self {
-        // Preserve invalid values for deterministic validation at the shared
-        // solve boundary rather than silently clamping numerical policy.
-        self.options.stationarity_tolerance = stationarity_tolerance;
-        self
-    }
-
     /// Override the number of halvings permitted after a rejected full step.
     ///
     /// The complete candidate budget is `max_backtracks + 1`; zero therefore
@@ -848,11 +807,12 @@ impl NewtonRaphsonSolver {
     /// * `initial_guess` - Starting values for all variables (by name)
     /// # Algorithm
     /// 1. Evaluate `f(x)` and `J(x)` for the current accepted state
-    /// 2. Check root and first-order stationarity termination
-    /// 3. Solve the normalized `J * delta = -f(x)` system by SVD, augmenting
-    ///    it once with the caller's exact ridge strength when requested
-    /// 4. Backtrack transactionally until Armijo sufficient decrease holds
-    /// 5. Commit the already-evaluated candidate as the next accepted state
+    /// 2. Check residual-based root termination
+    /// 3. Solve the configured normalized linear correction model by SVD
+    /// 4. Use that factorization's retained residual projection to classify
+    ///    model stationarity and derive the Armijo slope
+    /// 5. Backtrack transactionally until sufficient decrease holds
+    /// 6. Commit the already-evaluated candidate as the next accepted state
     fn solve_internal(&self, workspace: &mut SolverWorkspace) -> Result<Solution, SolverError> {
         // Borrow the construction-time symbolic cache and every caller-owned
         // numerical buffer for the duration of this solve.
@@ -913,7 +873,7 @@ impl NewtonRaphsonSolver {
         }
         // The current state is always fully evaluated at loop entry. A mutable
         // accepted-update count lets the budget-exhausted state receive the same
-        // root and stationarity checks without a special final evaluation path.
+        // root and retained-model checks without a special final evaluation path.
         let mut iter = 0;
         loop {
             let error = scaled_f_vals.norm();
@@ -930,38 +890,12 @@ impl NewtonRaphsonSolver {
                 return Ok(self.build_solution(vars, iter, error, gradient, last_linear_attempt));
             }
 
-            // Every system shape can reach a first-order fixed point that is not
-            // a root, particularly after rank truncation or regularization.
-            // Detect it before another identical linear solve or backtracking
-            // attempt and return a non-success result at the stationary state.
+            // Preserve the column-scaled gradient as a public diagnostic, but do
+            // not use it as an independent termination policy. Correlated columns
+            // can each have a tiny residual cosine even when a retained linear
+            // combination exactly reaches a root. Local reducibility is therefore
+            // classified below by the same SVD that produces the correction.
             let gradient = Self::residual_gradient_measure(scaled_jacobian, scaled_f_vals);
-            if gradient.is_stationary(self.options.stationarity_tolerance) {
-                return Err(self.stationary_non_root_error(
-                    iter,
-                    vars,
-                    f_vals,
-                    gradient,
-                    last_linear_attempt,
-                ));
-            }
-
-            // Root and stationarity checks deliberately precede this boundary:
-            // the final permitted update may legitimately land on either. Only
-            // a still-active state is classified as budget exhaustion.
-            if iter == self.options.max_iterations {
-                let diagnostic = self.build_diagnostic(
-                    format!(
-                        "Failed to converge after {} accepted updates. Final error: {:.2e}",
-                        self.options.max_iterations, error
-                    ),
-                    iter,
-                    vars,
-                    f_vals,
-                    Some(gradient),
-                    last_linear_attempt,
-                );
-                return Err(SolverError::NoConvergence(Box::new(diagnostic)));
-            }
 
             for i in 0..num_equations {
                 f_neg[(i, 0)] = -scaled_f_vals[(i, 0)];
@@ -993,6 +927,46 @@ impl NewtonRaphsonSolver {
                 })?;
             last_linear_attempt = Some(linear_solve.diagnostic.clone());
 
+            // The dimensionless retained fraction is zero exactly when this SVD
+            // model has no representable component of its correction right hand
+            // side in the retained factor space. It remains the stationarity
+            // decision even when the corresponding physical slope is too small
+            // for `f64`. When ridge is configured, the effective factor space is
+            // the augmented linear system rather than the Jacobian alone.
+            if linear_solve
+                .diagnostic
+                .effective
+                .retained_rhs_projection_fraction
+                == 0.0
+            {
+                return Err(self.stationary_non_root_error(
+                    iter,
+                    vars,
+                    f_vals,
+                    gradient,
+                    linear_solve.diagnostic,
+                ));
+            }
+
+            // Root and model-stationarity checks deliberately precede this
+            // boundary: the final permitted update may legitimately land on
+            // either. Only a state with a usable retained correction is
+            // classified as budget exhaustion.
+            if iter == self.options.max_iterations {
+                let diagnostic = self.build_diagnostic(
+                    format!(
+                        "Failed to converge after {} accepted updates. Final error: {:.2e}",
+                        self.options.max_iterations, error
+                    ),
+                    iter,
+                    vars,
+                    f_vals,
+                    Some(gradient),
+                    last_linear_attempt,
+                );
+                return Err(SolverError::NoConvergence(Box::new(diagnostic)));
+            }
+
             if !delta.all_finite() {
                 return Err(Self::attach_linear_attempt(
                     self.non_finite_evaluation_error(
@@ -1005,20 +979,17 @@ impl NewtonRaphsonSolver {
                 ));
             }
 
+            // The same factorization returns the residual-norm derivative for
+            // its correction. Reusing it avoids reconstructing `J*p` through
+            // products that can overflow before cancellation and avoids
+            // squaring a tiny ratio before the residual's physical scale can
+            // restore a representable slope.
+            let residual_norm_directional_derivative =
+                linear_solve.diagnostic.effective.residual_norm_slope;
+
             // Armijo is the only update policy. It leaves the accepted state
             // untouched while populating candidate buffers, so failure cannot
             // require rollback or consume an update count.
-            let residual_norm_directional_derivative = self
-                .residual_norm_directional_derivative(DirectionalDerivativeContext {
-                    jacobian: scaled_jacobian,
-                    scaled_residuals: scaled_f_vals,
-                    direction: delta,
-                    vars,
-                    diagnostic_residuals: f_vals,
-                    accepted_updates: iter,
-                    gradient,
-                })
-                .map_err(|error| Self::attach_linear_attempt(error, last_linear_attempt.clone()))?;
             self.line_search(LineSearchContext {
                 jacobian,
                 vars,
@@ -1070,8 +1041,9 @@ impl NewtonRaphsonSolver {
             }
             iter += 1;
 
-            // Root and stationarity checks occur once at the next loop entry,
-            // using the residual and Jacobian for exactly this accepted state.
+            // Root and linear-model stationarity checks occur once at the next
+            // loop entry, using the residual and Jacobian for exactly this
+            // accepted state.
         }
     }
 
@@ -1219,12 +1191,6 @@ impl NewtonRaphsonSolver {
         Self::require_valid_option(
             self.options.residual_tolerance.is_finite() && self.options.residual_tolerance > 0.0,
             "residual_tolerance must be finite and greater than zero",
-        )?;
-        Self::require_valid_option(
-            self.options.stationarity_tolerance.is_finite()
-                && self.options.stationarity_tolerance > 0.0
-                && self.options.stationarity_tolerance <= 1.0,
-            "stationarity_tolerance must be finite and in the interval (0, 1]",
         )?;
         Self::require_valid_option(
             self.options.regularization.is_finite() && self.options.regularization >= 0.0,
@@ -1391,31 +1357,31 @@ impl NewtonRaphsonSolver {
         }
     }
 
-    /// Construct the shape-independent error returned when a non-root satisfies
-    /// the configured first-order stationarity threshold.
+    /// Construct the shape-independent error returned when a non-root has no
+    /// reducible component in its effective retained linear correction model.
     fn stationary_non_root_error(
         &self,
         iterations: usize,
         vars: &HashMap<VarId, f64>,
         residuals: &Matrix,
         gradient: ResidualGradientMeasure,
-        last_linear_attempt: Option<LinearSolveDiagnostic>,
+        linear_attempt: LinearSolveDiagnostic,
     ) -> SolverError {
-        // Pass the already-computed gradient and linear attempt into the common
-        // constructor so no second evaluation or later field mutation can
-        // disagree with the terminating state.
+        // Pass both the descriptive gradient and the decisive linear attempt into
+        // the common constructor. The factorization's zero projection, rather
+        // than an independently tuned gradient threshold, establishes that no
+        // retained correction can reduce this residual locally.
         let diagnostic = self.build_diagnostic(
             format!(
-                "Residual norm {:.2e} exceeds tolerance {:.2e}, while the normalized residual gradient satisfies stationarity tolerance {:.2e}",
+                "Residual norm {:.2e} exceeds tolerance {:.2e}, and the retained linear correction model cannot reduce it",
                 self.scaled_residual_norm(residuals),
                 self.options.residual_tolerance,
-                self.options.stationarity_tolerance,
             ),
             iterations,
             vars,
             residuals,
             Some(gradient),
-            last_linear_attempt,
+            Some(linear_attempt),
         );
         SolverError::StationaryNonRoot(Box::new(diagnostic))
     }
@@ -1470,16 +1436,15 @@ impl NewtonRaphsonSolver {
         error
     }
 
-    /// Compute the normalized least-squares gradient norm and its column-scaled
-    /// first-order stationarity measure.
+    /// Compute the normalized least-squares gradient norm and column alignments.
     ///
-    /// The decision quantity is `max_j |J_j^T f| / (||J_j||_2 ||f||_2)`, the
-    /// largest absolute cosine between the residual and any non-zero Jacobian
-    /// column. Normalizing each column independently prevents an unrelated
-    /// high-scale variable from hiding a strong descent direction in another
-    /// column, which a single Frobenius normalization of the whole Jacobian can
-    /// do. Entries are divided by finite maxima before products are formed so
-    /// the criterion also remains defined when the raw norms exceed `f64`.
+    /// The relative diagnostic is
+    /// `max_j |J_j^T f| / (||J_j||_2 ||f||_2)`, the largest absolute cosine
+    /// between the residual and any non-zero Jacobian column. It is intentionally
+    /// descriptive: correlated columns can each have a small cosine while their
+    /// retained span still contains a useful correction. Entries are divided by
+    /// finite maxima before products are formed so both diagnostics remain
+    /// defined when raw norms exceed `f64`.
     fn residual_gradient_measure(jacobian: &Matrix, residuals: &Matrix) -> ResidualGradientMeasure {
         // A zero residual has no direction and is already handled as a root by
         // every caller. All residual entries were checked for finiteness before
@@ -1508,9 +1473,9 @@ impl NewtonRaphsonSolver {
                 .map(|row| jacobian[(row, column)].abs())
                 .fold(0.0_f64, f64::max);
             if column_scale == 0.0 {
-                // A zero column contributes neither a gradient component nor
-                // a residual alignment. An entirely zero Jacobian consequently
-                // yields the mathematically stationary value `Some(0.0)`.
+                // A zero column contributes neither a gradient component nor a
+                // residual alignment. An entirely zero Jacobian consequently
+                // yields the descriptive relative value `Some(0.0)`.
                 continue;
             }
 
@@ -1542,106 +1507,6 @@ impl NewtonRaphsonSolver {
             absolute_norm,
             relative_norm: Some(maximum_cosine),
         }
-    }
-
-    /// Compute the directional derivative of the scaled residual norm along a
-    /// proposed normalized solver direction.
-    ///
-    /// Away from a root the derivative is
-    /// `(f_scaled / ||f_scaled||_2)^T J_scaled p`. Normalizing the residual
-    /// before the dot product prevents large finite values and velocities from
-    /// overflowing the mathematically equivalent unnormalized expression.
-    fn residual_norm_directional_derivative(
-        &self,
-        context: DirectionalDerivativeContext<'_>,
-    ) -> Result<f64, SolverError> {
-        let DirectionalDerivativeContext {
-            jacobian,
-            scaled_residuals,
-            direction,
-            vars,
-            diagnostic_residuals,
-            accepted_updates,
-            gradient,
-        } = context;
-
-        // The direction is a single normalized-variable column and must span
-        // every Jacobian column. Validate the private invariant explicitly so a
-        // future caller receives structured state instead of an indexing panic.
-        if scaled_residuals.cols() != 1 || jacobian.rows() != scaled_residuals.rows() {
-            return Err(self.matrix_error(
-                MatrixError::DimensionMismatch {
-                    operation: "residual_norm_directional_derivative",
-                    left: (jacobian.rows(), jacobian.cols()),
-                    right: (scaled_residuals.rows(), scaled_residuals.cols()),
-                },
-                accepted_updates,
-                vars,
-                diagnostic_residuals,
-                gradient,
-                None,
-            ));
-        }
-        if direction.cols() != 1 || jacobian.cols() != direction.rows() {
-            return Err(self.matrix_error(
-                MatrixError::DimensionMismatch {
-                    operation: "residual_norm_directional_derivative",
-                    left: (jacobian.rows(), jacobian.cols()),
-                    right: (direction.rows(), direction.cols()),
-                },
-                accepted_updates,
-                vars,
-                diagnostic_residuals,
-                gradient,
-                None,
-            ));
-        }
-
-        // The iteration requests a slope only for non-roots, so a positive
-        // finite norm must exist. Rejecting an unexpected zero or non-finite
-        // norm here keeps this private helper safe if future call sites change.
-        let residual_norm = scaled_residuals.norm();
-        if !residual_norm.is_finite() || residual_norm <= 0.0 {
-            return Err(self.non_finite_evaluation_error(
-                "Line-search residual norm was zero or non-finite",
-                accepted_updates,
-                vars,
-                diagnostic_residuals,
-            ));
-        }
-
-        // Fuse J*p with the outer normalized-residual dot product. This keeps
-        // the directional derivative allocation-free and avoids materializing a
-        // residual-space vector that no later solver stage consumes.
-        let mut slope = CompensatedSum::default();
-        for row in 0..scaled_residuals.rows() {
-            let mut velocity = CompensatedSum::default();
-            for column in 0..jacobian.cols() {
-                velocity.add(jacobian[(row, column)] * direction[(column, 0)]);
-            }
-            let velocity = velocity.total();
-            if !velocity.is_finite() {
-                return Err(self.non_finite_evaluation_error(
-                    "Line-search directional derivative produced NaN or infinity",
-                    accepted_updates,
-                    vars,
-                    diagnostic_residuals,
-                ));
-            }
-            let normalized_residual = scaled_residuals[(row, 0)] / residual_norm;
-            slope.add(normalized_residual * velocity);
-        }
-
-        let residual_norm_derivative = slope.total();
-        if !residual_norm_derivative.is_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Line-search residual-norm slope accumulation overflowed",
-                accepted_updates,
-                vars,
-                diagnostic_residuals,
-            ));
-        }
-        Ok(residual_norm_derivative)
     }
 
     /// Build the dedicated error variant for non-finite numerical states while
@@ -1748,11 +1613,27 @@ impl NewtonRaphsonSolver {
             candidate_scaled_residuals,
         } = context;
 
-        // A non-negative derivative means the proposed correction is not a
-        // descent direction for the least-squares objective. Backtracking cannot
-        // repair such a direction, so preserve the current state and explain the
-        // numerical cause without evaluating misleading trial points.
-        if residual_norm_directional_derivative >= 0.0 {
+        // The factorization can legitimately report negative infinity when the
+        // completed physical slope exceeds `f64` range. Reject every non-finite
+        // slope before sign classification so it remains a numerical evaluation
+        // failure rather than a line-search policy result.
+        if !residual_norm_directional_derivative.is_finite() {
+            return Err(self.non_finite_evaluation_error(
+                "Line-search residual-norm slope produced NaN or infinity",
+                accepted_updates,
+                vars,
+                current_residuals,
+            ));
+        }
+
+        // A positive derivative means the proposed correction is not a descent
+        // direction for the least-squares objective. Backtracking cannot repair
+        // such a direction, so preserve the current state and explain the cause
+        // without evaluating misleading trial points. Negative zero is allowed:
+        // the SVD has separately established a non-zero retained component, but
+        // its physical slope can lie below the subnormal range. In that case the
+        // representable Armijo requirement is simply nonincrease.
+        if residual_norm_directional_derivative > 0.0 {
             let diagnostic = self.build_diagnostic(
                 format!(
                     "Line search cannot proceed because the proposed correction is not a descent direction (d||f||/d alpha = {residual_norm_directional_derivative:.2e})"
@@ -1764,17 +1645,6 @@ impl NewtonRaphsonSolver {
                 None,
             );
             return Err(SolverError::NoConvergence(Box::new(diagnostic)));
-        }
-
-        // Roots terminate before line search begins, and the helper has already
-        // verified that the supplied residual-norm slope is finite.
-        if !residual_norm_directional_derivative.is_finite() {
-            return Err(self.non_finite_evaluation_error(
-                "Line-search residual-norm slope produced NaN or infinity",
-                accepted_updates,
-                vars,
-                current_residuals,
-            ));
         }
 
         // Always test the unmodified Newton correction first. Each rejection
@@ -1879,28 +1749,6 @@ mod tests {
     use crate::compiler::Compiler;
     use crate::exp::Exp;
 
-    /// Apply the documented inclusive maximum at the exact dimensionless
-    /// stationarity boundary.
-    #[test]
-    fn test_stationarity_tolerance_boundary_is_inclusive() {
-        let boundary_measure = ResidualGradientMeasure {
-            absolute_norm: 1.0,
-            relative_norm: Some(0.25),
-        };
-
-        assert!(boundary_measure.is_stationary(0.25));
-        assert!(!boundary_measure.is_stationary(0.25 - f64::EPSILON));
-
-        // An exact root has no residual direction and is handled by the root
-        // check before stationarity; absence must never become stationary by
-        // comparison alone.
-        let root_measure = ResidualGradientMeasure {
-            absolute_norm: 0.0,
-            relative_norm: None,
-        };
-        assert!(!root_measure.is_stationary(1.0));
-    }
-
     /// Small deterministic generator used by numerical property regressions.
     ///
     /// Keeping the generator local and dependency-free makes every randomized
@@ -1954,6 +1802,20 @@ mod tests {
             SolverError::StationaryNonRoot(diagnostic) => *diagnostic,
             other => panic!("expected StationaryNonRoot, got {other:?}"),
         }
+    }
+
+    /// Assert the factorization invariant shared by every stationary-non-root
+    /// diagnostic produced after the SVD-centered convergence refactor.
+    fn assert_zero_retained_projection(diagnostic: &SolverRunDiagnostic) {
+        // Stationarity is no longer inferred from a separately tuned gradient
+        // threshold. The terminating state must therefore retain the successful
+        // linear attempt whose projection result made the decision.
+        let attempt = diagnostic
+            .last_linear_attempt
+            .as_ref()
+            .expect("stationarity requires a completed SVD factorization");
+        assert_eq!(attempt.effective.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.effective.residual_norm_slope, 0.0);
     }
 
     /// Compile equations and construct the sole serial solver policy used by
@@ -2309,18 +2171,6 @@ mod tests {
             (
                 "residual_tolerance",
                 Box::new(|solver| solver.with_residual_tolerance(f64::NAN)),
-            ),
-            (
-                "stationarity_tolerance",
-                Box::new(|solver| solver.with_stationarity_tolerance(0.0)),
-            ),
-            (
-                "stationarity_tolerance",
-                Box::new(|solver| solver.with_stationarity_tolerance(f64::INFINITY)),
-            ),
-            (
-                "stationarity_tolerance",
-                Box::new(|solver| solver.with_stationarity_tolerance(2.0)),
             ),
             (
                 "regularization",
@@ -2829,6 +2679,7 @@ mod tests {
         assert_eq!(diagnostic.error, 1.0);
         assert_eq!(diagnostic.gradient_norm, Some(0.0));
         assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert_zero_retained_projection(&diagnostic);
     }
 
     /// Confirm that a tiny Newton update reports diagnostics from the returned
@@ -2879,6 +2730,7 @@ mod tests {
                 .relative_gradient_norm
                 .is_some_and(|norm| norm < 1e-10)
         );
+        assert_zero_retained_projection(&diagnostic);
     }
 
     /// Verify strict stationary-non-root semantics do not depend on the number
@@ -2922,11 +2774,12 @@ mod tests {
             assert_eq!(diagnostic.iterations, 0, "unexpected {shape} update");
             assert!(diagnostic.error > 0.0, "missing {shape} residual");
             assert_eq!(diagnostic.gradient_norm, Some(0.0));
+            assert_zero_retained_projection(&diagnostic);
         }
     }
 
-    /// Ensure column-scaled stationarity remains observable when both raw norms
-    /// and residual-gradient products exceed the finite `f64` range.
+    /// Preserve finite gradient geometry and retained-model stationarity when
+    /// raw norms and residual-gradient products exceed the `f64` range.
     #[test]
     fn test_scaled_stationary_system_avoids_raw_gradient_overflow() {
         // At x=0 the residual and Jacobian norms are both infinite in f64,
@@ -2950,31 +2803,25 @@ mod tests {
         assert_eq!(diagnostic.gradient_norm, Some(0.0));
         assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
         assert!(diagnostic.error.is_infinite());
+        assert_zero_retained_projection(&diagnostic);
     }
 
     /// Preserve a representable public gradient norm when reconstructing it
     /// requires three factors whose naive association underflows.
     #[test]
     fn test_gradient_diagnostic_uses_scale_safe_factor_reconstruction() {
-        // At x=0, J^T*f is exactly 1e-308: only the first equation depends
-        // on x. Max-normalized stationarity remains correct, but multiplying
-        // scaled_dot by the tiny column scale before the large residual
-        // scale used to underflow the public absolute diagnostic to zero.
-        let x = Exp::var("x");
-        let equations = vec![
-            Exp::add(Exp::mul(Exp::val(1e-308), x), Exp::val(1.0)),
-            Exp::val(1e308),
-        ];
-        let solver = build_solver(equations);
-        let initial = HashMap::from([("x".to_string(), 0.0)]);
-
-        let error = solver
-            .solve_once(initial)
-            .expect_err("the non-zero residual is stationary at the initial point");
-        let diagnostic = expect_stationary_non_root(error);
-        let gradient_norm = diagnostic
-            .gradient_norm
-            .expect("stationarity evaluation must include its absolute norm");
+        // J^T*f is exactly 1e-308: only the first residual depends on the
+        // variable. Multiplying the normalized dot by the tiny column scale
+        // before the large residual scale would underflow this diagnostic to
+        // zero. Exercise the diagnostic directly because the SVD-centered solver
+        // now removes that reducible first residual before it reports the final
+        // stationary state.
+        let jacobian =
+            Matrix::from_vec(vec![1e-308, 0.0], 2, 1).expect("the Jacobian fixture has two rows");
+        let residuals =
+            Matrix::from_vec(vec![1.0, 1e308], 2, 1).expect("the residual fixture has two rows");
+        let gradient = NewtonRaphsonSolver::residual_gradient_measure(&jacobian, &residuals);
+        let gradient_norm = gradient.absolute_norm;
         let relative_error = (gradient_norm / 1e-308 - 1.0).abs();
 
         assert!(gradient_norm > 0.0);
@@ -2987,16 +2834,15 @@ mod tests {
     fn test_scaled_consistent_overdetermined_system_does_not_false_converge() {
         // At the origin the x column is exactly anti-parallel to the
         // residual, but two unrelated y equations dominate the Jacobian's
-        // global Frobenius norm by nine orders of magnitude. A global
-        // normalization falls below the configured 1e-8 threshold even
-        // though the x=1 root is one ordinary Newton correction away.
+        // global Frobenius norm by nine orders of magnitude. A global gradient
+        // threshold could therefore hide the x direction even though the x=1
+        // root is one ordinary Newton correction away.
         let x = Exp::var("x");
         let y = Exp::var("y");
         let x_residual = Exp::sub(x, Exp::val(1.0));
         let y_residual = Exp::mul(Exp::val(1e9), y);
-        let solver = build_solver(vec![x_residual, y_residual.clone(), y_residual])
-            .with_stationarity_tolerance(1e-8)
-            .with_regularization(0.0);
+        let solver =
+            build_solver(vec![x_residual, y_residual.clone(), y_residual]).with_regularization(0.0);
         let initial = HashMap::from([("x".to_string(), 0.0), ("y".to_string(), 0.0)]);
 
         let solution = solver
@@ -3007,6 +2853,70 @@ mod tests {
         assert!((solution.values["x"] - 1.0).abs() < 1e-12);
         assert_eq!(solution.values["y"], 0.0);
         assert!(solution.error < 1e-12);
+    }
+
+    /// Use the retained singular subspace, rather than individual column
+    /// cosines, to decide whether a correlated system has a usable correction.
+    #[test]
+    fn test_correlated_columns_do_not_hide_reachable_root() {
+        // At this initial point the residual is [0, -1e-6]. Its cosine with each
+        // individual Jacobian column is at most 1e-12, but the difference of the
+        // nearly parallel columns spans the residual exactly. Both singular
+        // directions remain above the precision-derived rank cutoff, so the
+        // pseudoinverse correction [-1e6, 1e6] must be attempted rather than
+        // classifying the accepted state as stationary.
+        let x = Exp::var("x");
+        let y = Exp::var("y");
+        let equations = vec![Exp::add(x.clone(), y.clone()), Exp::mul(Exp::val(1e-12), y)];
+        let solver = build_solver(equations);
+        let initial = HashMap::from([("x".to_string(), 1e6), ("y".to_string(), -1e6)]);
+
+        let solution = solver
+            .solve_once(initial)
+            .expect("the retained correlated direction reaches the exact root");
+
+        assert_eq!(solution.iterations, 1);
+        assert!(solution.values["x"].abs() < 1e-8);
+        assert!(solution.values["y"].abs() < 1e-8);
+        assert!(solution.error <= solver.options().residual_tolerance);
+        assert_eq!(
+            solution
+                .last_linear_attempt
+                .as_ref()
+                .expect("one correction requires one factorization")
+                .effective
+                .rank,
+            2
+        );
+    }
+
+    /// Attempt a retained correction even when its physical Armijo slope
+    /// underflows to negative zero.
+    #[test]
+    fn test_underflowed_slope_does_not_imply_model_stationarity() {
+        // The variable can remove the tiny first residual exactly, while the
+        // independent constant residual remains unsatisfied. Relative to the
+        // unit residual, the retained projection is 1e-300 and its norm slope
+        // is -1e-600, which rounds to negative zero. The solver must still take
+        // the correction under the representable nonincrease condition before
+        // reporting the remaining constant equation as stationary.
+        let x = Exp::var("x");
+        let solver = build_solver(vec![Exp::add(x, Exp::val(1e-300)), Exp::val(1.0)]);
+        let initial = HashMap::from([("x".to_string(), 0.0)]);
+
+        let error = solver
+            .solve_once(initial)
+            .expect_err("the constant residual prevents a constraint root");
+        let diagnostic = expect_stationary_non_root(error);
+
+        assert_eq!(diagnostic.iterations, 1);
+        assert_eq!(diagnostic.values["x"], -1e-300);
+        assert_eq!(diagnostic.equations[0].residual, 0.0);
+        let attempt = diagnostic
+            .last_linear_attempt
+            .expect("stationarity is established by the final SVD attempt");
+        assert_eq!(attempt.effective.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(attempt.effective.residual_norm_slope, 0.0);
     }
 
     /// Classify a non-root zero-Jacobian point as stationary without claiming it
@@ -3031,6 +2941,7 @@ mod tests {
         assert_eq!(diagnostic.values["x"], 0.0);
         assert_eq!(diagnostic.gradient_norm, Some(0.0));
         assert_eq!(diagnostic.relative_gradient_norm, Some(0.0));
+        assert_zero_retained_projection(&diagnostic);
     }
 
     /// Ensure Armijo reaches a non-zero residual floor without confusing small

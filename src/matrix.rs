@@ -34,7 +34,7 @@ SOFTWARE.
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
-use crate::scaled::{CompensatedSum, ScaledSum};
+use crate::scaled::{CompensatedSum, ScaledSum, product_ratio};
 
 /// Identifies which matrix operand contained a non-finite value before a
 /// checked arithmetic or linear-solve operation began.
@@ -172,6 +172,34 @@ pub struct LeastSquaresInfo {
     /// Ratio of the largest to smallest retained singular value. Infinity means
     /// the matrix has no retained non-zero singular subspace.
     pub cond_est: f64,
+    /// Fraction of the right-hand-side norm captured by retained directions.
+    ///
+    /// For right-hand side `b` and its orthogonal projection `P*b` onto the
+    /// retained column space, this is `||P*b|| / ||b||`. The value lies in
+    /// `[0, 1]` after rounding. It is zero when `b` is zero or when the retained
+    /// factorization contains no representable component of `b`.
+    ///
+    /// This dimensionless value is the factorization's stationarity result. Zero
+    /// is reserved for an absent retained component; when an exact non-zero
+    /// fraction is smaller than the `f64` subnormal range, the smallest positive
+    /// `f64` is returned. Keeping that distinction lets callers separate model
+    /// stationarity from an underflowed physical slope.
+    pub retained_rhs_projection_fraction: f64,
+    /// Initial residual-norm slope along the returned solution.
+    ///
+    /// If `x` is the returned solution, this is the derivative at `alpha = 0`
+    /// of `||alpha*A*x - b||`: `-||P*b||² / ||b||`. It is zero when `b` is zero,
+    /// when no retained direction can reduce it, or when the negative physical
+    /// slope is smaller than the `f64` subnormal range. The value has the same
+    /// units as `b`, is never positive, and may be negative infinity only when
+    /// the completed mathematical quantity exceeds `f64` range.
+    ///
+    /// For a least-squares Newton correction solving `J*p = -f`, this is exactly
+    /// the retained linear model's directional derivative of `||f||`. Returning
+    /// it from the factorization avoids reconstructing `J*p` with range-sensitive
+    /// products or squaring a tiny dimensionless ratio before a large residual
+    /// norm can restore a representable slope.
+    pub residual_norm_slope: f64,
 }
 
 impl fmt::Display for MatrixError {
@@ -502,6 +530,11 @@ impl Matrix {
     /// no allocation and overwrites the solution only after all input and shape
     /// validation succeeds. A later numerical error can leave it partially
     /// overwritten, so it remains scratch until `Ok` is returned.
+    ///
+    /// On success, [`LeastSquaresInfo`] reports rank, retained conditioning, the
+    /// fraction of `b` captured by the same retained singular directions, and
+    /// the residual-norm slope along the returned solution. No secondary matrix
+    /// multiplication is used to reconstruct those model diagnostics.
     pub fn solve_least_squares_into(
         &self,
         b: &Matrix,
@@ -565,6 +598,8 @@ impl Matrix {
             return Ok(LeastSquaresInfo {
                 rank: 0,
                 cond_est: f64::INFINITY,
+                retained_rhs_projection_fraction: 0.0,
+                residual_norm_slope: -0.0,
             });
         }
 
@@ -692,7 +727,8 @@ impl Matrix {
         };
         // Project the normalized right-hand side onto every retained singular
         // direction. These bounded dot products use ordinary compensated
-        // `f64`; only reconstruction is permitted an extended exponent range.
+        // `f64`; exponent-safe factor formation is deferred until physical
+        // scales participate in the slope and solution reconstruction.
         workspace.projections.fill(0.0);
         for (component, projection) in workspace.projections.iter_mut().enumerate() {
             let singular_value = workspace.singular_values[component];
@@ -720,6 +756,53 @@ impl Matrix {
                 Self::normalized_column_dot(&workspace.right_vectors, component, 1.0, b, rhs_scale)
             };
         }
+
+        // Measure the retained projection and complete right-hand-side norm in
+        // the independently normalized coordinates used above. Their bounded
+        // norms are combined with `rhs_scale` only once below, avoiding either a
+        // squared physical norm or a range-sensitive divide-then-multiply order.
+        let mut normalized_rhs_norm = 0.0_f64;
+        for row in 0..b.rows {
+            normalized_rhs_norm = normalized_rhs_norm.hypot(b[(row, 0)] / rhs_scale);
+        }
+        let retained_projection_norm = workspace
+            .projections
+            .iter()
+            .fold(0.0_f64, |norm, projection| norm.hypot(*projection));
+        let (retained_rhs_projection_fraction, residual_norm_slope) = if normalized_rhs_norm == 0.0
+        {
+            // The zero vector has no direction to project and needs no linear
+            // correction. Return both additive identities rather than undefined
+            // zero-over-zero quotients.
+            (0.0, -0.0)
+        } else {
+            // The norm fraction answers only whether the retained SVD model
+            // can reduce this right hand side. Reserve exact zero for no
+            // retained component, saturating a smaller-than-subnormal ratio
+            // upward only when that distinction would otherwise be lost.
+            let rounded_fraction = retained_projection_norm / normalized_rhs_norm;
+            let fraction = if retained_projection_norm > 0.0 && rounded_fraction == 0.0 {
+                f64::from_bits(1)
+            } else {
+                // Clamp a possible final-rounding overshoot so the public
+                // quantity keeps its documented unit interval.
+                rounded_fraction.min(1.0)
+            };
+
+            // Form `rhs_scale * projection_norm^2 / normalized_rhs_norm`
+            // through exponent arithmetic. Squaring the normalized projection
+            // first could underflow even when multiplication by `rhs_scale`
+            // makes the completed model slope representable.
+            let slope = -product_ratio(
+                [
+                    rhs_scale,
+                    retained_projection_norm,
+                    retained_projection_norm,
+                ],
+                [normalized_rhs_norm],
+            );
+            (fraction, slope)
+        };
 
         // Reconstruct each output coordinate through one exponent-aligned
         // compensated sum. No singular coefficient or contribution is first
@@ -770,7 +853,12 @@ impl Matrix {
             solution[(row, 0)] = value;
         }
 
-        Ok(LeastSquaresInfo { rank, cond_est })
+        Ok(LeastSquaresInfo {
+            rank,
+            cond_est,
+            retained_rhs_projection_fraction,
+            residual_norm_slope,
+        })
     }
 
     /// Orthogonalize the columns of a tall-or-square matrix with cyclic Jacobi
@@ -1296,6 +1384,98 @@ mod tests {
         coefficients
             .solve_least_squares_into(rhs, &mut solution, &mut workspace)
             .expect_err("least-squares fixture must fail")
+    }
+
+    /// Report retained projection geometry and residual slope from the same
+    /// singular subspace used to construct the pseudoinverse solution.
+    #[test]
+    fn least_squares_reports_retained_projection_and_residual_slope() {
+        // Only the first coordinate belongs to this rank-one matrix's column
+        // space. For b=[3,4], ||P*b||^2/||b|| is 9/5.
+        let coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0], 2, 2)
+            .expect("the rank-one fixture has four entries");
+        let rhs =
+            Matrix::from_vec(vec![3.0, 4.0], 2, 1).expect("the right-hand side has two entries");
+        let result = solve_default(&coefficients, &rhs);
+
+        assert_eq!(result.info.rank, 1);
+        assert!((result.info.retained_rhs_projection_fraction - 0.6).abs() < 1e-12);
+        assert!((result.info.residual_norm_slope + 1.8).abs() < 1e-12);
+
+        // A true wide matrix follows the transposed SVD path. It must report the
+        // same projection measures as the equivalent tall residual subspace.
+        let wide_coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2, 3)
+            .expect("the wide rank-one fixture has six entries");
+        let wide_result = solve_default(&wide_coefficients, &rhs);
+        assert_eq!(wide_result.info.rank, 1);
+        assert!((wide_result.info.retained_rhs_projection_fraction - 0.6).abs() < 1e-12);
+        assert!((wide_result.info.residual_norm_slope + 1.8).abs() < 1e-12);
+
+        // A non-axis-aligned column protects the projection identity used by
+        // every effective correction system. For A=[1,sqrt(3)]^T and b=[2,0],
+        // the normalized retained projection has fraction 1/2 and slope -1/2.
+        let angled_coefficients = Matrix::from_vec(vec![1.0, 3.0_f64.sqrt()], 2, 1)
+            .expect("the angled single-column fixture has two entries");
+        let angled_rhs = Matrix::from_vec(vec![2.0, 0.0], 2, 1)
+            .expect("the angled right-hand side has two entries");
+        let angled_result = solve_default(&angled_coefficients, &angled_rhs);
+        assert!((angled_result.info.retained_rhs_projection_fraction - 0.5).abs() < 1e-12);
+        assert!((angled_result.info.residual_norm_slope + 0.5).abs() < 1e-12);
+
+        // A zero right-hand side has no direction and therefore reports the
+        // documented zero fraction and slope instead of undefined quotients.
+        let zero_rhs = Matrix::new(2, 1);
+        let zero_result = solve_default(&coefficients, &zero_rhs);
+        assert_eq!(zero_result.info.retained_rhs_projection_fraction, 0.0);
+        assert_eq!(zero_result.info.residual_norm_slope, 0.0);
+        assert!(zero_result.info.residual_norm_slope.is_sign_negative());
+
+        // The dimensionless projection ratio here is 1e-200. Squaring it first
+        // underflows, but ||P*b||^2/||b|| is the representable value 1e-100 once
+        // the right-hand side's 1e300 physical scale participates.
+        let narrow_coefficients = Matrix::from_vec(vec![1.0, 0.0], 2, 1)
+            .expect("the single-column fixture has two entries");
+        let wide_scale_rhs = Matrix::from_vec(vec![1e100, 1e300], 2, 1)
+            .expect("the wide-scale right-hand side has two entries");
+        let wide_scale_result = solve_default(&narrow_coefficients, &wide_scale_rhs);
+        let fraction_relative_error =
+            (wide_scale_result.info.retained_rhs_projection_fraction / 1e-200 - 1.0).abs();
+        let relative_error = (wide_scale_result.info.residual_norm_slope / -1e-100 - 1.0).abs();
+        assert!(
+            fraction_relative_error < 1e-12,
+            "projection-fraction relative error: {fraction_relative_error:e}"
+        );
+        assert!(relative_error < 1e-12, "relative error: {relative_error:e}");
+
+        // Keep model stationarity separate from physical-slope representability.
+        // This retained component is visible in normalized coordinates even
+        // though its completed physical slope rounds to negative zero.
+        let underflow_scale_rhs = Matrix::from_vec(vec![1e-300, 1.0], 2, 1)
+            .expect("the underflow-scale right-hand side has two entries");
+        let underflow_scale_result = solve_default(&narrow_coefficients, &underflow_scale_rhs);
+        assert!(underflow_scale_result.info.retained_rhs_projection_fraction > 0.0);
+        assert_eq!(underflow_scale_result.info.residual_norm_slope, 0.0);
+        assert!(
+            underflow_scale_result
+                .info
+                .residual_norm_slope
+                .is_sign_negative()
+        );
+
+        // Zero in the fraction field is a semantic stationarity result, so a
+        // retained projection smaller than the fraction's representable range
+        // saturates at the least positive subnormal instead of becoming zero.
+        let least_positive = f64::from_bits(1);
+        let saturation_coefficients = Matrix::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 6, 1)
+            .expect("the six-row single-column fixture has six entries");
+        let saturation_rhs = Matrix::from_vec(vec![least_positive, 1.0, 1.0, 1.0, 1.0, 1.0], 6, 1)
+            .expect("the fraction-saturation right-hand side has six entries");
+        let saturation_result = solve_default(&saturation_coefficients, &saturation_rhs);
+        assert_eq!(
+            saturation_result.info.retained_rhs_projection_fraction,
+            least_positive
+        );
+        assert_eq!(saturation_result.info.residual_norm_slope, 0.0);
     }
 
     #[test]
